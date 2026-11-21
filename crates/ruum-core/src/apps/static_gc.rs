@@ -271,9 +271,9 @@ impl AppService {
     /// ([`super::static_site::StaticSites::migrate_legacy`], decision 0008-4), each under the
     /// tenant's site lock taken shared (the collection, which takes it exclusively, never runs
     /// on a tenant while its objects move). `delete` removes the moved objects from the blob
-    /// bucket; the sweeper passes it only after [`STATIC_GC_FIRST_DELAY`], when no server of
-    /// an earlier release (which reads and writes the blob bucket) still runs. A tenant whose
-    /// move fails is left for the next run (logged).
+    /// bucket; the sweeper of this release never passes it, so a rollback to the earlier
+    /// release (which reads the blob bucket) finds every site it wrote (backlog I6-3D-3). A
+    /// tenant whose move fails is left for the next run (logged).
     pub async fn migrate_legacy_sites(
         &self,
         delete: bool,

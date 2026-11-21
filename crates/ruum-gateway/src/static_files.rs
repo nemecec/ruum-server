@@ -23,7 +23,9 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use ruum_core::apps::static_site::request_path;
-use ruum_core::identity::app_sign_in::wire::{PREFIX, StaticFileLink, StaticFileQuery};
+use ruum_core::identity::app_sign_in::wire::{
+    PREFIX, STATIC_MISSING_HEADER, StaticFileLink, StaticFileQuery,
+};
 use std::time::Duration;
 
 /// The largest static file the gateway serves (the plan's file size limit is smaller).
@@ -96,7 +98,15 @@ impl SiteFiles for HttpSiteFiles {
             .await
             .map_err(|e| CoreError(format!("/static/file: {}", e.without_url())))?;
         match r.status() {
-            reqwest::StatusCode::NOT_FOUND => Ok(LinkAnswer::NotFound),
+            // Only the core's own answer is "not found"; a bare 404 is a core without the route
+            // (an earlier release during a rolling upgrade): the request fails closed (503).
+            reqwest::StatusCode::NOT_FOUND
+                if r.headers()
+                    .get(STATIC_MISSING_HEADER)
+                    .is_some_and(|v| v == "missing") =>
+            {
+                Ok(LinkAnswer::NotFound)
+            }
             reqwest::StatusCode::SERVICE_UNAVAILABLE => Ok(LinkAnswer::Unavailable),
             s if s.is_success() => r
                 .json::<StaticFileLink>()

@@ -35,8 +35,10 @@
 //!
 //! A server of an earlier release wrote the objects under the same keys into the blob bucket.
 //! [`StaticSites::migrate_legacy`] copies them into the static bucket (the files of an index
-//! before the index) and, once no server of the earlier release can run any more, deletes them
-//! from the blob bucket.
+//! before the index); until a site has moved, [`StaticSites::link`] links to it in the blob
+//! bucket. The copies in the blob bucket stay in this release, so a rollback to the earlier
+//! release still finds every site it wrote (Kimi k14i6, 2); `migrate_legacy` can delete them,
+//! and a later release does that (backlog I6-3D-3).
 //!
 //! Objects stay when a preview expires (they may be shared with another deployment); the
 //! sweeper deletes only the index of an expired preview. The garbage collection of static sites
@@ -420,6 +422,34 @@ pub fn media_type(path: &str) -> &'static str {
     }
 }
 
+/// The index of a deployment in `store` (see [`StaticSites::read_index`]).
+async fn read_index_in(
+    store: &Arc<dyn ObjectStore>,
+    tenant: TenantId,
+    deployment: Uuid,
+) -> Result<Option<SiteIndex>> {
+    let r = match store.get(&index_key(tenant, deployment)).await {
+        Ok(r) => r,
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if r.meta.size > MAX_INDEX_BYTES {
+        return Err(Error::Internal(format!(
+            "the site index of {deployment} is too large"
+        )));
+    }
+    let bytes = r.bytes().await?;
+    let index: SiteIndex = serde_json::from_slice(&bytes)
+        .map_err(|e| Error::Internal(format!("the site index of {deployment}: {e}")))?;
+    if index.v != LAYOUT_VERSION {
+        return Err(Error::Internal(format!(
+            "the site index of {deployment} has layout version {}",
+            index.v
+        )));
+    }
+    Ok(Some(index))
+}
+
 /// What [`StaticSites::write_site`] did.
 #[derive(Clone, Debug)]
 pub struct WrittenSite {
@@ -465,6 +495,8 @@ pub struct StaticSites {
     /// The blob bucket, where a server of an earlier release wrote the same objects
     /// ([`StaticSites::migrate_legacy`]).
     legacy: Option<Arc<dyn ObjectStore>>,
+    /// Signs read links in the blob bucket, for a site whose objects have not moved yet.
+    legacy_links: Option<Arc<dyn Signer>>,
 }
 
 impl std::fmt::Debug for StaticSites {
@@ -479,6 +511,7 @@ impl StaticSites {
             store,
             links: Arc::default(),
             legacy: None,
+            legacy_links: None,
         }
     }
 
@@ -504,6 +537,13 @@ impl StaticSites {
     /// same objects into ([`StaticSites::migrate_legacy`]).
     pub fn with_legacy(mut self, legacy: Arc<dyn ObjectStore>) -> Self {
         self.legacy = Some(legacy);
+        self
+    }
+
+    /// The signer of the blob bucket: until a site's objects have moved, [`StaticSites::link`]
+    /// links to them there (Kimi k14i6, 1: no false `404` in the first sweep after an upgrade).
+    pub fn with_legacy_links(mut self, signer: Arc<dyn Signer>) -> Self {
+        self.legacy_links = Some(signer);
         self
     }
 
@@ -814,26 +854,7 @@ impl StaticSites {
         tenant: TenantId,
         deployment: Uuid,
     ) -> Result<Option<SiteIndex>> {
-        let r = match self.store.get(&index_key(tenant, deployment)).await {
-            Ok(r) => r,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        if r.meta.size > MAX_INDEX_BYTES {
-            return Err(Error::Internal(format!(
-                "the site index of {deployment} is too large"
-            )));
-        }
-        let bytes = r.bytes().await?;
-        let index: SiteIndex = serde_json::from_slice(&bytes)
-            .map_err(|e| Error::Internal(format!("the site index of {deployment}: {e}")))?;
-        if index.v != LAYOUT_VERSION {
-            return Err(Error::Internal(format!(
-                "the site index of {deployment} has layout version {}",
-                index.v
-            )));
-        }
-        Ok(Some(index))
+        read_index_in(&self.store, tenant, deployment).await
     }
 
     /// Opens a file of a site for streaming. Fails when the object is larger than `max_bytes`
@@ -949,8 +970,19 @@ impl StaticSites {
         if request_path(&raw) != Some(path) {
             return Ok(None);
         }
-        let Some(index) = self.read_index(tenant, deployment).await? else {
-            return Ok(None);
+        // The static bucket; else, for a site an earlier release wrote and the move has not
+        // reached yet, the blob bucket (its files go before its index, so they are still there).
+        let (index, signer) = match self.read_index(tenant, deployment).await? {
+            Some(i) => (i, signer),
+            None => match (&self.legacy, &self.legacy_links) {
+                (Some(legacy), Some(legacy_signer)) => {
+                    match read_index_in(legacy, tenant, deployment).await? {
+                        Some(i) => (i, legacy_signer),
+                        None => return Ok(None),
+                    }
+                }
+                _ => return Ok(None),
+            },
         };
         let Some((_, entry)) = index.resolve(path, navigation) else {
             return Ok(None);
@@ -1530,9 +1562,30 @@ mod tests {
             .put(&chunk, PutPayload::from_static(b"chunk"))
             .await
             .unwrap();
-        let sites = StaticSites::in_memory().with_legacy(blobs.object_store());
+        let sites = StaticSites::in_memory()
+            .with_legacy(blobs.object_store())
+            .with_links(Arc::new(FakeSigner));
         assert!(sites.has_legacy());
         assert_eq!(sites.legacy_tenants().await.unwrap(), vec![t]);
+        // Before the move, without a signer of the blob bucket: no link for the old site.
+        assert!(
+            sites
+                .link(t, a, "index.html", false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let sites = sites.with_legacy_links(Arc::new(FakeSigner));
+        let (e, url) = sites
+            .link(t, a, "index.html", false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(e.size, 11);
+        assert!(
+            url.as_str()
+                .contains(&file_key(t, &Hash::of(b"<h1>Hi</h1>")).to_string())
+        );
         // Without delete: everything readable is copied, nothing leaves the blob bucket.
         let r = sites.migrate_legacy(t, false).await.unwrap();
         assert_eq!(

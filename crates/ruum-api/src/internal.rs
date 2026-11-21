@@ -208,8 +208,8 @@ pub mod gateway {
     use ruum_core::authz::{ObjectRef, Role, SubjectRef};
     use ruum_core::identity::app_sign_in::wire::{
         AgentAnswer, AgentRequest, DeploymentInfo, DeploymentQuery, EndSessionRequest, PREFIX,
-        RedeemRequest, RedeemResponse, SessionInfo, SessionRequest, StaticFileLink,
-        StaticFileQuery, UpstreamAnswer, UpstreamQuery,
+        RedeemRequest, RedeemResponse, STATIC_MISSING_HEADER, SessionInfo, SessionRequest,
+        StaticFileLink, StaticFileQuery, UpstreamAnswer, UpstreamQuery,
     };
     use ruum_core::identity::app_sign_in::{AppBinding, AppEnv, pairwise};
     use ruum_core::{NodeId, TenantId, UserId};
@@ -312,13 +312,13 @@ pub mod gateway {
         }
         match deployment_info(&s, q.tenant_id, q.app_id, q.deployment_id).await {
             Ok(Some(info)) if info.serving && !info.sandbox => {}
-            Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+            Ok(_) => return no_static_file(),
             Err(e) => return failed("static file", e),
         }
         // An app in the trash serves nothing (the host lookup leaves it out too).
         match app_in_trash(&s, q.tenant_id, q.app_id).await {
             Ok(false) => {}
-            Ok(true) => return StatusCode::NOT_FOUND.into_response(),
+            Ok(true) => return no_static_file(),
             Err(e) => return failed("static file", e),
         }
         match sites
@@ -332,9 +332,15 @@ pub mod gateway {
                 url: url.to_string(),
             })
             .into_response(),
-            Ok(None) => StatusCode::NOT_FOUND.into_response(),
+            Ok(None) => no_static_file(),
             Err(e) => failed("static file", e),
         }
+    }
+
+    /// The core's own "no such file" answer (a `404` that the gateway can tell from a missing
+    /// route).
+    fn no_static_file() -> Response {
+        (StatusCode::NOT_FOUND, [(STATIC_MISSING_HEADER, "missing")]).into_response()
     }
 
     /// Whether the app node is in the trash (or gone), read as the app itself (no permission
