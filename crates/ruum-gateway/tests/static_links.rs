@@ -13,6 +13,7 @@ mod support;
 use support::*;
 
 use ruum_core::identity::app_sign_in::wire::{PREFIX, StaticFileLink, StaticFileQuery};
+use ruum_gateway::static_files::{HttpSiteFiles, LinkAnswer, SiteFiles};
 use ruum_testkit::gateway::{self, Access, Env, GatewayWorld, Req};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -236,4 +237,75 @@ async fn without_links_static_paths_are_unavailable() {
     assert_eq!(r.status, 503);
     assert!(!r.text().contains("hidden"));
     assert_eq!(w.objects.gets.load(Ordering::SeqCst), 0);
+}
+
+/// A sandbox deployment serves no static files, even when an index exists under its ID.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sandbox_deployment_gets_no_static_links() {
+    let w = World::new().await.unwrap();
+    let (app, _, _) = public_site(&w, &[("index.html", b"static")]).await;
+    let node = w
+        .seed_node_deployment(&app, Env::Preview, "http://127.0.0.1:9")
+        .await
+        .unwrap();
+    let list = vec![(
+        "secret.txt".to_string(),
+        bytes::Bytes::from_static(b"T6-SANDBOX-INDEX"),
+    )];
+    w.sites
+        .write_site(
+            World::tenant_id(&app.tenant).unwrap(),
+            node.id.parse().unwrap(),
+            &list,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(ask(&w, &query(&app, &node, "secret.txt")).await.0, 404);
+}
+
+/// Only the core's own "no such file" is a `404` for the gateway: a core of an earlier release
+/// (no `static/file` route) is an error, so the visitor gets the `503` page, never a false `404`
+/// (Kimi k14i6, 1). And the gateway follows no redirect of the object store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_core_without_the_route_and_a_redirect_fail_closed() {
+    let w = World::new().await.unwrap();
+    let (app, d, _) = public_site(&w, &[("a.txt", b"aaa")]).await;
+    // A listener with no routes stands for the core of the earlier release.
+    let old_l = listen().await;
+    let old = old_l.local_addr().unwrap();
+    let redirect = axum::Router::new().route(
+        "/obj",
+        axum::routing::get(|| async {
+            (
+                axum::http::StatusCode::FOUND,
+                [("location", "http://127.0.0.1:9/elsewhere")],
+            )
+        }),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(old_l, redirect.into_make_service()).await;
+    });
+    let files = HttpSiteFiles::new(&format!("http://{old}")).unwrap();
+    let q = query(&app, &d, "a.txt");
+    assert!(
+        files.link(&q).await.is_err(),
+        "a bare 404 is not 'not found'"
+    );
+    // The real core: its own 404 is "not found".
+    let core = HttpSiteFiles::new(&format!("http://{}", w.internal)).unwrap();
+    assert_eq!(
+        core.link(&query(&app, &d, "nope.txt")).await.unwrap(),
+        LinkAnswer::NotFound
+    );
+    let LinkAnswer::File(mut link) = core.link(&q).await.unwrap() else {
+        panic!("a file");
+    };
+    link.url = format!("http://{old}/obj");
+    assert!(
+        core.open(&link).await.is_err(),
+        "a redirect is never followed"
+    );
+    link.url = "file:///etc/passwd".into();
+    assert!(core.open(&link).await.is_err(), "only http(s) links");
 }

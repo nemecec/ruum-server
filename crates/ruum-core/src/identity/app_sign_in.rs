@@ -246,8 +246,14 @@ pub mod wire {
         pub navigation: bool,
     }
 
-    /// The answer of `POST /static/file` (`404` when the deployment does not serve a static
-    /// site or no file matches; `503` when the core has no static store that can sign links).
+    /// The header that marks the core's own "no such file" answer of `POST /static/file`. A
+    /// `404` without it (a core of an earlier release, which has no such route) is an error for
+    /// the gateway, never "not found" (Kimi k14i6, 1).
+    pub const STATIC_MISSING_HEADER: &str = "ruum-static-file";
+
+    /// The answer of `POST /static/file` (`404` with [`STATIC_MISSING_HEADER`]`: missing` when the
+    /// deployment does not serve a static site or no file matches; `503` when the core has no
+    /// static store that can sign links).
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct StaticFileLink {
         /// The BLAKE3 hash of the file (lower-case hex), the `ETag`.

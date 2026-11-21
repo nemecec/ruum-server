@@ -3,9 +3,9 @@
 # rule 3). The internet reaches it only through the edge (the site *.*.<hosts.apps>); network
 # policy (charts/platform networkpolicies.yaml): nothing but the edge reaches it, and it reaches
 # only the core's internal listener, Postgres (its role may only execute ruum_app_host_lookup),
-# the static sites' bucket, DNS and the sandboxes in ruum-apps. It holds no tenant key: the
-# user-token key (Secret ruum/ruum-gateway, a file, never an environment value), its database
-# password and an optional read credential of the bucket.
+# the static bucket (through links the core signs), DNS and the sandboxes in ruum-apps. It holds
+# no tenant key and no object store key (decision 0008-4): only the user-token key (Secret
+# ruum/ruum-gateway, a file, never an environment value) and its database password.
 # Updates without downtime (design 12.7): two replicas spread over the nodes, maxUnavailable 0,
 # a disruption budget, a pause before SIGTERM.
 {{- $pause := int .Values.gateway.preStopSeconds }}

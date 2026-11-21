@@ -262,7 +262,8 @@ pub fn install_apps(
 /// The static sites over S3 (decision 0008-4). With `static_bucket` (`RUUM_STATIC_S3_BUCKET`):
 /// that bucket, with the endpoint and the key of the blob store; the core signs the gateway's
 /// short-lived read links with that key, and the objects that an earlier release wrote into the
-/// blob bucket move over ([`ruum_core::apps::static_site::StaticSites::migrate_legacy`]). The
+/// blob bucket are copied over ([`ruum_core::apps::static_site::StaticSites::migrate_legacy`];
+/// until a site is copied, its links point into the blob bucket). The
 /// static bucket must not be the blob bucket. Without it (a laptop stack set up before the
 /// static bucket existed), the sites stay in the blob bucket, and the gateway still gets only
 /// signed links, never a key.
@@ -299,9 +300,11 @@ pub fn static_sites(
         bucket,
         "static sites: a bucket of their own (decision 0008-4)"
     );
+    let blobs = Arc::new(blobs);
     Ok(StaticSites::new(store.clone())
         .with_links(store)
-        .with_legacy(Arc::new(blobs)))
+        .with_legacy(blobs.clone())
+        .with_legacy_links(blobs))
 }
 
 /// The workload token issuer (card R-3; `ruum_core::apps::workload_tokens`), with the key of

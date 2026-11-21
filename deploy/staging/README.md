@@ -543,9 +543,11 @@ Milestone M2 on staging: apps are served at `<app>.<tenant slug>.apps.staging.ru
   signs a link that reads one file object for one minute; the gateway fetches the bytes with it
   on 443. ruum-server signs only for a deployment that serves now and is static. Hetzner keys
   cannot be limited to one bucket or to reads, so a read-only gateway key would need Garage as
-  well; signed links need no extra service. ruum-server moves site objects that an earlier
-  release wrote into the blob bucket over to the static bucket (each sweep, every 5 minutes) and
-  deletes them from the blob bucket an hour after its start. The static bucket has no copy job:
+  well; signed links need no extra service. ruum-server copies site objects that an earlier
+  release wrote into the blob bucket over to the static bucket (each sweep, every 5 minutes; until
+  a site is copied, its links point into the blob bucket). The copies in the blob bucket stay in
+  this release, so `deploy.sh --rollback` to the earlier release finds every site it wrote; a
+  later release deletes them (backlog I6-3D-3). The static bucket has no copy job:
   every site can be built again from its deployment archive in the blob bucket. The egress proxy: one replica, CONNECT on 443, `EGRESS_DENY` from the Hetzner API
   (the cluster ranges and every public address of staging and of the build server, ConfigMap
   `ruum/ruum-egress-deny`; the platform step stops when an API answer fails or misses a node, the
