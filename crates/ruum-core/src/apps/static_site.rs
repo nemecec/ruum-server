@@ -550,8 +550,8 @@ pub struct SiteMigration {
     pub present: u64,
     /// Objects deleted from the old bucket (their copy is older than the delete delay).
     pub deleted: u64,
-    /// File objects that went from the old bucket before they were copied (the old garbage
-    /// collection deleted them: no index named them).
+    /// Objects that went from the old bucket before they were copied: file objects that the
+    /// old garbage collection deleted (no index named them) and indexes of ended deployments.
     pub gone: u64,
     /// Files that a moved index names but that neither bucket holds (logged; such a site was
     /// broken in the old bucket too).
@@ -767,6 +767,12 @@ impl StaticSites {
         legacy: &dyn ObjectStore,
         meta: &object_store::ObjectMeta,
     ) -> Result<u64> {
+        if meta.size > MAX_INDEX_BYTES {
+            return Err(Error::Internal(format!(
+                "the moved index {} is too large",
+                meta.location
+            )));
+        }
         let bytes = self.store.get(&meta.location).await?.bytes().await?;
         let index: SiteIndex = serde_json::from_slice(&bytes)
             .map_err(|e| Error::Internal(format!("the moved index {}: {e}", meta.location)))?;
@@ -804,7 +810,8 @@ impl StaticSites {
     }
 
     /// `503 unavailable` while the move closes the writes ([`StaticSites::begin_move`]).
-    fn writes_open(&self) -> Result<()> {
+    /// `createAppDeployment` asks it first, so a deploy is refused before anything is stored.
+    pub fn writes_open(&self) -> Result<()> {
         if self.moving.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(Error::Api(
                 crate::error::ApiError::new(

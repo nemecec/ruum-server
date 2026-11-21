@@ -655,6 +655,9 @@ impl AppService {
                 "/draft",
             ));
         }
+        // While the move of static sites out of the blob bucket closes writes (decision 0008-4):
+        // a direct `503`, before a row or an archive is stored (Kimi review of k14r3).
+        self.deps.sites.writes_open()?;
         let plan = self.plan_limits(ctx.tenant).await?;
         let limits = Limits::of(&plan);
         // A slot of the tenant and of the process, held until the image stage has stored the

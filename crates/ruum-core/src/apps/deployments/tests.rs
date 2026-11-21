@@ -1301,6 +1301,38 @@ async fn end(w: &World, id: Uuid) {
     );
 }
 
+/// Decision 0008-4, Kimi review of k14r3: while the first pass of the move of static sites
+/// runs, a deploy is a direct `503` and leaves no deployment row; after the pass it deploys.
+#[tokio::test]
+async fn a_deploy_waits_for_the_move_of_static_sites() {
+    let w = world().await;
+    let app = w.app("Moving").await;
+    let folder = w
+        .folder("site", &[("app.yaml", MANIFEST), ("index.html", INDEX)])
+        .await;
+    w.s.apps.sites().begin_move();
+    let e = w.deploy(&w.m(), app, folder, None).await.unwrap_err();
+    assert!(
+        matches!(&e, Error::Api(a) if a.code == ErrorCode::Unavailable),
+        "{e:?}"
+    );
+    let rows =
+        w.s.apps
+            .store()
+            .list_deployments(w.team.id, app, None, PageRequest::default())
+            .await
+            .unwrap();
+    assert!(rows.items.is_empty(), "no deployment row");
+    let legacy: std::sync::Arc<dyn object_store::ObjectStore> =
+        std::sync::Arc::new(object_store::memory::InMemory::new());
+    w.s.apps
+        .sites()
+        .migrate_from(legacy, Duration::from_secs(3600))
+        .await
+        .unwrap();
+    w.preview(app, folder, None).await;
+}
+
 #[tokio::test]
 async fn static_objects_count_against_the_storage_quota() {
     let w = world().await;
