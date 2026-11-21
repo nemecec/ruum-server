@@ -3,11 +3,12 @@
 #
 #   deploy/staging/status.sh --netpol      (or: deploy/staging/tool.sh bash deploy/staging/ops/netpol-probe.sh)
 #
-# Tests TCP reachability from three places: an unknown pod in a temporary namespace, and
-# ephemeral containers inside the real ruum-server and edge pods (same network identity, no
-# fake pod behind their Services). Prints PASS/FAIL per path; exit 1 on any FAIL.
-# Not read-only: it creates the namespace netpol-probe (deleted on exit) and adds an ephemeral
-# container to one ruum-server pod and one edge pod (Kubernetes keeps finished ephemeral
+# Tests TCP reachability from an unknown pod in a temporary namespace, from ephemeral containers
+# inside the real ruum-server, edge and (card I-6) gateway pods (same network identity, no fake pod
+# behind their Services), and from a sandbox: a pod of the runtime class gvisor in ruum-apps. Prints PASS/FAIL per path; exit 1 on any FAIL.
+# Not read-only: it creates the namespace netpol-probe (deleted on exit), a short sandbox pod in
+# ruum-apps, and adds an ephemeral container to one ruum-server pod, one edge pod and one gateway
+# pod (Kubernetes keeps finished ephemeral
 # containers in the pod spec until the pod is replaced; they use no resources).
 # The expected paths follow charts/platform/templates/networkpolicies.yaml; change both together.
 set -uo pipefail
@@ -79,6 +80,46 @@ check edge "$out" "$T_PG" closed
 check edge "$out" "$T_SPICE_HTTP" closed
 check edge "$out" "$T_NATS" closed
 check edge "$out" "$T_MAIL" closed
+
+# 4. The app runtime (card I-6), when the release has it.
+if [[ -z "$(kubectl -n ruum get pods -l app=ruum-gateway -o name 2>/dev/null)" ]]; then
+  echo "SKIP the app runtime: no ruum-gateway pod (a release without it)"
+else
+  T_GW=ruum-gateway.ruum.svc.cluster.local:8494
+  T_EG=ruum-egress.ruum.svc.cluster.local:3128
+  APPS=("$T_GW" "$T_EG")
+  out="$(kubectl -n netpol-probe run probe2 --image=$IMG --restart=Never --rm -i --quiet \
+    --overrides='{"spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":65534,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"probe2","image":"'$IMG'","command":["sh","-c","'"$(probe_cmd "${APPS[@]}")"'"],"securityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}}}]}}' 2>&1)"
+  check unknown-pod "$out" "$T_GW" closed
+  check unknown-pod "$out" "$T_EG" closed
+  out="$(inside edge app=ruum-edge "$T_GW" "$T_EG")"
+  check edge "$out" "$T_GW" open
+  check edge "$out" "$T_EG" closed
+  out="$(inside ruum app=ruum-server "$T_GW" "$T_EG")"
+  check ruum-server "$out" "$T_GW" closed
+  check ruum-server "$out" "$T_EG" closed
+  # The gateway has an egress policy: the core's internal listener and Postgres, nothing else here.
+  out="$(inside ruum app=ruum-gateway "${ALL[@]}" "$T_EG")"
+  check gateway "$out" "$T_SERVER_INT" open
+  check gateway "$out" "$T_PG" open
+  check gateway "$out" "$T_SERVER" closed
+  check gateway "$out" "$T_SPICE_HTTP" closed
+  check gateway "$out" "$T_NATS" closed
+  check gateway "$out" "$T_MAIL" closed
+  check gateway "$out" "$T_ZITADEL" closed
+  check gateway "$out" "$T_EG" closed
+  # A sandbox: a pod of the runtime class gvisor in ruum-apps. It has no DNS, so the targets are
+  # Service addresses. The egress proxy is the positive control: open there, closed elsewhere.
+  ip() { kubectl -n "$1" get service "$2" -o jsonpath='{.spec.clusterIP}'; }
+  S_EG="$(ip ruum ruum-egress):3128" S_GW="$(ip ruum ruum-gateway):8494" S_SRV="$(ip ruum ruum-server):8491"
+  S_INT="$(ip ruum ruum-server-internal):8493" S_PG="$(ip data pg-rw):5432" S_SPICE="$(ip authz spicedb):8443"
+  S_DNS="$(ip kube-system kube-dns):53" S_META=169.254.169.254:80 S_NET=1.1.1.1:443
+  SB=("$S_EG" "$S_GW" "$S_SRV" "$S_INT" "$S_PG" "$S_SPICE" "$S_DNS" "$S_META" "$S_NET")
+  out="$(kubectl -n ruum-apps run sandbox-probe --image=$IMG --restart=Never --rm -i --quiet \
+    --overrides='{"spec":{"runtimeClassName":"gvisor","automountServiceAccountToken":false,"securityContext":{"runAsNonRoot":true,"runAsUser":65534,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"sandbox-probe","image":"'$IMG'","command":["sh","-c","'"$(probe_cmd "${SB[@]}")"'"],"securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}}}]}}' 2>&1)"
+  check sandbox "$out" "$S_EG" open
+  for t in "$S_GW" "$S_SRV" "$S_INT" "$S_PG" "$S_SPICE" "$S_DNS" "$S_META" "$S_NET"; do check sandbox "$out" "$t" closed; done
+fi
 
 [[ $fail == 0 ]] && echo "netpol probe: all paths as expected" || echo "netpol probe: FAILED"
 exit "$fail"

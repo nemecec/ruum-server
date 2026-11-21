@@ -1,8 +1,14 @@
-# deploy-chart.sh sets the two image references, always by digest (review 1 S-7):
+# deploy-chart.sh sets the image references, always by digest (review 1 S-7):
 #   ghcr.io/nemecec/ruum-server@sha256:...   ghcr.io/nemecec/ruum-edge@sha256:...
+# and, from the tags <commit> of the same images.yml run, after the same provenance check (card
+# I-6): ghcr.io/nemecec/ruum-gateway@sha256:...   ghcr.io/nemecec/ruum-egress@sha256:...
+# The app runtime (gateway.yaml, egress.yaml, the apps site of the edge) renders only when both
+# gateway and egress are set; a commit from before I-6 has neither image and deploys without it.
 images:
   server: ""
   edge: ""
+  gateway: ""
+  egress: ""
 # The commit of the images, recorded in the release (and in the ConfigMap ruum-release).
 commit: ""
 # The commit that was live before this deploy (deploy-chart.sh reads it from ruum-release under
@@ -22,6 +28,11 @@ hosts:
   auth: auth.staging.ruum.space
   dav: dav.staging.ruum.space
   content: content.staging.ruumapps.net
+  # The apps domain (card I-6): an app is <app>.<tenant>.<apps>, a preview
+  # <short id>--<app>.<tenant>.<apps>. Its own name under ruumapps.net, apart from the content
+  # hosts (a tenant slug "content" could otherwise collide with them). ruum-server and the
+  # gateway get it as RUUM_APPS_DOMAIN.
+  apps: apps.staging.ruumapps.net
 
 # ACME (review 2 R-3): staging never uses production's Let's Encrypt quota.
 #   letsencrypt-staging: the Let's Encrypt staging CA (not trusted by browsers; for bring-up)
@@ -64,3 +75,40 @@ edge:
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { memory: 256Mi }
+
+# The app gateway (card I-6, crates/ruum-gateway): the only way from the internet to an app.
+# Nothing reaches it but the edge (charts/platform networkpolicies.yaml). RUUM_GATEWAY_* settings.
+gateway:
+  # Two, spread over the nodes, never fewer in a rollout (design 12.7).
+  replicas: 2
+  preStopSeconds: 5
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 256Mi }
+  # RUUM_GATEWAY_WAKE_HOLD: how long a request waits while its app starts (decision 25: 3 s
+  # cold start; a margin for gVisor).
+  wakeHoldSeconds: 10
+  # RUUM_GATEWAY_UPSTREAM_TIMEOUT: until the head of an app's answer.
+  upstreamTimeoutSeconds: 60
+  # Held requests and WebSockets in all (RUUM_GATEWAY_HOLD_GLOBAL, RUUM_GATEWAY_WS_GLOBAL), lower
+  # than the defaults (1024, 8192) for three small nodes; the per-tenant shares stay a quarter.
+  holdGlobal: 256
+  holdPerTenant: 64
+  wsGlobal: 1024
+  wsPerTenant: 256
+  # The static sites' bucket (the blob bucket, card W-2s). The credential is the optional Secret
+  # ruum/ruum-gateway-s3 (k8s/apply.sh, from STG_GATEWAY_S3_*); without it the gateway serves
+  # no static file and says so at start.
+  s3Endpoint: https://hel1.your-objectstorage.com
+  s3Region: hel1
+
+# The egress proxy (card R-2e, crates/ruum-egress): the only way from a sandbox to the internet.
+# Only pods of ruum-apps reach it (charts/platform networkpolicies.yaml).
+egress:
+  # One: registrations live in the proxy's memory, and its control socket is in the pod
+  # (crates/ruum-egress/README.md "Control listener"). A restart denies every app until the
+  # runtime driver registers again (fails closed).
+  replicas: 1
+  resources:
+    requests: { cpu: 20m, memory: 32Mi }
+    limits: { memory: 128Mi }

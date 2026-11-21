@@ -154,7 +154,9 @@ admin tunnel open while it runs (`--no-tunnel` skips it). The command gets no va
 | `deploy/staging/ops/tunnel-setup.sh [--before-bootstrap]` | The admin tunnel: the key (only if missing), the `ruumtunnel` user on the build server, the host key, a test ("Admin access"). `--before-bootstrap` (up.sh runs it in a fresh create, before a missing bootstrap and before a new node's machine config): the test waits for the Talos API of new nodes and skips stg-1's Kubernetes API. |
 | `deploy/staging/deploy.sh <sha>` | Deploys a green commit of main by digest: checks it on the Mac (`gh`), then writes a release request that the deploy controller checks again by itself (`cosign`, GitHub) and runs ("The deploy controller"); `--rollback` to go back to the previous release on purpose, `--rollback-older` stops with the admin path to go back further ("Going back past the previous release"); one deploy at a time (Lease `ruum/ruum-deploy`); `--acme zerossl` to switch the CA. |
 | `deploy/staging/status.sh [--checks]` | What exists, its price, orphans, nodes, pods, backups, deployed commit; with `--checks` also the smoke checks and Zitadel drift. |
-| `deploy/staging/status.sh --netpol` | The network policy probe (`ops/netpol-probe.sh`): an unknown pod reaches no platform port; ruum-server reaches only Postgres, SpiceDB HTTP, NATS and Mailpit; the edge reaches only ruum-server and Zitadel. Not read-only (a temporary namespace, ephemeral containers). |
+| `deploy/staging/status.sh --netpol` | The network policy probe (`ops/netpol-probe.sh`): an unknown pod reaches no platform port; ruum-server reaches only Postgres, SpiceDB HTTP, NATS and Mailpit; the edge reaches only ruum-server, Zitadel and the app gateway; the gateway reaches only the internal listener and Postgres among the platform ports; a sandbox (runtime class gvisor, `ruum-apps`) reaches only the egress proxy. Not read-only (a temporary namespace, ephemeral containers, a sandbox pod). |
+| `tool.sh bash deploy/staging/ops/gvisor-check.sh [--class-only]` | The gVisor extension on every node; without `--class-only` also a pod of the runtime class gvisor and a control pod on each node (card I-6). Not read-only (short pods in `ruum-apps`). |
+| `deploy/staging/ops/smoke-apps.sh` | The smoke checks of the app runtime (card I-6), on the Mac; also in `status.sh --checks`. |
 | `deploy/staging/destroy.sh --plan` | Three lists (removed, kept on purpose, never touched) and the state compared with the labelled resources. Read-only. |
 | `deploy/staging/destroy.sh` | The same, then asks you to type `destroy ruum-staging`. |
 | `deploy/staging/destroy.sh --sweep` | When the state is lost: deletes by label `env=staging`, only the staging names (nodes, their IPs, LB, network, firewall, placement group, and the rrsets of `rrsets.json`), never the build server or the zones. |
@@ -162,7 +164,7 @@ admin tunnel open while it runs (`--no-tunnel` skips it). The command gets no va
 | `deploy/staging/tests/server-env.sh` | The guard against drift between the server and the chart: every `RUUM_*` setting of the chart and of `ruum/ruum-server-env` is one the server reads, and every setting it needs in production is set. The list is `crates/ruum-server/env-names.txt`, checked against the code. Change the list when the server gets a new setting. |
 | `deploy/staging/tool.sh COMMAND...` | One command in the tools container (kubectl, talosctl, helm, the `ops/` scripts below). `--port N` publishes a port on `127.0.0.1` of the Mac. |
 | `deploy/staging/tools-image.sh [build \| clean]` | Builds or removes the tools image (the steps build it when it is missing). |
-| `tool.sh bash deploy/staging/ops/upgrade-talos.sh`, `... ops/upgrade-k8s.sh` | Upgrades, one node at a time, after a version change in `versions.env`. |
+| `tool.sh bash deploy/staging/ops/upgrade-talos.sh [--check]`, `... ops/upgrade-k8s.sh` | Upgrades, one node at a time, after a version or schematic change in `versions.env`; `--check` only reports each node's version, schematic and extensions. |
 | `tool.sh bash deploy/staging/ops/restore-test.sh` | Monthly restore test into a temporary cluster. |
 | `tool.sh bash deploy/staging/ops/check-capacity.sh` | The N-1 sizing rule (below). |
 | `ops/check-backup.sh` | Bring-up check (`up.sh --apply` runs it after the platform): a forced WAL switch is archived into the COMPLIANCE-locked bucket and an on-demand base backup completes (code review F-7). |
@@ -502,11 +504,117 @@ step from a checkout before this change: it writes the owner's DSN back into `ru
 
 The sum of the memory requests must fit on two nodes, or a node upgrade hangs. Requests in the
 charts: Postgres 2 x 512 MiB, Zitadel 384 MiB, ruum-server 2 x 200 MiB, SpiceDB 128 MiB,
-operators about 300 MiB, NATS 64 MiB, edge 3 x 64 MiB, deploy controller 64 MiB, Mailpit 32 MiB:
-about 2.6 GiB plus the system pods,
+operators about 300 MiB, NATS 64 MiB, edge 3 x 64 MiB, deploy controller 64 MiB, Mailpit 32 MiB,
+the app gateway 2 x 64 MiB and the egress proxy 32 MiB (card I-6): about 2.8 GiB plus the system
+pods (sandboxes come on top, each with the runtime class overhead of 64 MiB),
 against about 6.5 GiB allocatable on two cx23. `ops/check-capacity.sh` measures it on the live
 cluster; run it in the first week with one node cordoned. If it does not fit, set
 `NODE_COUNT=4` before the first upgrade.
+
+## The app runtime (card I-6)
+
+Milestone M2 on staging: apps are served at `<app>.<tenant slug>.apps.staging.ruumapps.net`
+(previews `<short id>--<app>.<tenant slug>.apps.staging.ruumapps.net`).
+
+- **gVisor on the nodes.** `talos/schematic.yaml` adds the Talos system extension
+  `siderolabs/gvisor`; `TALOS_SCHEMATIC` in `versions.env` is that file's SHA-256 (Image
+  Factory's ID; `tests/run.sh` checks it), and the installer image and the snapshot follow it.
+  Running nodes get it only through `ops/upgrade-talos.sh` (one node at a time; a node is
+  current when it runs `TALOS_VERSION` with that schematic and every extension of the file).
+  New nodes boot the snapshot labelled `schematic=<first 32 hex>`; `tofu` never replaces a
+  running node for a new snapshot. The runtime class `gvisor` (handler `runsc`,
+  `k8s/manifests/runtimeclass.yaml`) is applied by the platform step only after
+  `ops/gvisor-check.sh --class-only` found the extension on every node; at its end the step
+  runs a pod of that class and a control pod on every node (`ops/gvisor-check.sh`): the control
+  must see the node's kernel and the gVisor pod must not.
+- **The gateway and the egress proxy** (`charts/ruum` `gateway.yaml`, `egress.yaml`) run from
+  `ghcr.io/nemecec/ruum-gateway` and `ruum-egress`, built, scanned and attested by `images.yml`
+  with the other images. `ops/deploy-chart.sh` takes them from the tag `<commit>` and checks
+  their provenance like the server's; a commit without them (older than I-6) deploys without the
+  app runtime, and one image without the other stops the deploy. The gateway: two replicas,
+  `RUUM_GATEWAY_*` settings from the chart, its database role `ruum_gateway` (it may only execute
+  `ruum_app_host_lookup`; `k8s/sql/ruum-gateway-grants.sql` fails the platform step when it can
+  do more), the user-token key as a file (`STG_GATEWAY_TOKEN_KEY`), and an optional read
+  credential of the static sites' bucket (`STG_GATEWAY_S3_*`; without it the gateway serves no
+  static file). The egress proxy: one replica, CONNECT on 443, `EGRESS_DENY` from the Hetzner API
+  (the cluster ranges and every public address of staging and of the build server, ConfigMap
+  `ruum/ruum-egress-deny`), its control socket inside the pod.
+- **Network policy** (`charts/platform` `networkpolicies.yaml`): nothing reaches the gateway but
+  the edge (8494); the gateway reaches only ruum-server's internal listener (8493), Postgres,
+  the sandboxes, DNS and public addresses on 443 (the bucket); sandboxes in `ruum-apps` get
+  ingress only from the gateway and egress only to the egress proxy (3128: no DNS, no other
+  pod, no metadata address); only `ruum-apps` reaches the egress proxy, which reaches DNS and
+  public addresses on 443. `status.sh --netpol` probes each path, a sandbox of the runtime class
+  gvisor included.
+- **The edge and DNS.** The site `*.*.apps.staging.ruumapps.net` goes to the gateway with
+  on-demand TLS and no HSTS; ruum-server's `ask` endpoint answers 200 only for a host whose
+  tenant slug and app slug name an existing app (`ruum_api::internal`), within the same hourly
+  limit as the content hosts. `tofu/cluster/dns.tf`: `*.apps.staging` A, AAAA and CAA.
+  `RUUM_APPS_DOMAIN` is the same in ruum-server and the gateway (the app addresses, the sign-in
+  redirect to an app origin).
+- **Smoke checks** (`ops/smoke-apps.sh`, in `status.sh --checks`): DNS, no certificate for an
+  unknown app host, and for the hosts in `STG_SMOKE_STATIC_HOST` (and, later,
+  `STG_SMOKE_NODE22_HOST`) a certificate, no HSTS, and the gateway's sign-in chain to the
+  platform. The page behind the sign-in is the person's browser check.
+
+**Not on staging yet** (backlog I6-1 to I6-6): a runtime driver that starts sandboxes on
+Kubernetes (the Docker driver needs a Docker engine; Talos has none), so node22 apps answer the
+gateway's 502 after the sign-in and the node22 smoke check prints BLOCKED; the registration of
+sandboxes at the egress proxy (its identity is a registered subnet; Kubernetes pods share the
+node's pod range, so the driver must register each pod address, and its control socket is
+inside the proxy's pod); the builder, the database pooler, the telemetry listeners, the key set
+of user tokens for apps (P-97); scale to zero (Knative or KEDA, STEP3 "Infrastructure work" 11).
+
+### The person, once
+
+1. GitHub, after the first `images.yml` run on main that publishes them: the packages
+   `ruum-gateway` and `ruum-egress` (Your profile, Packages, the package, Package settings,
+   "Change visibility", Public), like `ruum-server`. Until then `deploy-chart.sh` finds no
+   image and deploys without the app runtime.
+2. Optional, for static apps: Hetzner Console, project of staging, Object Storage, "S3
+   credentials", "Generate credentials", description `ruum-staging-gateway`. Put the two values
+   into `secrets.env` as `STG_GATEWAY_S3_ACCESS_KEY` and `STG_GATEWAY_S3_SECRET_KEY`. Hetzner
+   credentials are not scoped: this key can write every bucket of the project, like the server's.
+   A separate key only makes it separately revocable (backlog I6-3).
+3. After the deploy: sign in at `https://staging.ruum.space`, deploy one static app over MCP or
+   the web UI and publish it, put its host into `secrets.env` as `STG_SMOKE_STATIC_HOST`, and open
+   it in the browser (a certificate of the configured CA, the page after the app sign-in).
+
+### The orchestrator: from main to the app runtime
+
+Each step stops on the first error; the live release keeps serving through all of them.
+
+1. `deploy/staging/up.sh` (read-only plan). Expected: the persistent root unchanged; the cluster
+   root creates `hcloud_zone_rrset.apps_a["*.apps.staging"]`, `apps_aaaa["*.apps.staging"]` and
+   `app_origins_caa`, and changes `talos_machine_configuration_apply.node["stg-1"]` to `["stg-3"]`
+   in place (the installer image); Talos access `tunnel`; nothing else; price unchanged.
+2. `deploy/staging/tool.sh bash deploy/staging/ops/upgrade-talos.sh --check` shows each node's
+   version, schematic and extensions (read-only). Then
+   `deploy/staging/tool.sh bash deploy/staging/ops/upgrade-talos.sh`: one node at a time, through
+   the admin tunnel (capacity check, etcd, pods, CNPG switchover, `talosctl upgrade` with the new
+   installer image, wait, the schematic and gvisor checked before the next node). About 10
+   minutes per node. `--check` again: all current.
+3. `RUUM_STAGING_APPLY=yes deploy/staging/up.sh --apply --infra-only`: uploads the snapshot of the
+   new schematic (a temporary server for about 10 minutes), applies the three DNS records and
+   the machine configs through the admin tunnel (the nodes already run that installer image, so
+   nothing reboots).
+4. `deploy/staging/secrets-init.sh` (adds `STG_PG_RUUM_GATEWAY_PASSWORD`, `STG_GATEWAY_TOKEN_KEY`,
+   `STG_EGRESS_CONTROL_TOKEN`; prints names only), then
+   `RUUM_STAGING_APPLY=yes deploy/staging/secrets-push.sh platform`: the extension check, the
+   runtime class, `ruum-apps`, the network policies, the role `ruum_gateway` and its grants, the
+   Secrets `ruum/ruum-gateway`, `ruum/ruum-egress` (and `ruum/ruum-gateway-s3` when the person
+   made the key), `ruum/ruum-egress-deny`, the new deploy controller (whose chart has the
+   gateway), and the gVisor pod check.
+5. `deploy/staging/deploy.sh <sha of main>`: the controller resolves the gateway and egress
+   images of that commit and rolls out the chart; ruum-server gets `RUUM_APPS_DOMAIN`.
+6. `deploy/staging/status.sh --checks` (smoke and smoke-apps) and `deploy/staging/status.sh
+   --netpol`.
+
+Going back: `deploy.sh --rollback` to the previous release removes the gateway and the egress
+proxy with the chart (the controller's chart renders them only with both images; the previous
+commit has none); the older ruum-server ignores `RUUM_APPS_DOMAIN` and gives no certificate to
+app hosts. The runtime class, `ruum-apps`, the policies and the Secrets stay (the platform step of an
+older checkout removes the policies; the rest is harmless). The nodes keep gVisor.
 
 ## Recreate
 

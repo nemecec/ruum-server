@@ -10,6 +10,10 @@
 #     email matches a strict pattern;
 #   - the tag <commit> of each image resolves to exactly that digest;
 #   - each digest has a provenance attestation of images.yml on refs/heads/main (cosign);
+#   - the app runtime (card I-6): the gateway and egress images come from the tag <commit> of
+#     ghcr.io/nemecec/ruum-{gateway,egress} (the same images.yml run), each with the same
+#     provenance check. A commit without them (before I-6) deploys without the app runtime;
+#     one image without the other stops the deploy;
 #   - the values go to helm in a values file (JSON), never through --set, so no value can add
 #     another key (helm splits --set on commas).
 # Then (design 12.7, backlog O-25), holding the deploy lock (Lease ruum/ruum-deploy,
@@ -90,6 +94,25 @@ for ref in "$server" "$edge"; do
   [[ "$tagged" == "${ref#*@}" ]] || die "ghcr.io/$name:$commit is not ${ref#*@} (got ${tagged:-nothing})"
   cosign_verify_provenance "$ref" || die "no valid provenance attestation for $ref"
 done
+
+# The app runtime (card I-6): the gateway and the egress proxy of the same commit, by digest.
+gateway="" egress=""
+for kind in gateway egress; do
+  digest="$(ghcr_digest "nemecec/ruum-$kind" "$commit" 2>/dev/null || true)"
+  [[ -n "$digest" ]] || continue
+  [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]] || die "ghcr.io/nemecec/ruum-$kind:$commit resolves to an odd digest"
+  ref="ghcr.io/nemecec/ruum-$kind@$digest"
+  [[ "$ref" =~ $RUUM_APP_IMAGE_RE ]] || die "unexpected $kind image $ref"
+  cosign_verify_provenance "$ref" || die "no valid provenance attestation for $ref"
+  printf -v "$kind" '%s' "$ref"
+done
+if [[ -n "$gateway" && -n "$egress" ]]; then
+  echo "==> app runtime: $gateway, $egress (provenance checked)" >&2
+elif [[ -n "$gateway$egress" ]]; then
+  die "only one of ruum-gateway and ruum-egress has the tag $commit; images.yml publishes both (card I-6)"
+else
+  echo "==> no ruum-gateway or ruum-egress image of $commit: deploying without the app runtime (a commit from before card I-6, or the packages are not public yet)" >&2
+fi
 
 tmp="$(mktemp -d "$WORK/deploy.XXXXXX")"
 holder="deploy-${commit:0:12}-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
@@ -178,8 +201,8 @@ ruum_lock_renew "$holder" || die "lost the deploy lock after the migration step;
 
 # 3. The values as JSON (valid YAML), built by jq from validated strings.
 values="$tmp/values.json"
-jq -n --arg server "$server" --arg edge "$edge" --arg commit "$commit" --arg previous "$previous_value" --arg acme "$acme" --arg email "$acme_email" '
-  { images: { server: $server, edge: $edge }, commit: $commit, previousCommit: $previous }
+jq -n --arg server "$server" --arg edge "$edge" --arg gateway "$gateway" --arg egress "$egress" --arg commit "$commit" --arg previous "$previous_value" --arg acme "$acme" --arg email "$acme_email" '
+  { images: { server: $server, edge: $edge, gateway: $gateway, egress: $egress }, commit: $commit, previousCommit: $previous }
   + (if $acme != "" then { acme: ({ issuer: $acme } + (if $email != "" then { email: $email } else {} end)) } else {} end)
 ' >"$values"
 

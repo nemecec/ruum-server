@@ -1,10 +1,15 @@
 # Network policy (review 1 S-1), enforced by kube-network-policies next to Flannel. Each
 # namespace of Ruum denies all ingress by default; the rules below open only what a client
 # needs. Kubelet probes are not affected (kube-network-policies passes node-root traffic).
-# There is no egress policy: outgoing traffic is open, so Zitadel reaches Scaleway's SMTP on port
-# 587 (backlog O-20). The Hetzner firewall has inbound rules only. If an egress policy is added,
-# allow auth/zitadel to TCP 587 out (and DNS).
-{{- $ns := list "data" "authz" "auth" "ops" "nats" "ruum" "edge" "ruum-deploy" }}
+# Egress policies exist only for the app runtime (card I-6): the app gateway, the egress proxy and
+# the sandboxes of ruum-apps. Every other pod's outgoing traffic is open, so Zitadel reaches
+# Scaleway's SMTP on port 587 (backlog O-20). The Hetzner firewall has inbound rules only. If an
+# egress policy is added for Zitadel, allow auth/zitadel to TCP 587 out (and DNS).
+{{- $ns := list "data" "authz" "auth" "ops" "nats" "ruum" "edge" "ruum-deploy" "ruum-apps" }}
+{{- /* The private and special ranges that the gateway and the egress proxy never reach outside
+       the cluster rules below (the egress proxy checks them again after resolution). */}}
+{{- $private4 := list "10.0.0.0/8" "100.64.0.0/10" "127.0.0.0/8" "169.254.0.0/16" "172.16.0.0/12" "192.168.0.0/16" }}
+{{- $private6 := list "fc00::/7" "fe80::/10" "::1/128" }}
 {{- range $ns }}
 ---
 apiVersion: networking.k8s.io/v1
@@ -43,6 +48,11 @@ spec:
             matchLabels: { kubernetes.io/metadata.name: ruum }
           podSelector:
             matchLabels: { app: ruum-migrate }
+        # The app gateway: its role may only execute ruum_app_host_lookup (card I-6).
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ruum }
+          podSelector:
+            matchLabels: { app: ruum-gateway }
         - namespaceSelector:
             matchLabels: { kubernetes.io/metadata.name: auth }
         - namespaceSelector:
@@ -147,6 +157,172 @@ spec:
         - { protocol: TCP, port: 8491 }
         - { protocol: TCP, port: 8492 }
         - { protocol: TCP, port: 8493 }
+---
+# ------------------------------------------------------------------ the app runtime (card I-6)
+# The core's internal listener from the app gateway too (its small internal API, decision 0006-1).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ruum-server-internal-from-gateway
+  namespace: ruum
+spec:
+  podSelector:
+    matchLabels: { app: ruum-server }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app: ruum-gateway }
+      ports:
+        - { protocol: TCP, port: 8493 }
+---
+# Nothing reaches the app gateway but the edge.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-from-edge
+  namespace: ruum
+spec:
+  podSelector:
+    matchLabels: { app: ruum-gateway }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: edge }
+          podSelector:
+            matchLabels: { app: ruum-edge }
+      ports:
+        - { protocol: TCP, port: 8494 }
+---
+# The app gateway reaches the core's internal listener, Postgres, the sandboxes, DNS and the
+# static sites' bucket (a public address on 443), nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-egress
+  namespace: ruum
+spec:
+  podSelector:
+    matchLabels: { app: ruum-gateway }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: { app: ruum-server }
+      ports:
+        - { protocol: TCP, port: 8493 }
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: data }
+          podSelector:
+            matchLabels: { cnpg.io/cluster: pg }
+      ports:
+        - { protocol: TCP, port: 5432 }
+    # The sandboxes on whatever port their app listens on.
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ruum-apps }
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: {{ toJson $private4 }}
+        - ipBlock:
+            cidr: ::/0
+            except: {{ toJson $private6 }}
+      ports:
+        - { protocol: TCP, port: 443 }
+---
+# The egress proxy: only sandboxes reach it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-from-sandboxes
+  namespace: ruum
+spec:
+  podSelector:
+    matchLabels: { app: ruum-egress }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ruum-apps }
+      ports:
+        - { protocol: TCP, port: 3128 }
+---
+# The egress proxy reaches DNS and public addresses on 443 only, never a private range (it
+# refuses them itself too, after resolution, with EGRESS_DENY).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-proxy-out
+  namespace: ruum
+spec:
+  podSelector:
+    matchLabels: { app: ruum-egress }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: {{ toJson $private4 }}
+        - ipBlock:
+            cidr: ::/0
+            except: {{ toJson $private6 }}
+      ports:
+        - { protocol: TCP, port: 443 }
+---
+# Sandboxes: only the app gateway reaches them (default deny ingress above).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sandboxes-from-gateway
+  namespace: ruum-apps
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ruum }
+          podSelector:
+            matchLabels: { app: ruum-gateway }
+---
+# Sandboxes reach the egress proxy and nothing else: no DNS, no other sandbox, no platform
+# service, no metadata address (docs/STEP3.md "How an app runs" rule 2). An app sets
+# HTTPS_PROXY to the proxy's Service address; the proxy resolves names.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sandboxes-only-to-egress
+  namespace: ruum-apps
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ruum }
+          podSelector:
+            matchLabels: { app: ruum-egress }
+      ports:
+        - { protocol: TCP, port: 3128 }
 ---
 # The edge: from the load balancer over the private network (proxy protocol from 10.20.1.5).
 apiVersion: networking.k8s.io/v1

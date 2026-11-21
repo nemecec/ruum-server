@@ -251,6 +251,22 @@ impl AppStore for MemoryAppStore {
         })
     }
 
+    async fn app_host_known(&self, tenant_slug: &str, app_slug: &str) -> Result<bool> {
+        let st = self.st();
+        let Some(tenant) = st
+            .tenants
+            .values()
+            .find(|t| t.slug == tenant_slug)
+            .map(|t| t.tenant_id)
+        else {
+            return Ok(false);
+        };
+        Ok(st
+            .apps
+            .values()
+            .any(|a| a.tenant_id == tenant && a.slug == app_slug))
+    }
+
     async fn insert_app(&self, ctx: &Context, app: NewApp) -> Result<Option<AppRow>> {
         let mut st = self.st();
         let tenant = ctx.tenant;

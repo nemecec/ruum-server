@@ -62,6 +62,11 @@ RUUM_S3_FORCE_PATH_STYLE required
 # WebDAV host (ruum-webdav lib.rs)
 RUUM_DAV_SPOOL_DIR optional
 
+# Apps (card I-6; ruum-core apps::AppConfig::from_env): the apps domain of app addresses, the
+# sign-in redirect to app origins and the certificates of app hosts (tls-ask). The same value as
+# the gateway's RUUM_APPS_DOMAIN. Default ruumapps.net (production).
+RUUM_APPS_DOMAIN optional
+
 # Databases (card D-1): the data cluster and the key-encryption key. Off without RUUM_DBHOST_URL.
 RUUM_DBHOST_URL optional
 RUUM_DATA_CLUSTER optional

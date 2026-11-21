@@ -16,7 +16,9 @@ locals {
   ]
 
   space_hosts = ["staging", "auth.staging", "dav.staging"]
-  apps_hosts  = ["content.staging", "*.content.staging"]
+  # *.apps.staging: every app and preview origin <label>.<tenant>.apps.staging.ruumapps.net
+  # (card I-6). A DNS wildcard answers for any depth below it while no closer name exists.
+  apps_hosts = ["content.staging", "*.content.staging", "*.apps.staging"]
 }
 
 resource "hcloud_zone_rrset" "space_a" {
@@ -71,6 +73,17 @@ resource "hcloud_zone_rrset" "space_caa" {
 resource "hcloud_zone_rrset" "apps_caa" {
   zone    = data.hcloud_zone.ruumapps_net.name
   name    = "content.staging"
+  type    = "CAA"
+  ttl     = 300
+  labels  = local.labels
+  records = [for v in local.caa : { value = v }]
+}
+
+# The app origins (card I-6): the same CAs, answered for every name under apps.staging (a CAA
+# lookup of a.b.apps.staging finds the wildcard's record before it climbs to the zone).
+resource "hcloud_zone_rrset" "app_origins_caa" {
+  zone    = data.hcloud_zone.ruumapps_net.name
+  name    = "*.apps.staging"
   type    = "CAA"
   ttl     = 300
   labels  = local.labels

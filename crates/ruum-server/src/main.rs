@@ -191,10 +191,13 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(addr = %bind, "internal listener (edge only) listening");
             let router = ruum_api::internal::router(
                 state.clone(),
+                // App hosts of the apps domain get certificates too (card I-6): the same
+                // domain as the server's app addresses (RUUM_APPS_DOMAIN).
                 ruum_api::internal::TlsAskConfig::for_content_url(
                     &config.content_url,
                     config.tls_ask_new_hosts_per_hour,
-                ),
+                )
+                .with_apps_domain(&state.services.apps.deps().config.apps_domain),
             );
             Some(
                 axum::serve(listener, router.into_make_service())

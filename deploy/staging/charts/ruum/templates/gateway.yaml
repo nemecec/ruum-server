@@ -1,0 +1,130 @@
+{{- if include "ruum.apps" . }}
+# The app gateway (card I-6; crates/ruum-gateway, decision 0006-1; docs/STEP3.md "How an app runs"
+# rule 3). The internet reaches it only through the edge (the site *.*.<hosts.apps>); network
+# policy (charts/platform networkpolicies.yaml): nothing but the edge reaches it, and it reaches
+# only the core's internal listener, Postgres (its role may only execute ruum_app_host_lookup),
+# the static sites' bucket, DNS and the sandboxes in ruum-apps. It holds no tenant key: the
+# user-token key (Secret ruum/ruum-gateway, a file, never an environment value), its database
+# password and an optional read credential of the bucket.
+# Updates without downtime (design 12.7): two replicas spread over the nodes, maxUnavailable 0,
+# a disruption budget, a pause before SIGTERM.
+{{- $pause := int .Values.gateway.preStopSeconds }}
+{{- if lt (int .Values.gateway.replicas) 2 }}
+{{- fail "gateway.replicas must be at least 2 (design 12.7)" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ruum-gateway
+  namespace: ruum
+  labels: { app: ruum-gateway }
+  annotations:
+    ruum.space/commit: {{ .Values.commit | quote }}
+spec:
+  replicas: {{ .Values.gateway.replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  minReadySeconds: 5
+  selector:
+    matchLabels: { app: ruum-gateway }
+  template:
+    metadata:
+      labels: { app: ruum-gateway }
+      annotations:
+        ruum.space/commit: {{ .Values.commit | quote }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ add $pause 30 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: ruum-gateway }
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: gateway
+          image: {{ include "ruum.appImage" (list "gateway" .Values.images.gateway) }}
+          env:
+            - { name: RUST_LOG, value: "info" }
+            # The one listener; the gateway opens no other and forwards nothing between networks.
+            - { name: RUUM_GATEWAY_BIND, value: "0.0.0.0:8494" }
+            - { name: RUUM_APPS_DOMAIN, value: {{ .Values.hosts.apps | quote }} }
+            # The instance's origin: the iss of user tokens, and where /v1/auth/login is.
+            - { name: RUUM_GATEWAY_ISSUER, value: "https://{{ .Values.hosts.public }}" }
+            - { name: RUUM_GATEWAY_INTERNAL_URL, value: "http://ruum-server-internal.ruum.svc.cluster.local:8493" }
+            - name: RUUM_GATEWAY_DATABASE_URL
+              valueFrom: { secretKeyRef: { name: ruum-gateway, key: database-url } }
+            - { name: RUUM_GATEWAY_TOKEN_KEY_FILE, value: /keys/token-key }
+            # The static sites' bucket: only with the optional Secret ruum-gateway-s3 (the
+            # bucket name is in it, so without it the gateway serves no static file).
+            - name: RUUM_GATEWAY_S3_BUCKET
+              valueFrom: { secretKeyRef: { name: ruum-gateway-s3, key: bucket, optional: true } }
+            - name: RUUM_GATEWAY_S3_ACCESS_KEY_ID
+              valueFrom: { secretKeyRef: { name: ruum-gateway-s3, key: access-key-id, optional: true } }
+            - { name: RUUM_GATEWAY_S3_SECRET_ACCESS_KEY_FILE, value: /s3/secret-access-key }
+            - { name: RUUM_GATEWAY_S3_ENDPOINT, value: {{ .Values.gateway.s3Endpoint | quote }} }
+            - { name: RUUM_GATEWAY_S3_REGION, value: {{ .Values.gateway.s3Region | quote }} }
+            - { name: RUUM_GATEWAY_WAKE_HOLD, value: {{ int .Values.gateway.wakeHoldSeconds | quote }} }
+            - { name: RUUM_GATEWAY_UPSTREAM_TIMEOUT, value: {{ int .Values.gateway.upstreamTimeoutSeconds | quote }} }
+            - { name: RUUM_GATEWAY_HOLD_GLOBAL, value: {{ int .Values.gateway.holdGlobal | quote }} }
+            - { name: RUUM_GATEWAY_HOLD_PER_TENANT, value: {{ int .Values.gateway.holdPerTenant | quote }} }
+            - { name: RUUM_GATEWAY_WS_GLOBAL, value: {{ int .Values.gateway.wsGlobal | quote }} }
+            - { name: RUUM_GATEWAY_WS_PER_TENANT, value: {{ int .Values.gateway.wsPerTenant | quote }} }
+          ports:
+            - { name: gateway, containerPort: 8494 }
+          # The gateway answers only app hosts, so the probes check the listener, not a path.
+          readinessProbe:
+            tcpSocket: { port: gateway }
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            tcpSocket: { port: gateway }
+            periodSeconds: 30
+            failureThreshold: 5
+          lifecycle:
+            preStop:
+              sleep: { seconds: {{ $pause }} }
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+          {{- include "ruum.restricted" . | nindent 10 }}
+          volumeMounts:
+            - { name: keys, mountPath: /keys, readOnly: true }
+            - { name: s3, mountPath: /s3, readOnly: true }
+            - { name: pg-ca, mountPath: /pg-ca, readOnly: true }
+      volumes:
+        - name: keys
+          secret: { secretName: ruum-gateway, items: [{ key: token-key, path: token-key }] }
+        - name: s3
+          secret: { secretName: ruum-gateway-s3, optional: true, items: [{ key: secret-access-key, path: secret-access-key }] }
+        - name: pg-ca
+          secret: { secretName: pg-ca, items: [{ key: ca.crt, path: ca.crt }] }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ruum-gateway
+  namespace: ruum
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: ruum-gateway }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ruum-gateway
+  namespace: ruum
+spec:
+  selector: { app: ruum-gateway }
+  ports:
+    - { name: gateway, port: 8494, targetPort: gateway }
+{{- end }}

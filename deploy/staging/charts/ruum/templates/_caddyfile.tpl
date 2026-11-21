@@ -106,6 +106,23 @@
 	reverse_proxy ruum-server.ruum.svc.cluster.local:8491
 }
 
+{{- if include "ruum.apps" . }}
+
+# App origins (card I-6): every app and preview host <label>.<tenant>.<apps domain> goes to the
+# app gateway, which checks every request (docs/STEP3.md "How an app runs" rule 3) and sets the
+# answer's headers itself. On-demand TLS only here and for the tenant content hosts: Caddy asks
+# ruum-server's internal listener, which answers 200 only for a host of an existing app, and
+# fails closed. No HSTS (ruumapps.net, stgsec S-6). The gateway drops X-Forwarded-*, Forwarded
+# and X-Real-IP before an app sees the request (decision 0006 G).
+*.*.{{ .Values.hosts.apps }} {
+	tls {
+		on_demand
+	}
+	header -Server
+	reverse_proxy ruum-gateway.ruum.svc.cluster.local:8494
+}
+{{- end }}
+
 # Port 80 as an explicit site. Without it, automatic HTTPS creates the HTTP redirect server at
 # runtime, outside this config, so it never gets the proxy_protocol listener wrapper: the load
 # balancer's PROXY header then reaches the HTTP parser, every request on port 80 answers 400,

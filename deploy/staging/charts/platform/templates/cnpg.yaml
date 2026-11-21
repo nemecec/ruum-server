@@ -63,6 +63,15 @@ spec:
         login: true
         inherit: false
         passwordSecret: { name: pg-role-ruum-app }
+      # The app gateway (card I-6): it may only execute ruum_app_host_lookup (migration 0013;
+      # k8s/sql/ruum-gateway-grants.sql grants it and fails when the role can read a table).
+      - name: ruum_gateway
+        ensure: present
+        login: true
+        inherit: false
+        # Two replicas and a surge pod in a rollout, 8 connections each (ruum-gateway main.rs).
+        connectionLimit: 32
+        passwordSecret: { name: pg-role-ruum-gateway }
       - name: zitadel
         ensure: present
         login: true

@@ -3,7 +3,8 @@
 #
 #   deploy/staging/status.sh            resources by label and their monthly price, nodes, pods,
 #                                       backups, deployed commit
-#   deploy/staging/status.sh --checks   also the smoke checks (ops/smoke.sh) and Zitadel drift
+#   deploy/staging/status.sh --checks   also the smoke checks (ops/smoke.sh, ops/smoke-apps.sh) and
+#                                       Zitadel drift
 #   deploy/staging/status.sh --netpol   only the network policy probe (ops/netpol-probe.sh; not
 #                                       read-only: a temporary namespace and ephemeral containers)
 set -euo pipefail
@@ -21,4 +22,6 @@ fi
 stg_secret_stream "${STG_NAMES_TOFU[@]}" | stg_run ro status "$@"
 if [[ "${1:-}" == --checks ]]; then
   bash "$STG_HERE/ops/smoke.sh" || true
+  # The app runtime (card I-6): DNS, on-demand TLS of app hosts, the smoke apps.
+  bash "$STG_HERE/ops/smoke-apps.sh" || true
 fi

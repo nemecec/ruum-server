@@ -5,8 +5,11 @@
 //! the edge reach it (review 1 B-6).
 //!
 //! - `GET /internal/tls-ask?domain=<host>`: the `ask` endpoint of Caddy's on-demand TLS. It
-//!   answers `200` only for `<tenant>.<content host>` where the tenant exists, and `404` for every
-//!   other name, so Caddy gets no certificate for a name that nobody uses. Caddy fails closed: an
+//!   answers `200` only for `<tenant>.<content host>` where the tenant exists, and for an app
+//!   host `<app>.<tenant slug>.<apps domain>` or `<short id>--<app>.<tenant slug>.<apps domain>`
+//!   where that tenant has an app with that slug (card I-6; the gateway decides later whether
+//!   the host serves), and `404` for every other name, so Caddy gets no certificate for a name
+//!   that nobody uses. Caddy fails closed: an
 //!   error or a timeout also means no certificate. New names are rate limited
 //!   ([`TlsAskConfig::new_hosts_per_hour`]), so even many real tenants cannot use up the CA's
 //!   limits in a burst; a name that was allowed once stays allowed without counting again.
@@ -40,6 +43,7 @@ use axum::Router;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
+use ruum_core::TenantId;
 use ruum_core::blobs::signed::tenant_of_host;
 use serde::Deserialize;
 use std::collections::{HashSet, VecDeque};
@@ -52,8 +56,12 @@ pub struct TlsAskConfig {
     /// The host of the user content domain, for example `content.staging.ruumapps.net`.
     pub content_host: String,
     /// At most this many names that were not allowed before get `200` per hour
-    /// (`RUUM_TLS_ASK_NEW_HOSTS_PER_HOUR`, default 20). Over the limit: `429`.
+    /// (`RUUM_TLS_ASK_NEW_HOSTS_PER_HOUR`, default 20). Over the limit: `429`. Content hosts and
+    /// app hosts share the limit.
     pub new_hosts_per_hour: usize,
+    /// The apps domain (`RUUM_APPS_DOMAIN`, for example `apps.staging.ruumapps.net`), lower case
+    /// without dots at the ends. `None`: no app host gets a certificate (card I-6).
+    pub apps_domain: Option<String>,
 }
 
 impl TlsAskConfig {
@@ -66,8 +74,43 @@ impl TlsAskConfig {
         Self {
             content_host: host,
             new_hosts_per_hour,
+            apps_domain: None,
         }
     }
+
+    /// The same settings, and certificates for the app hosts of `apps_domain` (card I-6).
+    pub fn with_apps_domain(mut self, apps_domain: &str) -> Self {
+        let d = apps_domain.trim().trim_matches('.').to_ascii_lowercase();
+        self.apps_domain = (!d.is_empty()).then_some(d);
+        self
+    }
+}
+
+/// The tenant and app slugs of an app host `<app>.<tenant>.<apps domain>` or
+/// `<short id>--<app>.<tenant>.<apps domain>` (the rules of `ruum-gateway`'s host parser:
+/// exactly two labels in front of the domain, slug rules, a short ID of 8 characters of
+/// `[a-z0-9]`). `None` for anything else.
+fn app_host_slugs<'a>(domain: &'a str, apps_domain: &str) -> Option<(&'a str, &'a str)> {
+    use ruum_core::apps::slugs::{SlugKind, is_valid};
+    let front = domain.strip_suffix(apps_domain)?.strip_suffix('.')?;
+    let (first, tenant) = front.split_once('.')?;
+    if tenant.contains('.') || !is_valid(tenant, SlugKind::Tenant) {
+        return None;
+    }
+    let app = match first.split_once("--") {
+        Some((short, app)) => {
+            let short_ok = short.len() == 8
+                && short
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+            if !short_ok {
+                return None;
+            }
+            app
+        }
+        None => first,
+    };
+    is_valid(app, SlugKind::App).then_some((tenant, app))
 }
 
 #[derive(Default)]
@@ -613,17 +656,32 @@ async fn tls_ask(State(s): State<AskState>, Query(q): Query<AskQuery>) -> Status
     else {
         return StatusCode::BAD_REQUEST;
     };
-    let Some(label) = domain
-        .strip_suffix(&s.config.content_host)
-        .and_then(|rest| rest.strip_suffix('.'))
-    else {
-        return StatusCode::NOT_FOUND;
-    };
-    // Exactly one label in front of the content host, and it is a tenant ID.
-    if label.is_empty() || label.contains('.') {
-        return StatusCode::NOT_FOUND;
+    // What the name must be: a content host of an existing tenant, or an app host of an
+    // existing app (card I-6).
+    enum Wanted<'a> {
+        Content(TenantId),
+        App { tenant: &'a str, app: &'a str },
     }
-    let Some(tenant) = tenant_of_host(label) else {
+    let content = domain
+        .strip_suffix(&s.config.content_host)
+        .and_then(|rest| rest.strip_suffix('.'));
+    let wanted = if let Some(label) = content {
+        // Exactly one label in front of the content host, and it is a tenant ID.
+        if label.is_empty() || label.contains('.') {
+            return StatusCode::NOT_FOUND;
+        }
+        let Some(tenant) = tenant_of_host(label) else {
+            return StatusCode::NOT_FOUND;
+        };
+        Wanted::Content(tenant)
+    } else if let Some((tenant, app)) = s
+        .config
+        .apps_domain
+        .as_deref()
+        .and_then(|apps| app_host_slugs(&domain, apps))
+    {
+        Wanted::App { tenant, app }
+    } else {
         return StatusCode::NOT_FOUND;
     };
     {
@@ -632,7 +690,19 @@ async fn tls_ask(State(s): State<AskState>, Query(q): Query<AskQuery>) -> Status
             return StatusCode::OK;
         }
     }
-    if s.app.services.tenants.find(tenant).await.is_err() {
+    let exists = match wanted {
+        Wanted::Content(tenant) => s.app.services.tenants.find(tenant).await.is_ok(),
+        // An error fails closed: no certificate.
+        Wanted::App { tenant, app } => s
+            .app
+            .services
+            .apps
+            .store()
+            .app_host_known(tenant, app)
+            .await
+            .unwrap_or(false),
+    };
+    if !exists {
         return StatusCode::NOT_FOUND;
     }
     let mut w = s.window.lock().expect("ask window lock");
@@ -731,6 +801,79 @@ mod tests {
             app.clone().oneshot(req).await.unwrap().status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    /// Card I-6: an app host gets a certificate only when its tenant slug and app slug name an
+    /// app; the labels follow the gateway's host rules. Without an apps domain no app host does.
+    #[tokio::test]
+    async fn only_hosts_of_existing_apps_get_a_certificate() {
+        use ruum_core::apps::settings::AppSettings;
+        use ruum_core::apps::store::NewApp;
+        let (_, _, state) = crate::routes::auth::tests::app();
+        let t = tenant(&state, "apps@example.test").await;
+        let other = tenant(&state, "other@example.test").await;
+        let store = state.services.apps.store().clone();
+        store
+            .ensure_tenant_settings(t, &["garden".into()])
+            .await
+            .unwrap();
+        store
+            .ensure_tenant_settings(other, &["orchard".into()])
+            .await
+            .unwrap();
+        let ctx = ruum_core::Context {
+            tenant: t,
+            actor: ruum_core::Actor::user(ruum_core::UserId::new()),
+            scope: None,
+            idempotency_key: None,
+        };
+        store
+            .insert_app(
+                &ctx,
+                NewApp {
+                    node_id: ruum_core::NodeId::new(),
+                    slug: "plants".into(),
+                    settings: AppSettings::default(),
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let config = TlsAskConfig::for_content_url("https://content.staging.ruumapps.net", 20);
+        let without = router(state.clone(), config.clone());
+        assert_eq!(
+            ask(&without, "plants.garden.apps.staging.ruumapps.net").await,
+            StatusCode::NOT_FOUND,
+            "no apps domain: no app host"
+        );
+        let app = router(
+            state,
+            config.with_apps_domain(".Apps.Staging.RuumApps.net."),
+        );
+        for good in [
+            "plants.garden.apps.staging.ruumapps.net",
+            "PLANTS.Garden.apps.staging.ruumapps.net.",
+            "ab12cd34--plants.garden.apps.staging.ruumapps.net",
+        ] {
+            assert_eq!(ask(&app, good).await, StatusCode::OK, "{good}");
+        }
+        for bad in [
+            // Another tenant's slug, an unknown app, an unknown tenant.
+            "plants.orchard.apps.staging.ruumapps.net",
+            "weeds.garden.apps.staging.ruumapps.net",
+            "plants.nobody.apps.staging.ruumapps.net",
+            // Label count, the domain itself, a bad short ID, reserved and malformed slugs.
+            "garden.apps.staging.ruumapps.net",
+            "x.plants.garden.apps.staging.ruumapps.net",
+            "apps.staging.ruumapps.net",
+            "ab12cd3--plants.garden.apps.staging.ruumapps.net",
+            "AB12CD34X--plants.garden.apps.staging.ruumapps.net",
+            "plants.www.apps.staging.ruumapps.net",
+            "plants.garden.apps.staging.ruumapps.net.evil.example",
+            "plants.gardenapps.staging.ruumapps.net",
+        ] {
+            assert_eq!(ask(&app, bad).await, StatusCode::NOT_FOUND, "{bad}");
+        }
     }
 
     #[tokio::test]
