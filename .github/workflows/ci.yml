@@ -153,8 +153,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Card B-1: --test apps_bindings (the binding cases of tests/common/apps_bindings.rs).
       # Card O-2: --test apps_telemetry (the telemetry cases of tests/common/apps_telemetry.rs).
+      # Backlog T-72: --test gateway --test runtime_api --test names --test batch, the test kit
+      # binaries that no CI job ran before (decision 0008-3).
       - name: Tenant isolation and permission matrix (in-memory services)
-        run: cargo test -p ruum-testkit --no-fail-fast --test isolation --test permissions --test databases_d1 --test databases_guests --test databases_agents --test databases_nodes --test databases_statements --test databases_classes_api --test databases_grants_api --test databases_approvals_api --test databases_query_api --test apps_settings --test apps_deployments --test apps_publish --test apps_roles --test apps_bindings --test apps_telemetry --test apps_meta --test privacy --locked -- --nocapture
+        run: cargo test -p ruum-testkit --no-fail-fast --test isolation --test permissions --test databases_d1 --test databases_guests --test databases_agents --test databases_nodes --test databases_statements --test databases_classes_api --test databases_grants_api --test databases_approvals_api --test databases_query_api --test apps_settings --test apps_deployments --test apps_publish --test apps_roles --test apps_bindings --test apps_telemetry --test apps_meta --test privacy --test gateway --test runtime_api --test names --test batch --locked -- --nocapture
       # The data cluster (as in the unit job): the privacy suite runs its Postgres cases on the
       # Postgres engine (card Q-2); without it they fail in CI, never skip.
       - name: Start the data cluster (postgres-data)
@@ -174,12 +176,13 @@ jobs:
         run: psql "postgres://ruum:ruum@localhost:5432/ruum" -c "create role ruum_suite login password 'ruum_suite' createdb"
       # Card B-1: --test apps_bindings, as above.
       # Card O-2: --test apps_telemetry, as above.
+      # Backlog T-72: --test gateway --test runtime_api --test names --test batch, as above.
       - name: Tenant isolation and permission matrix (Postgres stores)
         env:
           RUUM_SUITE_BACKEND: postgres
           DATABASE_URL: postgres://ruum_suite:ruum_suite@localhost:5432/ruum
           RUUM_DBHOST_URL: postgres://ruum_dbhost:ci-dbhost@127.0.0.1:5435/postgres
-        run: cargo test -p ruum-testkit --no-fail-fast --test isolation --test permissions --test databases_d1 --test databases_guests --test databases_agents --test databases_nodes --test databases_statements --test databases_classes_api --test databases_grants_api --test databases_approvals_api --test databases_query_api --test apps_settings --test apps_deployments --test apps_publish --test apps_roles --test apps_bindings --test apps_telemetry --test apps_meta --test privacy --locked -- --nocapture
+        run: cargo test -p ruum-testkit --no-fail-fast --test isolation --test permissions --test databases_d1 --test databases_guests --test databases_agents --test databases_nodes --test databases_statements --test databases_classes_api --test databases_grants_api --test databases_approvals_api --test databases_query_api --test apps_settings --test apps_deployments --test apps_publish --test apps_roles --test apps_bindings --test apps_telemetry --test apps_meta --test privacy --test gateway --test runtime_api --test names --test batch --locked -- --nocapture
 
   cargo-deny:
     name: cargo-deny
