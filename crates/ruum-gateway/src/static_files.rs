@@ -66,17 +66,21 @@ pub struct HttpSiteFiles {
 }
 
 impl HttpSiteFiles {
-    /// Asks the internal listener at `base` (`RUUM_GATEWAY_INTERNAL_URL`).
+    /// Asks the internal listener at `base` (`RUUM_GATEWAY_INTERNAL_URL`). Neither client uses a
+    /// proxy of the environment: a link is a bearer secret for its lifetime (as the R-3 Kimi run 14
+    /// finding 1 for the core clients).
     pub fn new(base: &str) -> CoreResult<Self> {
         let core = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .build()
             .map_err(|e| CoreError(e.to_string()))?;
         let objects = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .read_timeout(OBJECT_FIRST_BYTE)
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .build()
             .map_err(|e| CoreError(e.to_string()))?;
         Ok(Self {
