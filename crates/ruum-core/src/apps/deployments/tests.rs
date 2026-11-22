@@ -1333,6 +1333,50 @@ async fn a_deploy_waits_for_the_move_of_static_sites() {
     w.preview(app, folder, None).await;
 }
 
+/// Kimi review of k14r3 (round 2, High): a pass of the move takes the tenant's site lock
+/// shared, like a writer of a site, so it never runs in the middle of the collection
+/// (exclusive), which could otherwise delete a copied file whose index is still on its way.
+#[tokio::test]
+async fn the_move_of_static_sites_waits_for_the_collection() {
+    use super::super::static_site::StaticSites;
+    let w = world().await;
+    let legacy: std::sync::Arc<dyn object_store::ObjectStore> =
+        std::sync::Arc::new(object_store::memory::InMemory::new());
+    StaticSites::new(legacy.clone())
+        .write_site(
+            w.team.id,
+            Uuid::now_v7(),
+            &[("index.html".into(), bytes::Bytes::from_static(INDEX))],
+            None,
+        )
+        .await
+        .unwrap();
+    let collection =
+        w.s.apps
+            .lock_sites(w.team.id, true, Duration::from_secs(1))
+            .await
+            .unwrap();
+    let apps = w.s.apps.clone();
+    let from = legacy.clone();
+    let pass = tokio::spawn(async move {
+        apps.move_static_sites(from, Duration::from_secs(3600))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !pass.is_finished(),
+        "the pass waits for the collection's lock"
+    );
+    assert_eq!(
+        w.s.apps.sites().stored_bytes(w.team.id).await.unwrap(),
+        0,
+        "nothing is copied while the collection runs"
+    );
+    drop(collection);
+    let r = pass.await.unwrap().unwrap();
+    assert_eq!((r.listed, r.copied), (2, 2));
+}
+
 #[tokio::test]
 async fn static_objects_count_against_the_storage_quota() {
     let w = world().await;

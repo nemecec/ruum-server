@@ -558,6 +558,17 @@ pub struct SiteMigration {
     pub broken: u64,
 }
 
+impl std::ops::AddAssign for SiteMigration {
+    fn add_assign(&mut self, o: Self) {
+        self.listed += o.listed;
+        self.copied += o.copied;
+        self.present += o.present;
+        self.deleted += o.deleted;
+        self.gone += o.gone;
+        self.broken += o.broken;
+    }
+}
+
 /// Copies one object into `store` unless it holds it with the same size. `Some(true)`: copied,
 /// `Some(false)`: present, `None`: the old bucket no longer holds it.
 async fn copy_one(
@@ -662,47 +673,62 @@ impl StaticSites {
         Ok(Some(url.to_string()))
     }
 
-    /// One pass of the move of static objects out of the tenant blob bucket of `blob` (where
-    /// card W-2s put them before decision 0008-4) into this store. See
-    /// [`StaticSites::migrate_from`].
-    pub async fn migrate_from_blob_bucket(&self, blob: &S3Settings) -> Result<SiteMigration> {
-        self.migrate_from(Arc::new(blob.build()?), MOVE_DELETE_AFTER)
-            .await
+    /// The static objects of `legacy` (the tenant blob bucket of card W-2s), by tenant: one
+    /// listing of `apps/static/`. An object whose key names no tenant is left alone.
+    pub async fn list_moving(
+        &self,
+        legacy: &dyn ObjectStore,
+    ) -> Result<BTreeMap<TenantId, Vec<object_store::ObjectMeta>>> {
+        let mut out: BTreeMap<TenantId, Vec<object_store::ObjectMeta>> = BTreeMap::new();
+        let mut list = legacy.list(Some(&Path::from(ROOT_PREFIX)));
+        while let Some(meta) = list.next().await {
+            let meta = meta?;
+            let tenant = meta
+                .location
+                .parts()
+                .nth(2)
+                .and_then(|p| p.as_ref().parse::<Uuid>().ok())
+                .map(TenantId);
+            match tenant {
+                Some(t) => out.entry(t).or_default().push(meta),
+                None => tracing::warn!(target: "ruum::apps", object = %meta.location,
+                    "a static object of the blob bucket names no tenant; it stays"),
+            }
+        }
+        Ok(out)
     }
 
-    /// One pass of the move out of `legacy` (Kimi review of k14r3, findings 1 to 3):
+    /// One pass of the move of one tenant's static objects (`metas`, from
+    /// [`StaticSites::list_moving`]) out of `legacy` into this store (decision 0008-4; Kimi
+    /// reviews of k14r3). The caller holds the tenant's site lock shared
+    /// (`AppService::move_static_sites`), so the garbage collection, which holds it exclusive,
+    /// never runs in the middle of a pass of that tenant:
     ///
-    /// 1. Every file object under `apps/static/` is copied, unless this store holds it with the
-    ///    same size; then every index, so a moved index never names a file that is not here.
-    ///    Each index is checked: a file it names that is still missing here is copied from the
-    ///    old bucket, or counted as `broken` when neither bucket holds it.
+    /// 1. Every file object is copied, unless this store holds it with the same size; then every
+    ///    index, so a moved index never names a file that is not here. Each index is checked: a
+    ///    file it names that is still missing here (also one that the collection deleted between
+    ///    two passes) is copied from the old bucket, or counted as `broken` when neither bucket
+    ///    holds it.
     /// 2. An object of the old bucket is deleted only when its copy here is older than
     ///    `delete_after` (longer than a rolling deploy), so servers and gateways of the previous
     ///    release, which still read and collect the old bucket, lose nothing under them.
     ///
-    /// The server runs a pass at its start and again until the old bucket holds no static
-    /// object (`listed == 0`), so sites that a previous-release server writes during the
-    /// rollout move too. Passes are safe on several servers at once: objects are
-    /// content-addressed or never change, and every copy is checked before anything is deleted.
-    /// When step 1 succeeds, the writes of new sites open again ([`StaticSites::begin_move`]).
-    /// Objects are copied whole (static files are smaller than the plan's file limit).
-    pub async fn migrate_from(
+    /// Passes are safe on several servers at once: objects are content-addressed or never
+    /// change, and every copy is checked before anything is deleted. Objects are copied whole
+    /// (static files are smaller than the plan's file limit).
+    pub async fn migrate_tenant(
         &self,
         legacy: Arc<dyn ObjectStore>,
+        metas: &[object_store::ObjectMeta],
         delete_after: std::time::Duration,
     ) -> Result<SiteMigration> {
-        let mut report = SiteMigration::default();
-        let mut list = legacy.list(Some(&Path::from(ROOT_PREFIX)));
-        let (mut files, mut indexes) = (Vec::new(), Vec::new());
-        while let Some(meta) = list.next().await {
-            let meta = meta?;
-            report.listed += 1;
-            if meta.location.as_ref().contains("/sites/") {
-                indexes.push(meta);
-            } else {
-                files.push(meta);
-            }
-        }
+        let mut report = SiteMigration {
+            listed: metas.len() as u64,
+            ..SiteMigration::default()
+        };
+        let (indexes, files): (Vec<_>, Vec<_>) = metas
+            .iter()
+            .partition(|m| m.location.as_ref().contains("/sites/"));
         // 1. Files first, then indexes.
         let jobs: Vec<(Path, u64)> = files.iter().map(|m| (m.location.clone(), m.size)).collect();
         let results: Vec<Result<Option<bool>>> = futures::stream::iter(jobs)
@@ -738,8 +764,6 @@ impl StaticSites {
             }
             report.broken += self.check_moved_index(legacy.as_ref(), meta).await?;
         }
-        self.moving
-            .store(false, std::sync::atomic::Ordering::SeqCst);
         // 2. Deletes, only of objects whose copy here is old enough.
         let cutoff = (crate::now().unix_timestamp_nanos() / 1_000_000)
             .saturating_sub(i128::try_from(delete_after.as_millis()).unwrap_or(i128::MAX));
@@ -758,6 +782,31 @@ impl StaticSites {
             }
         }
         Ok(report)
+    }
+
+    /// A whole pass over every tenant without site locks: only for a store that no collection
+    /// runs on at the same time (tests). The server uses `AppService::move_static_sites`.
+    /// Opens the writes of new sites at its end ([`StaticSites::end_move_pass`]).
+    pub async fn migrate_from(
+        &self,
+        legacy: Arc<dyn ObjectStore>,
+        delete_after: std::time::Duration,
+    ) -> Result<SiteMigration> {
+        let mut total = SiteMigration::default();
+        for (_, metas) in self.list_moving(legacy.as_ref()).await? {
+            total += self
+                .migrate_tenant(legacy.clone(), &metas, delete_after)
+                .await?;
+        }
+        self.end_move_pass();
+        Ok(total)
+    }
+
+    /// Opens the writes of new sites after a pass of the move that copied every object of the
+    /// old bucket (every tenant without an error).
+    pub fn end_move_pass(&self) {
+        self.moving
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Checks that every file a moved index names is here; copies a missing one from `legacy`.
@@ -802,9 +851,10 @@ impl StaticSites {
         Ok(broken)
     }
 
-    /// Closes the writes of new sites until the first pass of the move has copied every object
-    /// of the old bucket (Kimi review of k14r3, finding 3): until then the storage quota cannot
-    /// see the sites that are still only in the old bucket. A write answers `503 unavailable`.
+    /// Closes the writes of new sites until a pass of the move has copied every object of the
+    /// old bucket ([`StaticSites::end_move_pass`]; Kimi review of k14r3, finding 3): until then
+    /// the storage quota cannot see the sites that are still only in the old bucket. A write
+    /// answers `503 unavailable`.
     pub fn begin_move(&self) {
         self.moving.store(true, std::sync::atomic::Ordering::SeqCst);
     }

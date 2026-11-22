@@ -248,8 +248,11 @@ pub fn install_apps(
     };
     // Static sites go to a bucket of their own (decision 0008-4), never to the blob bucket;
     // the runtime driver stays the in-memory one until the runtime cards (R-2a, I-4).
-    static_sites(&mut parts)?;
+    let moving = static_sites(&mut parts)?;
     ruum_core::apps::install(services, parts).context("set up the apps area")?;
+    if let Some(blob) = moving {
+        tokio::spawn(move_static_sites(services.apps.clone(), blob));
+    }
     tokio::spawn(services.apps.clone().run_sweeper(PREVIEW_SWEEP_EVERY));
     Ok(())
 }
@@ -261,10 +264,12 @@ const STATIC_MOVE_ROLLOUT_EVERY: std::time::Duration = std::time::Duration::from
 
 /// The store of static sites (decision 0008-4): the bucket of `RUUM_STATIC_S3_BUCKET`, with
 /// signed read links for the gateway. When the blob store is S3 too, the sites that card W-2s
-/// wrote into the blob bucket move over in the background (`StaticSites::migrate_from`). With S3 blobs but no
+/// wrote into the blob bucket move over in the background (`move_static_sites`). With S3 blobs but no
 /// `RUUM_STATIC_S3_BUCKET`, sites stay in this process's memory and the server says so on every
 /// start: they never go into the blob bucket again.
-fn static_sites(parts: &mut ruum_core::apps::AppParts) -> anyhow::Result<()> {
+fn static_sites(
+    parts: &mut ruum_core::apps::AppParts,
+) -> anyhow::Result<Option<ruum_core::blobs::object::S3Settings>> {
     use ruum_core::apps::static_site::{StaticSites, static_s3_settings};
     let blob = ruum_core::blobs::object::S3Settings::from_env();
     let Some(settings) =
@@ -276,55 +281,57 @@ fn static_sites(parts: &mut ruum_core::apps::AppParts) -> anyhow::Result<()> {
                  restart (decision 0008-4: they need a bucket of their own)"
             );
         }
-        return Ok(());
+        return Ok(None);
     };
     let sites = StaticSites::s3(&settings).context("set up the bucket of static sites")?;
-    if let Some(blob) = blob {
-        // Writes of new sites wait for the first pass (the quota cannot see sites that are
-        // still only in the blob bucket). Passes repeat every minute during the first hour of
-        // this server, the window of a rolling deploy, so a site that a previous-release server
-        // writes into the blob bucket moves within a minute; then every 10 minutes until the
-        // blob bucket holds no static object, and never ending inside that first hour (Kimi
-        // review of k14r3).
+    if blob.is_some() {
+        // Writes of new sites wait for the first pass of the move (the quota cannot see sites
+        // that are still only in the blob bucket).
         sites.begin_move();
-        let target = sites.clone();
-        tokio::spawn(async move {
-            let started = std::time::Instant::now();
-            loop {
-                let rollout = started.elapsed() < ruum_core::apps::static_site::MOVE_DELETE_AFTER;
-                match target.migrate_from_blob_bucket(&blob).await {
-                    Ok(r) if r.listed == 0 && !rollout => {
-                        tracing::info!(
-                            "static sites: the blob bucket holds none (the move is done)"
-                        );
-                        break;
-                    }
-                    Ok(r) if r.listed == 0 => {}
-                    Ok(r) => tracing::info!(
-                        listed = r.listed,
-                        copied = r.copied,
-                        present = r.present,
-                        deleted = r.deleted,
-                        gone = r.gone,
-                        broken = r.broken,
-                        "static sites: a pass of the move out of the blob bucket"
-                    ),
-                    Err(e) => tracing::error!(
-                        error = %e,
-                        "static sites: a pass of the move out of the blob bucket failed"
-                    ),
-                }
-                let every = if rollout {
-                    STATIC_MOVE_ROLLOUT_EVERY
-                } else {
-                    STATIC_MOVE_EVERY
-                };
-                tokio::time::sleep(every).await;
-            }
-        });
     }
     parts.sites = sites;
-    Ok(())
+    Ok(blob)
+}
+
+/// The move of static sites out of the blob bucket (`AppService::move_static_sites`): passes
+/// every minute during the first hour of this server, the window of a rolling deploy, so a
+/// site that a previous-release server writes into the blob bucket moves within a minute; then
+/// every 10 minutes until the blob bucket holds no static object, never ending inside that
+/// first hour (Kimi reviews of k14r3).
+async fn move_static_sites(
+    apps: Arc<ruum_core::apps::AppService>,
+    blob: ruum_core::blobs::object::S3Settings,
+) {
+    let started = std::time::Instant::now();
+    loop {
+        let rollout = started.elapsed() < ruum_core::apps::static_site::MOVE_DELETE_AFTER;
+        match apps.move_static_sites_from_blob_bucket(&blob).await {
+            Ok(r) if r.listed == 0 && !rollout => {
+                tracing::info!("static sites: the blob bucket holds none (the move is done)");
+                break;
+            }
+            Ok(r) if r.listed == 0 => {}
+            Ok(r) => tracing::info!(
+                listed = r.listed,
+                copied = r.copied,
+                present = r.present,
+                deleted = r.deleted,
+                gone = r.gone,
+                broken = r.broken,
+                "static sites: a pass of the move out of the blob bucket"
+            ),
+            Err(e) => tracing::error!(
+                error = %e,
+                "static sites: a pass of the move out of the blob bucket failed"
+            ),
+        }
+        let every = if rollout {
+            STATIC_MOVE_ROLLOUT_EVERY
+        } else {
+            STATIC_MOVE_EVERY
+        };
+        tokio::time::sleep(every).await;
+    }
 }
 
 /// The workload token issuer (card R-3; `ruum_core::apps::workload_tokens`), with the key of

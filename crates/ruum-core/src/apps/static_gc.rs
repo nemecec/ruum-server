@@ -252,6 +252,58 @@ impl AppService {
         Ok(report)
     }
 
+    /// One pass of the move of static sites out of the tenant blob bucket `legacy` into the
+    /// bucket of static sites (decision 0008-4; Kimi reviews of k14r3): each tenant's objects
+    /// move under its site lock, shared like a writer of a site, so the collection (exclusive)
+    /// never runs in the middle of a tenant's pass and never deletes a file whose index is
+    /// still on its way (`StaticSites::migrate_tenant`). When every tenant's pass succeeded,
+    /// the writes of new sites open (`StaticSites::end_move_pass`); a tenant that failed, or
+    /// whose lock stayed taken, fails the pass, and the next pass tries again.
+    pub async fn move_static_sites(
+        &self,
+        legacy: Arc<dyn object_store::ObjectStore>,
+        delete_after: Duration,
+    ) -> Result<super::static_site::SiteMigration> {
+        let sites = &self.deps.sites;
+        let mut total = super::static_site::SiteMigration::default();
+        let mut failed = 0usize;
+        for (tenant, metas) in sites.list_moving(legacy.as_ref()).await? {
+            let pass = async {
+                let _lock = self.lock_sites(tenant, false, SITE_LOCK_WAIT).await?;
+                sites
+                    .migrate_tenant(legacy.clone(), &metas, delete_after)
+                    .await
+            };
+            match pass.await {
+                Ok(r) => total += r,
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!(%tenant, error = %e, "the move of a tenant's static sites failed");
+                }
+            }
+        }
+        if failed > 0 {
+            return Err(Error::Internal(format!(
+                "the move of static sites failed for {failed} tenants; the next pass tries again"
+            )));
+        }
+        sites.end_move_pass();
+        Ok(total)
+    }
+
+    /// [`AppService::move_static_sites`] out of the blob bucket of `blob`, with
+    /// `static_site::MOVE_DELETE_AFTER`.
+    pub async fn move_static_sites_from_blob_bucket(
+        &self,
+        blob: &crate::blobs::object::S3Settings,
+    ) -> Result<super::static_site::SiteMigration> {
+        self.move_static_sites(
+            Arc::new(blob.build()?),
+            super::static_site::MOVE_DELETE_AFTER,
+        )
+        .await
+    }
+
     /// [`AppService::collect_static`] for every tenant with static objects. A tenant whose
     /// site lock stays taken, or whose collection fails, is left for the next run (logged).
     pub async fn collect_static_all(&self, grace: time::Duration) -> Result<SiteGcReport> {
