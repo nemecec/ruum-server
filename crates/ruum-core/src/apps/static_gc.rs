@@ -256,9 +256,10 @@ impl AppService {
     /// bucket of static sites (decision 0008-4; Kimi reviews of k14r3): each tenant's objects
     /// move under its site lock, shared like a writer of a site, so the collection (exclusive)
     /// never runs in the middle of a tenant's pass and never deletes a file whose index is
-    /// still on its way (`StaticSites::migrate_tenant`). When every tenant's pass succeeded,
-    /// the writes of new sites open (`StaticSites::end_move_pass`); a tenant that failed, or
-    /// whose lock stayed taken, fails the pass, and the next pass tries again.
+    /// still on its way (`StaticSites::migrate_tenant`). At the end the writes of new sites open
+    /// for every tenant except those whose pass failed or whose lock stayed taken
+    /// (`StaticSites::end_move_pass`); the pass then answers an error, and the next pass tries
+    /// again.
     pub async fn move_static_sites(
         &self,
         legacy: Arc<dyn object_store::ObjectStore>,
@@ -266,7 +267,7 @@ impl AppService {
     ) -> Result<super::static_site::SiteMigration> {
         let sites = &self.deps.sites;
         let mut total = super::static_site::SiteMigration::default();
-        let mut failed = 0usize;
+        let mut failed = std::collections::HashSet::new();
         for (tenant, metas) in sites.list_moving(legacy.as_ref()).await? {
             let pass = async {
                 let _lock = self.lock_sites(tenant, false, SITE_LOCK_WAIT).await?;
@@ -277,17 +278,19 @@ impl AppService {
             match pass.await {
                 Ok(r) => total += r,
                 Err(e) => {
-                    failed += 1;
+                    failed.insert(tenant);
                     tracing::warn!(%tenant, error = %e, "the move of a tenant's static sites failed");
                 }
             }
         }
-        if failed > 0 {
+        let count = failed.len();
+        sites.end_move_pass(failed);
+        if count > 0 {
             return Err(Error::Internal(format!(
-                "the move of static sites failed for {failed} tenants; the next pass tries again"
+                "the move of static sites failed for {count} tenants; their writes stay closed and \
+                 the next pass tries again"
             )));
         }
-        sites.end_move_pass();
         Ok(total)
     }
 

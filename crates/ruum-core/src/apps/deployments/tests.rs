@@ -1377,6 +1377,53 @@ async fn the_move_of_static_sites_waits_for_the_collection() {
     assert_eq!((r.listed, r.copied), (2, 2));
 }
 
+/// Kimi review of k14r3, round 3: a tenant whose move keeps failing (a malformed index in the
+/// blob bucket) keeps only its own writes closed; the other tenants deploy again.
+#[tokio::test]
+async fn a_tenant_whose_move_fails_keeps_only_its_own_writes_closed() {
+    use super::super::static_site::{StaticSites, index_key};
+    use object_store::ObjectStoreExt;
+    let w = world().await;
+    let legacy: std::sync::Arc<dyn object_store::ObjectStore> =
+        std::sync::Arc::new(object_store::memory::InMemory::new());
+    let page = [("index.html".to_string(), bytes::Bytes::from_static(INDEX))];
+    let healthy = w.team.id;
+    let broken = crate::TenantId::new();
+    StaticSites::new(legacy.clone())
+        .write_site(healthy, Uuid::now_v7(), &page, None)
+        .await
+        .unwrap();
+    legacy
+        .put(
+            &index_key(broken, Uuid::now_v7()),
+            object_store::PutPayload::from_static(b"not an index"),
+        )
+        .await
+        .unwrap();
+    let sites = w.s.apps.sites();
+    sites.begin_move();
+    for _ in 0..2 {
+        assert!(
+            w.s.apps
+                .move_static_sites(legacy.clone(), Duration::from_secs(3600))
+                .await
+                .is_err()
+        );
+        sites
+            .write_site_within(healthy, Uuid::now_v7(), &page, None, None)
+            .await
+            .unwrap();
+        let e = sites
+            .write_site_within(broken, Uuid::now_v7(), &page, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, Error::Api(a) if a.code == ErrorCode::Unavailable),
+            "{e:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn static_objects_count_against_the_storage_quota() {
     let w = world().await;

@@ -601,6 +601,15 @@ async fn copy_one(
     Ok(Some(true))
 }
 
+/// Whose writes of new sites the move keeps closed ([`StaticSites::begin_move`]).
+#[derive(Debug, Default)]
+struct MoveGate {
+    /// Every tenant's, until a pass of the move has listed the old bucket and ended.
+    all: bool,
+    /// The tenants whose last pass failed.
+    closed: std::collections::HashSet<TenantId>,
+}
+
 /// The static sites over an object store.
 #[derive(Clone)]
 pub struct StaticSites {
@@ -610,7 +619,7 @@ pub struct StaticSites {
     signer: Option<Arc<dyn Signer>>,
     /// Writes of new sites wait while the first pass of the move runs
     /// ([`StaticSites::begin_move`]).
-    moving: Arc<std::sync::atomic::AtomicBool>,
+    moving: Arc<std::sync::Mutex<MoveGate>>,
 }
 
 impl std::fmt::Debug for StaticSites {
@@ -798,15 +807,17 @@ impl StaticSites {
                 .migrate_tenant(legacy.clone(), &metas, delete_after)
                 .await?;
         }
-        self.end_move_pass();
+        self.end_move_pass(std::collections::HashSet::new());
         Ok(total)
     }
 
-    /// Opens the writes of new sites after a pass of the move that copied every object of the
-    /// old bucket (every tenant without an error).
-    pub fn end_move_pass(&self) {
-        self.moving
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+    /// Ends a pass of the move whose listing succeeded: the writes of every tenant open except
+    /// those of the tenants in `failed`, whose objects did not all move (Kimi review of k14r3,
+    /// round 3: one tenant's failure never closes the others' writes).
+    pub fn end_move_pass(&self, failed: std::collections::HashSet<TenantId>) {
+        let mut g = self.moving.lock().unwrap_or_else(|e| e.into_inner());
+        g.all = false;
+        g.closed = failed;
     }
 
     /// Checks that every file a moved index names is here; copies a missing one from `legacy`.
@@ -856,13 +867,18 @@ impl StaticSites {
     /// the storage quota cannot see the sites that are still only in the old bucket. A write
     /// answers `503 unavailable`.
     pub fn begin_move(&self) {
-        self.moving.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.moving.lock().unwrap_or_else(|e| e.into_inner()).all = true;
     }
 
-    /// `503 unavailable` while the move closes the writes ([`StaticSites::begin_move`]).
-    /// `createAppDeployment` asks it first, so a deploy is refused before anything is stored.
-    pub fn writes_open(&self) -> Result<()> {
-        if self.moving.load(std::sync::atomic::Ordering::SeqCst) {
+    /// `503 unavailable` while the move closes the writes of `tenant`
+    /// ([`StaticSites::begin_move`], [`StaticSites::end_move_pass`]). `createAppDeployment` asks
+    /// it first, so a deploy is refused before anything is stored.
+    pub fn writes_open(&self, tenant: TenantId) -> Result<()> {
+        let closed = {
+            let g = self.moving.lock().unwrap_or_else(|e| e.into_inner());
+            g.all || g.closed.contains(&tenant)
+        };
+        if closed {
             return Err(Error::Api(
                 crate::error::ApiError::new(
                     crate::error::ErrorCode::Unavailable,
@@ -901,7 +917,7 @@ impl StaticSites {
         spa_fallback: Option<String>,
         budget: Option<u64>,
     ) -> Result<WrittenSite> {
-        self.writes_open()?;
+        self.writes_open(tenant)?;
         let list = static_files(files);
         let data: std::collections::HashMap<Hash, &Bytes> = list
             .iter()
@@ -1129,7 +1145,7 @@ impl StaticSites {
         to: Uuid,
         budget: Option<u64>,
     ) -> Result<SiteIndex> {
-        self.writes_open()?;
+        self.writes_open(tenant)?;
         let index = self
             .read_index(tenant, from)
             .await?
