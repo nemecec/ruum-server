@@ -840,22 +840,57 @@ impl StaticSites {
         to: Uuid,
         budget: Option<u64>,
     ) -> Result<SiteIndex> {
-        let index = self
-            .read_index(tenant, from)
-            .await?
-            .ok_or_else(|| Error::Internal(format!("deployment {from} has no site index")))?;
+        // The static bucket; else, for a site an earlier release wrote into the blob bucket and
+        // the move has not reached yet, the blob bucket (Kimi k14i6-recheck, 1: a publish or a
+        // rollback right after an upgrade).
+        let (index, legacy) = match self.read_index(tenant, from).await? {
+            Some(i) => (i, None),
+            None => {
+                let found = match &self.legacy {
+                    Some(legacy) => read_index_in(legacy, tenant, from)
+                        .await?
+                        .map(|i| (i, legacy.clone())),
+                    None => None,
+                };
+                let (i, legacy) = found.ok_or_else(|| {
+                    Error::Internal(format!("deployment {from} has no site index"))
+                })?;
+                (i, Some(legacy))
+            }
+        };
         let body = index_bytes(&index)?;
         if let Some(free) = budget
             && body.len() as u64 > free
         {
             return Err(quota_exceeded(body.len() as u64));
         }
-        // Every file is still there (objects are never deleted while an index names them).
         let hashes = index
             .files
             .values()
             .map(IndexEntry::content_hash)
             .collect::<Result<std::collections::HashSet<Hash>>>()?;
+        // A site of the blob bucket: its files go into the static bucket first (they count
+        // against the quota already, as objects of the blob bucket), so the new index names
+        // only files that the static bucket has.
+        if let Some(legacy) = &legacy {
+            let sizes = index
+                .files
+                .values()
+                .map(|e| Ok((e.content_hash()?, e.size)))
+                .collect::<Result<std::collections::HashMap<Hash, u64>>>()?;
+            for (hash, size) in &sizes {
+                if self
+                    .copy_legacy(legacy, &file_key(tenant, hash), *size)
+                    .await?
+                    .is_none()
+                {
+                    return Err(Error::Internal(format!(
+                        "a file of the site of deployment {from} is missing"
+                    )));
+                }
+            }
+        }
+        // Every file is still there (objects are never deleted while an index names them).
         let heads: Vec<_> = hashes
             .iter()
             .map(|hash| object_size(self.store.clone(), file_key(tenant, hash)))
@@ -1572,6 +1607,63 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// A publish or a rollback of a site that an earlier release wrote into the blob bucket,
+    /// before the move reaches it: the files go into the static bucket, then the new index
+    /// (Kimi k14i6-recheck, 1).
+    #[tokio::test]
+    async fn a_legacy_site_copies_before_its_move() {
+        let blobs = StaticSites::in_memory();
+        let t = TenantId(Uuid::now_v7());
+        let (old, new, lost) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        blobs.write_site(t, old, &files(), None).await.unwrap();
+        let gone = vec![("gone.txt".to_string(), Bytes::from_static(b"gone"))];
+        blobs.write_site(t, lost, &gone, None).await.unwrap();
+        blobs
+            .object_store()
+            .delete(&file_key(t, &Hash::of(b"gone")))
+            .await
+            .unwrap();
+        let sites = StaticSites::in_memory().with_legacy(blobs.object_store());
+        let index = sites.copy_site_within(t, old, new, None).await.unwrap();
+        assert_eq!(
+            Some(&index),
+            blobs.read_index(t, old).await.unwrap().as_ref()
+        );
+        assert_eq!(sites.read_index(t, new).await.unwrap(), Some(index.clone()));
+        assert!(
+            sites.read_index(t, old).await.unwrap().is_none(),
+            "only the new index"
+        );
+        for e in index.files.values() {
+            assert!(
+                sites
+                    .has_file(t, &e.content_hash().unwrap(), e.size)
+                    .await
+                    .unwrap()
+            );
+        }
+        let (_, e) = index.resolve("assets/app.js", false).unwrap();
+        assert_eq!(
+            &sites.read_file(t, e, 64).await.unwrap()[..],
+            b"console.log(1)"
+        );
+        // The budget still applies, before anything is stored.
+        let other = Uuid::now_v7();
+        assert!(
+            sites
+                .copy_site_within(t, old, other, Some(1))
+                .await
+                .is_err()
+        );
+        assert!(sites.read_index(t, other).await.unwrap().is_none());
+        // A legacy site with a missing file writes no index.
+        assert!(sites.copy_site_within(t, lost, other, None).await.is_err());
+        assert!(sites.read_index(t, other).await.unwrap().is_none());
+        // Without a blob bucket there is nothing to copy from.
+        let alone = StaticSites::in_memory();
+        assert!(alone.copy_site_within(t, old, other, None).await.is_err());
     }
 
     #[tokio::test]

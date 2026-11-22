@@ -316,3 +316,80 @@ async fn a_core_without_the_route_and_a_redirect_fail_closed() {
     link.url = "file:///etc/passwd".into();
     assert!(core.open(&link).await.is_err(), "only http(s) links");
 }
+
+/// The object behind a link has exactly the size of its index entry: a chunked answer (no
+/// `Content-Length`) that ends early or runs long ends the stream with an error, never with a
+/// clean end; a declared length that differs is refused before any byte (Kimi k14i6-recheck, 3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_static_object_of_another_size_fails() {
+    use futures::StreamExt;
+    fn chunked(parts: &'static [&'static [u8]]) -> axum::body::Body {
+        axum::body::Body::from_stream(futures::stream::iter(
+            parts
+                .iter()
+                .map(|p| Ok::<_, std::io::Error>(bytes::Bytes::from_static(p))),
+        ))
+    }
+    let l = listen().await;
+    let addr = l.local_addr().unwrap();
+    let objects = axum::Router::new()
+        .route(
+            "/exact",
+            axum::routing::get(|| async { chunked(&[b"01234", b"56789"]) }),
+        )
+        .route(
+            "/short",
+            axum::routing::get(|| async { chunked(&[b"0123"]) }),
+        )
+        .route(
+            "/long",
+            axum::routing::get(|| async { chunked(&[b"01234", b"56789", b"x"]) }),
+        )
+        .route("/declared", axum::routing::get(|| async { "0123" }));
+    tokio::spawn(async move {
+        let _ = axum::serve(l, objects.into_make_service()).await;
+    });
+    let files = HttpSiteFiles::new("http://127.0.0.1:1").unwrap();
+    let link = |path: &str| StaticFileLink {
+        hash: "0".repeat(64),
+        size: 10,
+        media_type: "text/plain".into(),
+        url: format!("http://{addr}{path}"),
+    };
+    async fn read(
+        files: &HttpSiteFiles,
+        link: StaticFileLink,
+    ) -> Vec<Result<bytes::Bytes, String>> {
+        files
+            .open(&link)
+            .await
+            .unwrap()
+            .map(|c| c.map_err(|e| e.to_string()))
+            .collect()
+            .await
+    }
+    let exact = read(&files, link("/exact")).await;
+    assert!(exact.iter().all(Result::is_ok), "{exact:?}");
+    let body: Vec<u8> = exact
+        .into_iter()
+        .flat_map(|c| c.unwrap().to_vec())
+        .collect();
+    assert_eq!(body, b"0123456789");
+    let short = read(&files, link("/short")).await;
+    assert!(
+        short
+            .last()
+            .is_some_and(|c| c.as_ref().is_err_and(|e| e.contains("shorter"))),
+        "{short:?}"
+    );
+    let long = read(&files, link("/long")).await;
+    assert!(
+        long.last()
+            .is_some_and(|c| c.as_ref().is_err_and(|e| e.contains("longer"))),
+        "{long:?}"
+    );
+    assert!(
+        files.open(&link("/declared")).await.is_err(),
+        "a declared length other than the index entry's"
+    );
+}

@@ -137,20 +137,38 @@ impl SiteFiles for HttpSiteFiles {
                 "a static object does not have the size of its index entry".into(),
             ));
         }
+        // Exactly `link.size` bytes: a longer stream stops with an error at once, and a shorter
+        // one (a chunked answer that ends early) ends with an error, never a clean end (Kimi
+        // k14i6-recheck, 3).
         let limit = link.size;
-        let mut seen = 0u64;
-        Ok(r.bytes_stream()
-            .map(move |chunk| {
-                let chunk = chunk.map_err(|e| std::io::Error::other(e.without_url()))?;
-                seen += chunk.len() as u64;
-                if seen > limit {
-                    return Err(std::io::Error::other(
-                        "a static object is longer than its index entry",
-                    ));
+        Ok(futures::stream::unfold(
+            (r.bytes_stream().boxed(), 0u64, false),
+            move |(mut inner, mut seen, done)| async move {
+                if done {
+                    return None;
                 }
-                Ok(chunk)
-            })
-            .boxed())
+                let item = match inner.next().await {
+                    Some(Ok(chunk)) => {
+                        seen = seen.saturating_add(chunk.len() as u64);
+                        if seen > limit {
+                            Err(std::io::Error::other(
+                                "a static object is longer than its index entry",
+                            ))
+                        } else {
+                            Ok(chunk)
+                        }
+                    }
+                    Some(Err(e)) => Err(std::io::Error::other(e.without_url())),
+                    None if seen != limit => Err(std::io::Error::other(
+                        "a static object is shorter than its index entry",
+                    )),
+                    None => return None,
+                };
+                let done = item.is_err();
+                Some((item, (inner, seen, done)))
+            },
+        )
+        .boxed())
     }
 }
 
