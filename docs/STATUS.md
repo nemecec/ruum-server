@@ -19,7 +19,7 @@ the operations policy and the product direction), the integration of run 8 (2026
 (2026-11-11: the privacy filter of Postgres queries for agents), the integration of run 9 (2026-11-12 to
 11-13: decision 0004-40, cards A-2 and D-3a, step 3 wave 1 with T-4a, W-1, R-1 and spike S-2, and
 updates without downtime O-25), the Kimi re-review fixes of O-25, T-4a and S-2 (2026-11-13), the integration of run 10 (2026-11-13 to
-11-14: card S-35 of decision 0008-1, step 3 wave 2 with T-6, W-2s, B-2 and G-1a), the Kimi review fixes of run 10 (2026-11-14: T-6, G-1a, backlog S-43 and the deploy controller O-34), the integration of run 11 (2026-11-17: step 3 wave 3 with the egress proxy R-2e, the Docker runtime driver R-2a and the laptop telemetry stack I-5), the integration of run 12 (2026-11-18: step 3 wave 4 with the gateway in front of sandboxes G-1b and the node22 builder R-2b, and the follow-ups K11, FU-1, P-57, W2S-1 and O-1a), the Kimi review fixes of run 12 (2026-11-19: P-57, K11, G-1b, O-1a and R-2b), the integration of run 13 (2026-11-20: step 3 wave 5 with the telemetry processor O-1b, bindings B-1 and the Node SDK O-5, the site purge at scale W2S-4 and the staging admin tunnel for Talos O-21), the Kimi review fixes of run 13 (2026-11-21: B-1, O-5, W2S-4 and O-21), the integration of run 14 (2026-11-21: step 3 wave 6 with the runtime API R-3 and the telemetry reads O-2, and the app runtime on staging I-6), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+11-14: card S-35 of decision 0008-1, step 3 wave 2 with T-6, W-2s, B-2 and G-1a), the Kimi review fixes of run 10 (2026-11-14: T-6, G-1a, backlog S-43 and the deploy controller O-34), the integration of run 11 (2026-11-17: step 3 wave 3 with the egress proxy R-2e, the Docker runtime driver R-2a and the laptop telemetry stack I-5), the integration of run 12 (2026-11-18: step 3 wave 4 with the gateway in front of sandboxes G-1b and the node22 builder R-2b, and the follow-ups K11, FU-1, P-57, W2S-1 and O-1a), the Kimi review fixes of run 12 (2026-11-19: P-57, K11, G-1b, O-1a and R-2b), the integration of run 13 (2026-11-20: step 3 wave 5 with the telemetry processor O-1b, bindings B-1 and the Node SDK O-5, the site purge at scale W2S-4 and the staging admin tunnel for Talos O-21), the Kimi review fixes of run 13 (2026-11-21: B-1, O-5, W2S-4 and O-21), the integration of run 14 (2026-11-21: step 3 wave 6 with the runtime API R-3 and the telemetry reads O-2, and the app runtime on staging I-6), the Kimi review fixes of run 14 (2026-11-22: R-3, O-2 and I6-3D, decision 0008-4: static app files in their own bucket, no object store key in the gateway), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -252,6 +252,23 @@ Fixes made during the night integration:
 - The rebased branches were pushed as `integ/f-followups-4`, `integ/w-voice`, `integ/s2-k-1`,
   `integ/s2-a-1` and `integ/s2-a-1-r` (no force push) and deleted from GitHub after the
   fast-forward.
+
+Kimi review fixes of run 14 (2026-11-22; three fix branches rebased onto `main` `7d7c33d` in
+one stack, each tip checked on the build server, pushed as `integ14k/<name>`, green in GitHub CI,
+then fast-forwarded in this order, `7d7c33d..4f1c71e`, then the CI commit `cde9145` (T-72);
+linear history, no merge commit, no co-author line; no rebase conflict). Kimi K3.1 Pro reviewed
+the merged run 14 code of R-3, O-2 and I-6 (S-78); each fix had a Claude review and a Kimi
+re-check, and each ended with Kimi APPROVE on its final code. The digest section "Kimi reviews
+and fixes (run 12)" in `docs/digests/2026-11-21-run14.md` has the findings and the deploy steps;
+new backlog rows are in `docs/backlog/2026-11-22-run14k.md`. Decision 0008-4 (I6-3D) was built by
+three cards; only `fix/i6-kimi14` landed (`fix/r3-kimi14` is merged as its R-3-only twin
+`fix/r3-kimi14-only`; `f/i6-3d` is not merged; worth porting: T-74).
+
+| Branch (pushed as) | What it adds | Kimi |
+|---|---|---|
+| `fix/r3-kimi14-only` (`integ14k/r3`) | The runtime API's two core clients and the gateway's `HttpCore` use no proxy of the environment; one exchange per user token across runtime API processes (the core claims the `jti` in the shared idempotency store before it signs; a replay answers `401`). Two new mutations. | run 14: CHANGES REQUESTED (2 Medium); `589e27e` (same R-3 files) **APPROVE**, re-check **APPROVE** |
+| `fix/o2-kimi14` (`integ14k/o2`) | A preview pseudonymises telemetry with its own key per deployment (P-107 done); a confirmation at the row bound counts only new fields; `record_seen` takes the app-row lock. Three new mutations, one pattern updated. P-108, P-111 deferred, P-119 recorded. | run 14: CHANGES REQUESTED (1 High, 3 Medium, 1 Low); round on the fix CHANGES REQUESTED (1 Medium, fixed); re-check of `d213ee7` **APPROVE** |
+| `fix/i6-kimi14` (`integ14k/i6`) | I6-3D (decision 0008-4, I-6 finding 1): static app files in their own bucket (`RUUM_STATIC_S3_BUCKET`, staging `ruum-staging-static-768usm`); the gateway holds no object store setting and reads through 60 s `GET` links that the core signs for one object of a serving, non-sandbox deployment of an app not in the trash (`POST /internal/gateway/v1/static/file`); legacy objects are copied from the blob bucket and never deleted in this release (rollback keeps its sites); links and publish fall back to the blob bucket until a site is copied; quota counts both buckets once. Integration fix `4f1c71e`: the gateway's static clients use no proxy. 10 new mutations, one pattern rewritten. I6-3 done. | run 14: CHANGES REQUESTED (1 High, 4 Medium; findings 2 to 5 are I6-11, I6-12, S-82, S-83); four rounds, `99e6331` **APPROVE**; re-check CHANGES REQUESTED (fixed in `73241c2`), second re-check **APPROVE** |
 
 Integration of run 14 (2026-11-21; three branches rebased onto `main` `3f57d95` in one stack,
 each tip checked on the build server, pushed as `integ14/<name>`, green in GitHub CI, then
@@ -846,6 +863,37 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
+
+## Checks (2026-11-22 to 11-24, `main` after the Kimi review fixes of run 14, on the build server)
+
+`main` is `cde9145` before this documentation commit. Each tip was checked with the key
+`integ14k`, one full check at a time (`integ14k-check.sh`: fmt, clippy, the workspace without
+`ruum-dbengine` and `ruum-runtime`, `ruum-dbengine` with 4 threads, the test kit on both backends
+with `RUUM_REQUIRE_IMPLEMENTED=1`, then the Docker runtime tests of `ruum-runtime` alone (label
+`ruum.test=s3w3r2a`, T-53), then the browser tests; the final tip the smoke test).
+
+| Tip | Workspace without `ruum-dbengine`, `ruum-runtime` (passed / failed / ignored) | `ruum-dbengine` | Docker runtime | Isolation (memory = Postgres) | Permission matrix (memory = Postgres) | Privacy (memory / Postgres) | Trashed | e2e |
+|---|---|---|---|---|---|---|---|---|
+| R-3 (`57a8eaa`) | 1275 / 0 / 6 | 131 | 46 | 396 passed, 107 planned | 2144 passed, 512 planned | 99 planned / 38 passed, 61 planned | 112 | browser 172 passed, 1 skipped |
+| O-2 (`7b62ded`) | 1263 / 16 / 6 (data cluster OOM, B-48) | 131 | 46 | same | same | same | 112 | browser 171 / 1 failed (timing in `oauth.e2e.ts`); again 172 passed |
+| I6-3D (`4f1c71e`) | 1275 / 16 / 6 (data cluster OOM, B-48) | 131 | 46 | same | same | same | 112 | browser 172 passed, 1 skipped |
+| CI commit (`cde9145`, final) | **1291 / 0 / 6** (again, after a restart of the data cluster container) | **131** | **46** | **396 passed, 107 planned** | **2144 passed, 512 planned** | **99 planned / 38 passed, 61 planned** | **112** | **smoke: PASSED 59 checks** |
+
+On the final tree: `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets
+--locked -- -D warnings` clean; the test kit with `RUUM_REQUIRE_IMPLEMENTED=1` passes on memory
+and Postgres (95 tests each, 0 operations without a case; telemetry cases 15 of 15). Also:
+
+- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh` (key `integ14km1`):
+  **394 mutations, all KILLED** in the end (379 on `main` before; R-3 adds 2, O-2 3, I6-3D 10).
+  Shard 1 (186): 185 KILLED, 1 SURVIVED (`dbengine-mask-copy-stats-kept`, load-dependent as in
+  runs 13 and 13k, KILLED alone). Shard 2 (186): all KILLED (one start stopped in its baseline on
+  the timing test `one_tenant_cannot_hold_every_connection`, T-76). The 22 Docker mutations ran
+  alone: 22 KILLED (2026-11-24).
+- `deploy/staging/tests/run.sh` on the Mac: 775 checks passed on the R-3 and O-2 tips, 777 on
+  the I6-3D and CI tips.
+- GitHub CI green: `integ14k/r3` (`ci` 44985134435, attempt 2; attempt 1 failed in the Docker
+  memory hog check `the_sandbox_holds`, T-75), `integ14k/o2` (44985134216), `integ14k/i6`
+  (44985135030), `integ14k/ci` (44985134202).
 
 ## Checks (2026-11-21, `main` after the integration of run 14, on the build server)
 
