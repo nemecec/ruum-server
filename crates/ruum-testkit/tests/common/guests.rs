@@ -4,20 +4,59 @@
 //! hint `guests_create_resources`) and true (allowed). The `createDatabase` case is in
 //! [`super::d1`].
 //!
-//! The guest is `guest_view` raised to `manage` on `Projects` (a second grant by the owner), so
-//! its agent `agent_of_guest_view` (scope everything, `max_role: manage`) has the rights too and
+//! The guest is `guest_view` raised to `manage` on `Projects` (the owner changes the fixture's
+//! `view` grant with `updateGrant`: `addGrant` refuses a second grant of one grantee on a node,
+//! review D-2, 2), so its agent `agent_of_guest_view` (scope everything, `max_role: manage`) has the rights too and
 //! only the policy decides.
 
 use super::api::*;
 use super::{Case, Ctx, Fail};
 use crate::{case, check};
+use axum::http::Method;
+use ruum_testkit::RequestSpec;
 use ruum_testkit::fixtures::Who;
 use serde_json::{Value, json};
 
 /// Raises `guest_view` to `manage` on `Projects` and makes the garden.
 async fn setup(cx: &Ctx, name: &str) -> Result<Garden, Fail> {
-    add_grant(cx, cx.a().projects, Who::GuestView, "manage").await?;
+    raise_grant(cx, Who::GuestView, "manage").await?;
     garden(cx, name).await
+}
+
+/// Changes the role of `who`'s own grant on `Projects` (the fixture gives every guest one) as
+/// the owner (`listGrants`, then `updateGrant`).
+async fn raise_grant(cx: &Ctx, who: Who, role: &str) -> Result<(), Fail> {
+    let projects = cx.a().projects;
+    let page = cx
+        .ok(
+            Who::Owner,
+            RequestSpec::get(format!("/v1/nodes/{projects}/grants")).tenant(cx.a().id),
+            &[200],
+        )
+        .await?;
+    let id = cx.p(who).id.to_string();
+    let Some(grant) = page["items"].as_array().and_then(|items| {
+        items.iter().find(|g| {
+            g["grantee"]["id"].as_str() == Some(id.as_str()) && g["inherited_from"].is_null()
+        })
+    }) else {
+        crate::fail!("Projects has no grant of {who:?} to raise: {page}");
+    };
+    let Some(grant_id) = grant["id"].as_str() else {
+        crate::fail!("a grant without an id: {grant}");
+    };
+    cx.ok(
+        Who::Owner,
+        RequestSpec::new(
+            Method::PATCH,
+            format!("/v1/nodes/{projects}/grants/{grant_id}"),
+        )
+        .tenant(cx.a().id)
+        .json(json!({ "role": role })),
+        &[200],
+    )
+    .await?;
+    Ok(())
 }
 
 /// `who` gets 403 permission_denied with the hint guests_create_resources.
@@ -35,7 +74,8 @@ pub fn cases() -> Vec<Case> {
                 "createDatabase",
                 "applyDatabaseMigration",
                 "queryDatabase",
-                "addGrant",
+                "listGrants",
+                "updateGrant",
                 "updateTenant",
                 "createDatabaseBranch",
             ],
@@ -69,7 +109,8 @@ pub fn cases() -> Vec<Case> {
                 "createDatabase",
                 "applyDatabaseMigration",
                 "queryDatabase",
-                "addGrant",
+                "listGrants",
+                "updateGrant",
                 "updateTenant",
                 "createDatabaseRestorePoint",
                 "restoreDatabase",
@@ -131,7 +172,8 @@ pub fn cases() -> Vec<Case> {
                 "createDatabase",
                 "applyDatabaseMigration",
                 "queryDatabase",
-                "addGrant",
+                "listGrants",
+                "updateGrant",
                 "updateTenant",
                 "copyNode",
             ],
