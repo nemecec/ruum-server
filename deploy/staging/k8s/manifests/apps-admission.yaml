@@ -1,9 +1,16 @@
-# Admission rules of the app sandboxes (backlog S-83, Kimi run 14 I-6 finding 4; backlog I6-1).
+# Admission rules of the app sandboxes (backlog S-83, Kimi run 14 I-6 finding 4; backlog I6-1;
+# review of I6-1 change 5 and Kimi review of I6-1 finding 1).
 # Restricted Pod Security does not require a runtime class, so without this a pod in ruum-apps
 # that lacks runtimeClassName would run app code on the node's kernel. Every pod created or
-# changed in ruum-apps must run in gVisor and carry no service account token, whoever creates it
-# (the runtime driver, an operator, a bug). ops/gvisor-check.sh checks it live (a server-side dry
-# run of a pod without the class must be refused); its control pod without gVisor runs in ops.
+# changed in ruum-apps (whoever creates it: the runtime driver, an operator, a bug) must run in
+# gVisor, carry no service account token (neither automounted nor as a projected volume), use
+# the default service account, have no init or ephemeral containers, and reach no Secret but its
+# own: volumes are only emptyDir and the Secret ruum-i-<its ruum.instance label without dashes>,
+# environment values come only from that Secret, and there is no envFrom. The driver's Role may
+# create pods, so without these rules a pod could mount another instance's Secret (another
+# tenant's token and values) although the Role has no get on Secrets.
+# ops/gvisor-check.sh checks the rules live (server-side dry runs that must be refused, and a
+# positive control); its control pod without gVisor runs in ops.
 # k8s/apply.sh applies this file after the runtime class.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -19,7 +26,11 @@ spec:
       - apiGroups: [""]
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE"]
-        resources: ["pods"]
+        resources: ["pods", "pods/ephemeralcontainers"]
+  variables:
+    # The pod's own Secret, or '' for a pod without the instance label (it may name no Secret).
+    - name: own
+      expression: "has(object.metadata.labels) && 'ruum.instance' in object.metadata.labels ? 'ruum-i-' + object.metadata.labels['ruum.instance'].replace('-', '') : ''"
   validations:
     - expression: "has(object.spec.runtimeClassName) && object.spec.runtimeClassName == 'gvisor'"
       message: "pods in ruum-apps run in gVisor only (runtimeClassName: gvisor; backlog S-83)"
@@ -29,6 +40,21 @@ spec:
       reason: Forbidden
     - expression: "!has(object.spec.hostNetwork) || object.spec.hostNetwork == false"
       message: "pods in ruum-apps never use the node's network"
+      reason: Forbidden
+    - expression: "(!has(object.spec.initContainers) || size(object.spec.initContainers) == 0) && (!has(object.spec.ephemeralContainers) || size(object.spec.ephemeralContainers) == 0)"
+      message: "pods in ruum-apps have no init or ephemeral containers"
+      reason: Forbidden
+    - expression: "!has(object.spec.serviceAccountName) || object.spec.serviceAccountName == 'default'"
+      message: "pods in ruum-apps use the default service account only"
+      reason: Forbidden
+    - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir) || (has(v.secret) && variables.own != '' && v.secret.secretName == variables.own))"
+      message: "pods in ruum-apps mount only emptyDir volumes and their instance's own Secret (no projected token, no other Secret)"
+      reason: Forbidden
+    - expression: "object.spec.containers.all(c, !has(c.envFrom) || size(c.envFrom) == 0)"
+      message: "pods in ruum-apps take no envFrom"
+      reason: Forbidden
+    - expression: "object.spec.containers.all(c, !has(c.env) || c.env.all(e, !has(e.valueFrom) || (has(e.valueFrom.secretKeyRef) && variables.own != '' && e.valueFrom.secretKeyRef.name == variables.own)))"
+      message: "pods in ruum-apps take environment values only from their instance's own Secret"
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

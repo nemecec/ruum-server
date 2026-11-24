@@ -12,10 +12,12 @@
 #    (status.nodeInfo.kernelVersion) and the gVisor pod must not: gVisor answers uname with its
 #    own kernel. A pod that does not start, or a control pod that does not see the node's
 #    kernel, fails the check (no pass on silence, decision 0006 G).
-# 3. The admission rule of ruum-apps (k8s/manifests/apps-admission.yaml): a server-side dry run of
-#    a pod without the runtime class, and of one with a service account token, in ruum-apps must
-#    be refused by the policy; the same pod with gVisor must pass the dry run (the positive
-#    control: the refusal comes from the rule, not from another error).
+# 3. The admission rules of ruum-apps (k8s/manifests/apps-admission.yaml): server-side dry runs
+#    of pods in ruum-apps that must be refused by the policy: without the runtime class, with a
+#    service account token (automounted, or as a projected volume), with another instance's
+#    Secret (a volume, or an environment value) and with envFrom. A gVisor pod that mounts its
+#    own instance Secret and takes a value from it must pass the dry run (the positive control:
+#    the refusals come from the rules, not from another error).
 # Not read-only in step 2: it creates two short pods per node (ruum-apps and ops) and deletes
 # them. Step 3 creates nothing (dry runs).
 # Exit 1 on any failure.
@@ -104,33 +106,45 @@ while IFS='=' read -r name _ kernel; do
   fi
 done <<<"$nodes"
 
-# 3. The admission rule of ruum-apps (backlog S-83): dry runs on the API server, nothing is made.
-# dry_run CLASS [TOKEN]: the API server's answer to a pod in ruum-apps (TOKEN=yes: with a token).
+# 3. The admission rules of ruum-apps (backlog S-83): dry runs on the API server, nothing is made.
+# The pod is labelled as an instance; its own Secret is ruum-i-<that ID without dashes>.
+OWN_ID=0190f0f0-0000-7000-8000-000000000001
+OWN_SECRET=ruum-i-0190f0f0000070008000000000000001
+OTHER_SECRET=ruum-i-0190f0f0000070008000000000000002
+# dry_run CLASS [JQ]: the API server's answer to a pod in ruum-apps, changed by the jq filter JQ.
 dry_run() {
   local node spec
   node="$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')"
-  spec="$(pod_spec "$node" "$IMG" "$1" | jq -c --arg tok "${2:-}" '
-    {apiVersion: "v1", kind: "Pod", metadata: {name: "gvisor-check-admission", namespace: "ruum-apps"}} + .
-    | if $tok == "yes" then .spec.automountServiceAccountToken = true else . end')"
+  spec="$(pod_spec "$node" "$IMG" "$1" | jq -c --arg id "$OWN_ID" --arg own "$OWN_SECRET" --arg other "$OTHER_SECRET" "
+    {apiVersion: \"v1\", kind: \"Pod\", metadata: {name: \"gvisor-check-admission\", namespace: \"ruum-apps\", labels: {\"ruum.instance\": \$id}}} + .
+    | ${2:-.}")"
   kubectl create --dry-run=server -f - -o name <<<"$spec" 2>&1
 }
-out="$(dry_run "" || true)"
-if [[ "$out" == *"ruum-apps-gvisor"* && "$out" == *"gVisor only"* ]]; then
-  pass "ruum-apps refuses a pod without the runtime class gvisor (the admission rule)"
-else
-  bad "ruum-apps did not refuse a pod without gVisor with its admission rule: ${out:-no answer} (k8s/manifests/apps-admission.yaml)"
-fi
-out="$(dry_run gvisor yes || true)"
-if [[ "$out" == *"ruum-apps-gvisor"* && "$out" == *"service account token"* ]]; then
-  pass "ruum-apps refuses a pod with a service account token"
-else
-  bad "ruum-apps did not refuse a pod with a service account token: ${out:-no answer}"
-fi
-out="$(dry_run gvisor || true)"
+# refused WHAT NEEDLE CLASS [JQ]: the dry run must be refused by the policy with NEEDLE.
+refused() {
+  local out
+  out="$(dry_run "$3" "${4:-.}" || true)"
+  if [[ "$out" == *"ruum-apps-gvisor"* && "$out" == *"$2"* ]]; then
+    pass "ruum-apps refuses a pod $1 (the admission rule)"
+  else
+    bad "ruum-apps did not refuse a pod $1 with its admission rule: ${out:-no answer} (k8s/manifests/apps-admission.yaml)"
+  fi
+}
+refused "without the runtime class gvisor" "gVisor only" ""
+refused "with a service account token" "service account token" gvisor '.spec.automountServiceAccountToken = true'
+refused "with a projected service account token" "mount only emptyDir" gvisor \
+  '.spec.volumes = [{name: "t", projected: {sources: [{serviceAccountToken: {path: "token"}}]}}]'
+refused "that mounts another instance's Secret" "mount only emptyDir" gvisor \
+  '.spec.volumes = [{name: "token", secret: {secretName: $other}}]'
+refused "that takes a value of another instance's Secret" "environment values only" gvisor \
+  '.spec.containers[0].env = [{name: "X", valueFrom: {secretKeyRef: {name: $other, key: "token"}}}]'
+refused "with envFrom" "no envFrom" gvisor '.spec.containers[0].envFrom = [{secretRef: {name: $own}}]'
+out="$(dry_run gvisor '.spec.volumes = [{name: "token", secret: {secretName: $own}}]
+  | .spec.containers[0].env = [{name: "X", valueFrom: {secretKeyRef: {name: $own, key: "token"}}}]' || true)"
 if [[ "$out" == "pod/gvisor-check-admission"* ]]; then
-  pass "a restricted gVisor pod passes the admission rule (the positive control)"
+  pass "a restricted gVisor pod with its own instance Secret passes the admission rules (the positive control)"
 else
-  bad "a restricted gVisor pod did not pass the dry run, so the refusals above prove nothing: ${out:-no answer}"
+  bad "a restricted gVisor pod with its own Secret did not pass the dry run, so the refusals above prove nothing: ${out:-no answer}"
 fi
 
 [[ $fail == 0 ]] && echo "gvisor check: passed" || echo "gvisor check: FAILED"
