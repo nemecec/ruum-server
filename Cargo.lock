@@ -3182,6 +3182,7 @@ name = "ruum-runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "base64 0.23.1",
  "bollard",
  "bytes",
@@ -3241,6 +3242,7 @@ dependencies = [
  "ruum-api",
  "ruum-core",
  "ruum-mcp",
+ "ruum-runtime",
  "ruum-webdav",
  "serde_json",
  "sqlx",

@@ -1,6 +1,6 @@
-# ruum-runtime: the Docker runtime driver
+# ruum-runtime: the Docker and Kubernetes runtime drivers
 
-Card R-2a. `DockerDriver` implements `ruum_core::runtime::RuntimeDriver` on a Docker engine
+Card R-2a (Docker) and backlog I6-1 (Kubernetes, below). `DockerDriver` implements `ruum_core::runtime::RuntimeDriver` on a Docker engine
 through `bollard` 0.21.1 (features `http` and `pipe` only: no TLS). The OCI runtime is plain
 `runc` or gVisor (`runsc`). The crate docs (`src/lib.rs`) describe the sandbox.
 
@@ -144,6 +144,141 @@ they run with plain Docker; without an engine they fail when `CI` is set.
   passes the allow step; the address rules still apply). In R-2e's API an empty list
   (`Some(vec![])`) would let no host pass. A network holds one app and environment; its
   registration carries the deployment of its first instance.
+
+## Kubernetes driver
+
+Backlog I6-1. `KubeDriver` (`src/kube/`) implements the same trait on Kubernetes, for staging
+(Talos has no Docker engine): one pod per run in the namespace of the sandboxes (`ruum-apps`),
+of the runtime class `gvisor`. The same spec, limits, routes, token file and log redaction as the
+Docker driver; it passes the conformance suite unchanged against a fake API server
+(`tests/kube.rs`). No Kubernetes client crate: plain JSON over `reqwest` (no new dependency).
+
+### Objects
+
+Per instance `<n>` = `ruum-i-<instance id without dashes>`:
+
+| Object | What |
+|---|---|
+| ConfigMap `<n>` | The record (key `record`): identity, kind, routes, limits, image, command, plain environment, state, run, touches, the egress registration. Every state change replaces it with its `resourceVersion`, so of two server processes one makes the change and its effects (usage, unregistration, pod deletion). Any process answers for any instance: adoption after a restart (R2A-1) is the normal path. |
+| Secret `<n>` | The workload token (key `token`) and the secret environment values (keys `env.<NAME>`), written with `stringData`. The driver never reads it back. Kept while the instance can run (also scaled to zero), deleted when it ends. |
+| Pod `<n>-<run>` | One per run; a cold start makes the next run. Labels as the Docker driver's plus `ruum.deployment`, `ruum.instance`, `ruum.run`. |
+
+### The pod
+
+`runtimeClassName` (the setting; `gvisor` on staging), `automountServiceAccountToken: false`,
+`enableServiceLinks: false`, no host network, PID or IPC namespace, `restartPolicy: Never`,
+`dnsPolicy: None` (nameserver `127.0.0.1`: no DNS; the routes' shared services are
+`hostAliases` with the address the driver resolved in its own pod), pod and container user
+`10001`, `runAsNonRoot`, `fsGroup` 10001, `RuntimeDefault` seccomp; the container `app`:
+`readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, `privileged: false`,
+`capabilities.drop: [ALL]`, CPU and memory limits with requests equal to them, the image by digest
+from the repository of the spec's tenant and app (checked at the registry first, as the Docker
+driver does), the spec's command as `args`. Volumes: `tmp` (`emptyDir`, `medium: Memory`,
+`sizeLimit` = the disk limit; a full disk is `ENOSPC`) at `/tmp`, and `token` (the Secret's key
+`token`, mode 0440) read-only at the folder of `TOKEN_FILE`. Secret values come by
+`secretKeyRef`; the pod spec holds none. A service gets its port and, with a health check, an
+**exec** readiness probe (the configured command, busybox `wget -Y off` by default, on
+`http://127.0.0.1:<port><path>`): inside the sandbox, never from the node's network (decision
+0006 G point 1). A job gets `activeDeadlineSeconds` (its timeout, rounded up to a second), and the
+driver ends it too when the API server did not 5 s later. After create, the driver checks the
+stored pod (`pod::verify`): the runtime class, the token, the namespaces, the security contexts,
+one container, the limits (in the API server's canonical quantities), exactly the two volumes
+and mounts; a difference deletes the pod and fails the start.
+
+### States
+
+The record's state moves as the pod shows: a pod that runs is `running` (with the egress route,
+only after the pod's address is registered at the egress proxy as `<ip>/32`, key = the pod name);
+a terminated container is `exited` (`OOMKilled` is out of memory, the pod reason
+`DeadlineExceeded` is timed out, otherwise the exit code); a pod that is gone or cannot start
+(`CreateContainerConfigError`, an invalid image name) is `exited` as killed. A service past its
+idle timeout (the newest touch of the record and of this process; `touch` writes the record at
+most every quarter of the idle timeout) scales to zero: the pod goes, the record and the Secret
+stay, and `wake` makes the next run from the record. Health: healthy when the container is ready;
+unhealthy when it is not ready after the start period plus the probe's period times its threshold.
+The sweep (every `sweep_every`, 5 s by default, in each process) observes every instance of the
+driver's labels, retries an unregistration that failed, deletes pods without a running record (an
+exited pod after 60 s, so its log is read), registers running pods at the egress proxy again every
+`reregister_every` (a proxy restart forgets them), and deletes ended records and their Secrets
+after `ended_retention`.
+
+The egress unregistration comes before the pod's deletion. When it fails (three tries), the pod
+stays and the record keeps `registered`, so the address is not given to another pod while the
+proxy still names this app for it; the sweep tries again. An exited pod has already freed its
+address when the driver sees the exit: until the next sweep, a new pod on that address gets the
+proxy's `subnet_overlap` and stays `starting` (fails closed).
+
+### Logs
+
+The process that started (or woke) an instance follows the pod log (`follow=true`, container
+`app`) into a ring per instance, through the redactor of `ruum-core`, with the values it knows
+(the spec's secrets, previous values and tokens; a rotation adds the new token before it patches
+the Secret). Another process (another replica, or this one after a restart) cannot redact, so its
+`logs` is `runtime_unavailable`. With `split_log_streams` the two streams are read apart
+(`stream=Stdout|Stderr`, which needs the API server's feature gate `PodLogsQuerySplitStreams`);
+otherwise both come as one, reported as standard output. A state change to exited waits up to 3 s
+for the followers to read the end. A broken stream of a running pod reconnects from that moment
+(`tailLines=0`): lines of the gap are lost, none is read twice.
+
+### API calls (the Role of `deploy/staging/charts/platform/templates/runtime-rbac.yaml`)
+
+| Method and path (namespace of the setting) | When |
+|---|---|
+| `POST /api/v1/namespaces/{ns}/configmaps` | start (the record first) |
+| `GET /api/v1/namespaces/{ns}/configmaps/{n}` | status, stop, touch, wake, rotate_token, logs of another process |
+| `PUT /api/v1/namespaces/{ns}/configmaps/{n}` | every state change, with `resourceVersion` |
+| `GET /api/v1/namespaces/{ns}/configmaps?labelSelector=ruum.managed=ruum-runtime,...` | the sweep |
+| `DELETE /api/v1/namespaces/{ns}/configmaps/{n}` | after the retention; a failed start |
+| `POST /api/v1/namespaces/{ns}/secrets` | start |
+| `PATCH /api/v1/namespaces/{ns}/secrets/{n}` (merge patch, `stringData.token`) | rotate_token |
+| `DELETE /api/v1/namespaces/{ns}/secrets/{n}` | stop, exit, a failed start, the retention |
+| `POST /api/v1/namespaces/{ns}/pods` | start, wake |
+| `GET /api/v1/namespaces/{ns}/pods/{n}-{run}` | status, the sweep, the log followers |
+| `GET /api/v1/namespaces/{ns}/pods?labelSelector=...` | the sweep (pods without a running record) |
+| `DELETE /api/v1/namespaces/{ns}/pods/{n}-{run}` (grace = the stop timeout) | stop, scale to zero, the sweep, a refused read-back |
+| `GET /api/v1/namespaces/{ns}/pods/{n}-{run}/log?container=app&follow=true` | the log followers |
+
+The answers of Secret writes hold the data; the client reads only their status code. The fake
+API server of the tests reads the Role from the chart and refuses every other verb, resource or
+namespace, so a driver change that needs a new right fails the tests until the Role has it.
+Outside the API: `HEAD {registry}/v2/ruum/{tenant}/{app}/manifests/{digest}` and the egress
+proxy's control listener (`EgressRegistry`, as the Docker driver).
+
+### Settings (read by `ruum-server`, `crates/ruum-server/src/config.rs`)
+
+| Variable | What |
+|---|---|
+| `RUUM_RUNTIME_DRIVER` | `kubernetes` (the server's default is `memory`). |
+| `RUUM_KUBE_API_URL`, `RUUM_KUBE_TOKEN_FILE`, `RUUM_KUBE_CA_FILE` | The API server, a projected token (read for every call), its CA. |
+| `RUUM_KUBE_NAMESPACE`, `RUUM_KUBE_RUNTIME_CLASS` | `ruum-apps`, `gvisor` by default. |
+| `RUUM_REGISTRY` | The registry the nodes pull from; unset: every app image is `image_not_found`. |
+| `RUUM_KUBE_EGRESS_PROXY` | The egress proxy's Service, `host:port` (the route `egress_proxy`, alias `ruum-egress`). |
+| `RUUM_KUBE_EGRESS_CONTROL`, `RUUM_KUBE_EGRESS_CONTROL_TOKEN_FILE` | The proxy's control listener (backlog I6-2); unset: no registration, the proxy refuses every sandbox. |
+| `RUUM_KUBE_SPLIT_LOG_STREAMS` | `on` or `off` (default). |
+
+### Tests
+
+```sh
+cargo test -p ruum-runtime --test kube    # the conformance suite and the driver's rules, fake API server
+cargo test -p ruum-runtime --lib kube     # quantities, names
+```
+
+No cluster, no Docker: they run in every workspace run and in CI. They do not prove gVisor, the
+network policies or the kubelet's behaviour: on staging `ops/gvisor-check.sh`,
+`status.sh --netpol` and `ops/rbac-check.sh live` do.
+
+### Known limits of the Kubernetes driver
+
+- No pids limit per pod (Kubernetes sets it per node, `podPidsLimit` of the kubelet).
+- The kubelet updates the token file within about a minute of a rotation (a projected Secret);
+  the token issuer renews well before expiry (`apps::workload_tokens`).
+- A pod's output also goes to the node's CRI log files (rotated by the kubelet); the Docker
+  driver keeps output off the engine's disk with the log driver `none`.
+- With two server replicas, each one's sandbox directory keeps its own map of deployment to
+  instance, so a deployment can get one instance per replica.
+- A crash between the Secret and the record of a start cannot happen (the record comes first);
+  a crash right after the record leaves a record that the sweep ends after 60 s.
+- Usage of the runtime is not metered yet on the server (card I-8); the server logs it at debug.
 
 ## Builder
 
