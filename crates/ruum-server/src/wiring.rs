@@ -246,17 +246,107 @@ pub fn install_apps(
             p
         }
     };
-    // Static sites (card W-2s) go to a bucket of their own when there is S3 (decision 0008-4);
-    // the runtime driver stays the in-memory one until the runtime cards (R-2a, I-4).
+    // Static sites (card W-2s) go to a bucket of their own when there is S3 (decision 0008-4).
     if let Some(s3) = ruum_core::blobs::object::S3Settings::from_env() {
         parts.sites = static_sites(
             &s3,
             ruum_core::blobs::object::S3Settings::static_bucket_from_env().as_deref(),
         )?;
     }
+    // The runtime driver: the in-memory one, or pods in gVisor (backlog I6-1). The Docker driver
+    // of the laptop is card I-4's.
+    let kube = kube_driver(&crate::config::RuntimeSettings::from_env()?)?;
+    if let Some(k) = &kube {
+        parts.runtime = k.clone();
+    }
     ruum_core::apps::install(services, parts).context("set up the apps area")?;
+    if let Some(k) = kube {
+        services.sandboxes = Some(Arc::new(sandbox_directory(services, k)));
+    }
     tokio::spawn(services.apps.clone().run_sweeper(PREVIEW_SWEEP_EVERY));
     Ok(())
+}
+
+/// Usage of the runtime goes nowhere yet: the meters of apps are card I-8's. A sink that keeps
+/// records would grow without bound.
+struct UnmeteredUsage;
+
+impl ruum_core::runtime::RuntimeUsageSink for UnmeteredUsage {
+    fn record(&self, usage: ruum_core::runtime::RuntimeUsage) {
+        tracing::debug!(target: "ruum::runtime", ?usage, "runtime usage (not metered yet, card I-8)");
+    }
+}
+
+/// The Kubernetes runtime driver of `settings` (backlog I6-1), or `None` for the in-memory
+/// driver. It makes no API call here; its sweep starts on the current runtime.
+pub fn kube_driver(
+    settings: &crate::config::RuntimeSettings,
+) -> anyhow::Result<Option<Arc<ruum_runtime::KubeDriver>>> {
+    use ruum_core::runtime::{Route, SecretValue};
+    use ruum_runtime::{EgressRegistry, HttpEgressRegistry, KubeConfig, NoEgress, SharedService};
+    let crate::config::RuntimeSettings::Kubernetes(k) = settings else {
+        return Ok(None);
+    };
+    let mut cfg = KubeConfig::new(&k.api_url, &k.namespace, &k.runtime_class);
+    cfg.token_file = k.token_file.clone();
+    cfg.ca_file = k.ca_file.clone();
+    cfg.registry = k.registry.clone();
+    cfg.split_log_streams = k.split_log_streams;
+    if let Some((host, port)) = &k.egress_proxy {
+        cfg.routes.insert(
+            Route::EgressProxy,
+            SharedService {
+                address: host.clone(),
+                alias: "ruum-egress".to_owned(),
+                port: *port,
+            },
+        );
+    }
+    let egress: Arc<dyn EgressRegistry> = match (&k.egress_control, &k.egress_control_token_file) {
+        (Some(control), Some(file)) => {
+            let token = std::fs::read_to_string(file)
+                .with_context(|| format!("cannot read {}", file.display()))?;
+            Arc::new(HttpEgressRegistry::new(
+                control,
+                SecretValue::new(token.trim_end_matches(['\r', '\n'])),
+            )?)
+        }
+        _ => {
+            tracing::warn!(
+                "the runtime driver has no egress control listener (RUUM_KUBE_EGRESS_CONTROL, backlog I6-2): no sandbox is registered, so the egress proxy refuses every sandbox (fails closed)"
+            );
+            Arc::new(NoEgress)
+        }
+    };
+    if k.registry.is_none() {
+        tracing::warn!(
+            "the runtime driver has no registry (RUUM_REGISTRY): every app image is image_not_found"
+        );
+    }
+    let driver = ruum_runtime::KubeDriver::new(cfg, egress, Arc::new(UnmeteredUsage))?;
+    tracing::info!(
+        namespace = %k.namespace,
+        runtime_class = %k.runtime_class,
+        "runtime driver: Kubernetes (backlog I6-1)"
+    );
+    Ok(Some(Arc::new(driver)))
+}
+
+/// The sandbox directory over the Kubernetes driver: the gateway reaches a running pod at its
+/// address and the service port (the driver's last status of it). No spec maker yet: nothing
+/// starts a deployment's instance from a visit until the deploy pipeline builds node22 apps.
+pub fn sandbox_directory(
+    services: &Services,
+    driver: Arc<ruum_runtime::KubeDriver>,
+) -> ruum_core::apps::sandboxes::SandboxDirectory {
+    use ruum_core::apps::sandboxes::{Locator, SandboxDirectory, Upstream};
+    let locate = driver.clone();
+    let locator: Locator = Arc::new(move |st: &ruum_core::runtime::InstanceStatus| {
+        locate
+            .upstream(st.id)
+            .map(|(host, port)| Upstream { host, port })
+    });
+    SandboxDirectory::new(services.apps.store().clone(), driver, locator)
 }
 
 /// The static sites over S3 (decision 0008-4). With `static_bucket` (`RUUM_STATIC_S3_BUCKET`):
