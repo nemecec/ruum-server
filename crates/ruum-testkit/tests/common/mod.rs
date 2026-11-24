@@ -104,11 +104,7 @@ pub const PENDING: &[(&str, &str)] = &[
     ),
     (
         "guests_branch_a_database_only_with_the_policy",
-        "needs masked and full branches (card D-3b, the second part of D-3); its setup also gets 409 from addGrant (see guests_copy_a_database_only_with_the_policy)",
-    ),
-    (
-        "guests_copy_a_database_only_with_the_policy",
-        "its setup gives guest_view a second grant on Projects, which addGrant answers 409 (the grantee has a grant there): the case looks wrong (card T-1 to decide, panel/impl-d2.md); the agent's copy is also a masked copy (card D-3b)",
+        "needs masked and full branches (card D-3b, the second part of D-3)",
     ),
 ];
 

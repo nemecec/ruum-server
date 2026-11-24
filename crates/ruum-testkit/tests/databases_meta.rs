@@ -107,10 +107,8 @@ fn the_report_counts_planned_and_pending_apart() {
 fn pending_entries_name_a_case_and_a_card() {
     let names: BTreeSet<&str> = all_cases().iter().map(|c| c.name).collect();
     let mut seen = BTreeSet::new();
-    // 14 since card D-2: the migration operations left planned, and the cases that also need
-    // cards A-2w and D-3b (or a T-1 decision) moved here, each with its card.
     assert!(
-        PENDING.len() <= 14,
+        PENDING.len() <= 12,
         "the pending list grows: {} entries",
         PENDING.len()
     );
