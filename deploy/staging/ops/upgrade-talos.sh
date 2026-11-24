@@ -88,7 +88,7 @@ while IFS='=' read -r name ip; do
     kubectl -n data wait --for=jsonpath='{.status.currentPrimary}'="$target" cluster/pg --timeout=5m >/dev/null
   fi
   log "$name: talosctl upgrade to $TALOS_INSTALLER_IMAGE (--preserve); was: $st"
-  talosctl -n "$ip" upgrade --image "$TALOS_INSTALLER_IMAGE" --preserve --wait --timeout 15m
+  talosctl -n "$ip" upgrade --legacy --image "$TALOS_INSTALLER_IMAGE" --preserve --wait --timeout 15m
   kubectl wait --for=condition=Ready "node/$name" --timeout=10m >/dev/null
   kubectl -n data wait --for=condition=Ready cluster/pg --timeout=15m >/dev/null
   st="$(node_state "$ip")"
