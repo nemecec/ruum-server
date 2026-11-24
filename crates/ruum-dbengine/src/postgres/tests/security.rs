@@ -430,6 +430,66 @@ async fn a_statement_over_the_timeout_is_cancelled() {
     }
 }
 
+/// Decision 0004-35 (Kimi review D-2, 2): a `DO` block of a migration that lifts the timeouts
+/// does not lift them for the next statement, and a migration of many statements, each under
+/// its timeout, ends at the wall clock. Both roll back and leave the lens working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_migration_cannot_lift_its_limits() {
+    let Some(engine) = engine().await else { return };
+    let f = Fixture::new(&engine).await;
+    let sync = ClassSync {
+        personal: vec![],
+        secret: vec![],
+    };
+    let ups = [
+        "CREATE TABLE lifted (id integer); \
+         DO $$ BEGIN PERFORM set_config('statement_timeout', '0', true); \
+         PERFORM set_config('lock_timeout', '0', true); END $$; \
+         SELECT pg_sleep(30);"
+            .to_string(),
+        format!(
+            "CREATE TABLE lifted (id integer); {}",
+            "SELECT pg_sleep(0.15); ".repeat(20)
+        ),
+    ];
+    for up in ups {
+        let started = Instant::now();
+        let request = MigrationRequest {
+            up: up.clone(),
+            timeout: Duration::from_millis(200),
+            dry_run: false,
+        };
+        let err = engine
+            .apply_migration(f.db(), &f.key, &request, &sync)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, EngineError::MigrationFailed(e) if matches!(**e, EngineError::Timeout)),
+            "{up}: {err:?}"
+        );
+        // The wall clock is 10 timeouts (2 s); the cancel grace adds at most 2 s.
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "{up}: {:?}",
+            started.elapsed()
+        );
+        let tables = engine.catalog(f.db()).await.unwrap().tables;
+        assert!(
+            !tables.iter().any(|t| t.name == "lifted"),
+            "{up}: the migration was not rolled back"
+        );
+        // The lens is back: a lens kind reads.
+        f.run(
+            RoleKind::MaskedRead,
+            StatementMode::Read,
+            "SELECT 1",
+            vec![],
+        )
+        .await
+        .unwrap();
+    }
+}
+
 /// After a request, a pooled connection holds no session option: `SHOW` of statement_timeout,
 /// role, search_path (and TimeZone) equal a fresh session.
 ///

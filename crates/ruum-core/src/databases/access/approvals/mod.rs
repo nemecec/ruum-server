@@ -985,6 +985,9 @@ fn reads_full_up(ctx: &Context, role: Option<Role>) -> bool {
 /// gives [`UNPARSED`], never the raw `up`. A statement approval already stores the normalized
 /// text, and a grant request has no statement, so both stay as they are. The store keeps the
 /// `up` as sent (0004-40 d).
+///
+/// The `type` of each planned column follows the same rule ([`shown_type`]; backlog S-31,
+/// Kimi review D-2, 5): a type modifier or an enum label can hold a quoted literal.
 pub(crate) fn shown_statement(a: &mut DatabaseApproval, engine: Option<EngineKind>, full: bool) {
     if a.subject != ApprovalSubject::Migration || full {
         return;
@@ -995,6 +998,39 @@ pub(crate) fn shown_statement(a: &mut DatabaseApproval, engine: Option<EngineKin
             None => UNPARSED.to_string(),
         };
     }
+    for c in &mut a.planned_columns {
+        if let Some(t) = c.data_type.as_mut() {
+            *t = shown_type(t);
+        }
+    }
+}
+
+/// The `type` of a planned column for a reader who does not read the `up` as sent. The parser
+/// keeps a quoted type modifier without its quotes (`mytype('Mari Tamm')` reads
+/// `mytype(Mari Tamm)`), so only numeric modifiers (`varchar(80)`, `numeric(10, 2)`,
+/// `timestamp(3) with time zone`) are shown: any other text from the first `(` to the last `)`
+/// shows as `?` (a literal may hold a `)` itself). A type that still holds a quote, a dollar
+/// sign or a backslash shows as [`UNPARSED`].
+pub(crate) fn shown_type(t: &str) -> String {
+    let out = match (t.find('('), t.rfind(')')) {
+        (Some(open), Some(close)) if open < close => {
+            let inner = &t[open + 1..close];
+            let numeric = inner
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == ',' || c == ' ');
+            if numeric {
+                t.to_string()
+            } else {
+                format!("{}(?){}", &t[..open], &t[close + 1..])
+            }
+        }
+        (None, None) => t.to_string(),
+        _ => return UNPARSED.to_string(),
+    };
+    if out.contains(['\'', '$', '\\']) {
+        return UNPARSED.to_string();
+    }
+    out
 }
 
 impl DatabaseService {

@@ -454,12 +454,14 @@ pub trait DatabaseStore: Send + Sync {
 
     /// Takes the migration lock of a database (DB-2) and holds it until the lock is released
     /// or dropped: a migration holds it while it runs, a branch of the database from before its
-    /// engine copy until [`DatabaseStore::insert_branch`] wrote its rows. Waits while another
-    /// holder has it.
+    /// engine copy until [`DatabaseStore::insert_branch`] wrote its rows. Waits at most `wait`
+    /// while another holder has it, then gives [`migrations::lock_busy`] (`503`, retryable).
+    /// A waiter holds no connection of the store's pool (review D-2, 1).
     async fn lock_migrations(
         &self,
         tenant: TenantId,
         node: NodeId,
+        wait: std::time::Duration,
     ) -> Result<migrations::MigrationLock>;
 
     /// Writes a `database_restore_points` row of the database (no label; `reason` of
@@ -904,8 +906,9 @@ impl DatabaseStore for MemoryDatabaseStore {
         &self,
         tenant: TenantId,
         node: NodeId,
+        wait: std::time::Duration,
     ) -> Result<migrations::MigrationLock> {
-        Ok(self.migration_locks.lock(tenant, node).await)
+        self.migration_locks.lock(tenant, node, wait).await
     }
 
     async fn insert_restore_point(
@@ -1030,11 +1033,29 @@ pub fn in_trash() -> Error {
 #[derive(Clone, Debug)]
 pub struct PgDatabaseStore {
     pool: sqlx::PgPool,
+    /// The pool of the migration locks (card D-2), apart from `pool` (review D-2, 1): a holder
+    /// keeps one of these connections while its migration or branch copy works on `pool`, so
+    /// the locks never use up the connections that the holders (or other tenants' requests)
+    /// need. Made on first use, with the connect options of `pool`.
+    locks: Arc<std::sync::OnceLock<sqlx::PgPool>>,
 }
 
 impl PgDatabaseStore {
     pub fn new(pool: sqlx::PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            locks: Arc::default(),
+        }
+    }
+
+    fn lock_pool(&self) -> &sqlx::PgPool {
+        self.locks.get_or_init(|| {
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(migrations::LOCK_CONNECTIONS)
+                .min_connections(0)
+                .idle_timeout(std::time::Duration::from_secs(60))
+                .connect_lazy_with((*self.pool.connect_options()).clone())
+        })
     }
 }
 
@@ -1544,8 +1565,9 @@ impl DatabaseStore for PgDatabaseStore {
         &self,
         tenant: TenantId,
         node: NodeId,
+        wait: std::time::Duration,
     ) -> Result<migrations::MigrationLock> {
-        migrations::store::pg_lock(&self.pool, tenant, node).await
+        migrations::store::pg_lock(self.lock_pool(), tenant, node, wait).await
     }
 
     async fn insert_restore_point(
