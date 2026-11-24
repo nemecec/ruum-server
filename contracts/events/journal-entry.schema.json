@@ -1479,8 +1479,6 @@
       "description": "Event types that are specified but not known to the server yet (decision 0004-21). Not used for validation; the envelope test of ruum-core keeps `EventType` equal to `$defs/known_types` minus this list. A type leaves this list with its first reader rule or its first writer, whichever comes first (design 12.7).",
       "enum": [
         "typed_node.status_changed",
-        "database.migration_applied",
-        "database.migration_failed",
         "database.restore_started",
         "database.restored",
         "database.restore_failed",
