@@ -6,11 +6,25 @@
 #   challenges of the others. The ServiceAccount ruum-edge and its Role (Secrets and Leases of
 #   this namespace only) are in charts/platform, because the deployer has no access to Secrets.
 # - a DaemonSet, one edge on every node (three on staging, so at least two serve at any time):
-#   the Service uses externalTrafficPolicy Local and the load balancer's TCP check finds the
-#   nodes with an edge. With a Deployment of two, the node that loses its edge in a rollout
+#   the Services use externalTrafficPolicy Local and the load balancer's health checks find the
+#   nodes with a serving edge. With a Deployment of two, the node that loses its edge in a rollout
 #   would keep getting connections until the check (3 x 10 s) marks it down. The DaemonSet
 #   update starts the new pod on the same node first (maxSurge 1, maxUnavailable 0), so each
 #   node keeps a ready edge through a rollout.
+# - ready only with certificates (backlog O-53): after a node reboot an edge started while the
+#   API server refused connections, never loaded its certificates from the Secrets and served
+#   TLS without them, and the load balancer's TCP check kept the node in rotation. Now:
+#   - the init container waits (at most 120 s) until the API server answers, so Caddy normally
+#     starts with a reachable certificate storage;
+#   - the probes ask Caddy for the ready path over HTTPS without a server name; Caddy answers
+#     with the public host's certificate (default_sni) or fails the handshake. So the readiness
+#     probe fails until the certificates are loaded, which proves that the API server was
+#     reachable. It does not ask the API server again: an API server that is down later must
+#     not take every edge out of the load balancer, while Caddy keeps its certificates in memory;
+#   - Caddy does not retry a failed load, so the startup probe (5 minutes, which also covers the
+#     first ACME orders of a new cluster) and the liveness probe (1 minute) restart it;
+#   - the load balancer checks the same path over HTTPS on port 443 (tofu/cluster), so a node
+#     whose edge has no certificates leaves the rotation.
 # - shutdown: a pause before SIGTERM, then Caddy's grace_period for open connections.
 # The ACME CA is never production Let's Encrypt (review 2 R-3).
 {{- $grace := int .Values.edge.shutdownGraceSeconds }}
@@ -60,6 +74,27 @@ spec:
         runAsGroup: 65532
         fsGroup: 65532
         seccompProfile: { type: RuntimeDefault }
+      initContainers:
+        # Waits until the API server answers (any HTTP answer: /readyz may need credentials,
+        # and this sends none), at most 120 s; then Caddy starts anyway and the probes decide.
+        - name: wait-api-server
+          image: {{ include "ruum.byDigest" .Values.images.edge }}
+          command: [/bin/sh, -c]
+          args:
+            - |
+              url="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/readyz"
+              i=0
+              while [ "$i" -lt 60 ]; do
+                out="$(wget -q -T 3 -O /dev/null "$url" 2>&1)" && exit 0
+                case "$out" in *"server returned error: HTTP/1.1 401"* | *"server returned error: HTTP/1.1 403"*) exit 0 ;; esac
+                i=$((i + 1))
+                sleep 2
+              done
+              echo "the API server did not answer in 120 s: $out; Caddy starts anyway (backlog O-53)"
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 32Mi }
+          {{- include "ruum.restricted" . | nindent 10 }}
       containers:
         - name: caddy
           image: {{ include "ruum.byDigest" .Values.images.edge }}
@@ -73,9 +108,20 @@ spec:
           ports:
             - { name: http, containerPort: 8080 }
             - { name: https, containerPort: 8443 }
-          readinessProbe:
-            tcpSocket: { port: https }
+          # Backlog O-53: HTTPS without a server name, so a handshake succeeds only with the
+          # public host's certificate (see the top of this file).
+          startupProbe:
+            {{- include "ruum.edgeProbe" . | nindent 12 }}
             periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            {{- include "ruum.edgeProbe" . | nindent 12 }}
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            {{- include "ruum.edgeProbe" . | nindent 12 }}
+            periodSeconds: 10
+            failureThreshold: 6
           lifecycle:
             preStop:
               sleep: { seconds: {{ $pause }} }
@@ -94,10 +140,13 @@ spec:
         - name: config
           emptyDir: { sizeLimit: 16Mi }
 ---
-# NodePorts behind the load balancer (tofu/cluster: 80 -> 30080, 443 -> 30443, proxy protocol).
+# NodePorts behind the load balancer (tofu/cluster: 443 -> 30443, 80 -> 30081, proxy protocol).
 # externalTrafficPolicy Local keeps the source address (the LB, 10.20.1.5), which the proxy
-# protocol allow-list and the network policy expect; the LB health check finds the nodes that
-# run an edge (all of them, see the DaemonSet above).
+# protocol allow-list and the network policy expect; the LB health checks find the nodes that
+# run a serving edge (see the DaemonSet above). Only ready edges get connections here.
+# Port 80 on 30080 stays for one release (expand, then contract; design 12.7): the load balancer
+# of the release before backlog O-53 sends port 80 there. Remove it once tofu/cluster sends port
+# 80 to 30081 on staging.
 apiVersion: v1
 kind: Service
 metadata:
@@ -110,3 +159,20 @@ spec:
   ports:
     - { name: http, port: 80, targetPort: http, nodePort: 30080 }
     - { name: https, port: 443, targetPort: https, nodePort: 30443 }
+---
+# Port 80 for the load balancer (backlog O-53): also to edges that are not ready, because a new
+# cluster gets its first certificates through ACME HTTP-01 challenges on port 80, and an edge
+# without certificates is not ready. Port 80 answers only those challenges, the health path and
+# redirects to HTTPS.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ruum-edge-http
+  namespace: edge
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  publishNotReadyAddresses: true
+  selector: { app: ruum-edge }
+  ports:
+    - { name: http, port: 80, targetPort: http, nodePort: 30081 }

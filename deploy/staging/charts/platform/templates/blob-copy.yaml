@@ -9,10 +9,14 @@ metadata:
 spec:
   schedule: {{ .Values.blobCopy.schedule | quote }}
   concurrencyPolicy: Forbid
-  successfulJobsHistoryLimit: 3
-  failedJobsHistoryLimit: 3
+  # Backlog O-55: failed Jobs (three pods each) stayed in the cluster and stopped
+  # ops/upgrade-talos.sh. Keep the last Job of each kind for its log, and delete every finished
+  # Job after two days, so one failure is still there the next morning.
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
   jobTemplate:
     spec:
+      ttlSecondsAfterFinished: 172800
       backoffLimit: 2
       activeDeadlineSeconds: 14400
       template:

@@ -37,8 +37,12 @@ mailpit:
 blobCopy:
   image: rclone/rclone:1.75.2
   schedule: "30 2 * * *"
+  # The blob bucket of tofu/cluster (bucket_blobs) at the endpoint of its location: the minio
+  # provider makes it at ${var.location}.your-objectstorage.com, HCLOUD_LOCATION of versions.env
+  # (fsn1 since 2026-11-11). At hel1 the bucket does not exist, and rclone said "directory not
+  # found" every night (backlog O-55). tests/run.sh checks both against tofu and versions.env.
   source: ruum-staging-blobs-768usm
-  sourceEndpoint: https://hel1.your-objectstorage.com
+  sourceEndpoint: https://fsn1.your-objectstorage.com
   destination: ruum-staging-blobs-copy
   destinationEndpoint: https://s3.nl-ams.scw.cloud
 

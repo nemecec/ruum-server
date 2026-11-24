@@ -155,19 +155,32 @@ resource "hcloud_load_balancer_target" "nodes" {
   depends_on       = [hcloud_load_balancer_network.edge]
 }
 
+# Health checks (backlog O-53): a TCP check kept a node in rotation whose edge listened but had
+# no certificates. Port 443 now checks the ready path over HTTPS, which Caddy answers itself
+# only with the public host's certificate (charts/ruum: _caddyfile.tpl, edge.yaml), so a node
+# whose edge is not ready leaves the rotation. No body check: the edge of a release before
+# O-53 answers the same path with the web UI (200), so a rollback of the chart keeps the nodes
+# in. Port 80 goes to the Service ruum-edge-http (nodePort 30081, also edges that are not
+# ready) and checks the alive path over HTTP, which needs no certificate, so a new cluster can
+# answer its first ACME HTTP-01 challenges. Deploy the chart with O-53 before this change
+# (README; the orchestrator steps of O-53), or the port 80 check finds nothing on 30081.
 resource "hcloud_load_balancer_service" "http" {
   load_balancer_id = hcloud_load_balancer.edge.id
   protocol         = "tcp"
   listen_port      = 80
-  destination_port = 30080
+  destination_port = 30081
   proxyprotocol    = true
 
   health_check {
-    protocol = "tcp"
-    port     = 30443
+    protocol = "http"
+    port     = 30081
     interval = 10
     timeout  = 5
     retries  = 3
+    http {
+      path         = "/_edge/alive"
+      status_codes = ["200"]
+    }
   }
 }
 
@@ -179,11 +192,17 @@ resource "hcloud_load_balancer_service" "https" {
   proxyprotocol    = true
 
   health_check {
-    protocol = "tcp"
+    protocol = "http"
     port     = 30443
     interval = 10
     timeout  = 5
     retries  = 3
+    http {
+      domain       = "staging.ruum.space" # hosts.public of charts/ruum (tests/run.sh)
+      path         = "/_edge/ready"
+      tls          = true
+      status_codes = ["200"]
+    }
   }
 }
 

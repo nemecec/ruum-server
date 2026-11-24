@@ -48,3 +48,26 @@ https://acme.zerossl.com/v2/DV90
 {{- fail "commit must be 40 lowercase hex characters (code review F-3)" -}}
 {{- end -}}
 {{- end }}
+
+{{- /* The paths that the edge answers itself (backlog O-53). tofu/cluster/main.tf uses the same
+       two paths in the load balancer's health checks (tests/run.sh checks that they agree). */}}
+{{- define "ruum.edgeReadyPath" -}}
+/_edge/ready
+{{- end }}
+
+{{- define "ruum.edgeAlivePath" -}}
+/_edge/alive
+{{- end }}
+
+{{- /* The probe of the edge (backlog O-53): the ready path over HTTPS on the pod's address.
+       The kubelet sends no server name, so Caddy answers with the public host's certificate
+       (default_sni) or fails the handshake; the Host header picks the public site. */}}
+{{- define "ruum.edgeProbe" -}}
+httpGet:
+  scheme: HTTPS
+  port: https
+  path: {{ include "ruum.edgeReadyPath" . }}
+  httpHeaders:
+    - { name: Host, value: {{ .Values.hosts.public }} }
+timeoutSeconds: 3
+{{- end }}

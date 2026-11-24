@@ -7,6 +7,11 @@
 	email {{ . }}
 	{{- end }}
 	acme_ca {{ include "ruum.acmeCA" . }}
+	# A TLS handshake without a server name (the kubelet's HTTPS probe, maybe the load
+	# balancer's health check) gets the certificate of the public host, so the readiness probe
+	# proves that this edge has loaded its certificates (backlog O-53). Without them the
+	# handshake fails.
+	default_sni {{ .Values.hosts.public }}
 	# Certificates, ACME accounts and challenge tokens in Kubernetes Secrets of the edge
 	# namespace (backlog O-26): a restart never issues again, and every edge pod answers the
 	# HTTP-01 challenges of the others. Module: deploy/images/caddy-secret-storage.
@@ -45,6 +50,12 @@
 {{ .Values.hosts.public }} {
 	import platform_headers
 	encode zstd gzip
+	# Readiness of this edge (backlog O-53): the kubelet's probes and the load balancer's HTTPS
+	# health check. Caddy answers it itself, so it needs this host's certificate but no upstream:
+	# a slow ruum-server never takes the edges out of the load balancer.
+	handle {{ include "ruum.edgeReadyPath" . }} {
+		respond "ready" 200
+	}
 	@server path /v1/* /healthz /.well-known/* /mcp /mcp/*
 	handle @server {
 		reverse_proxy ruum-server.ruum.svc.cluster.local:8491
@@ -128,7 +139,14 @@
 # balancer's PROXY header then reaches the HTTP parser, every request on port 80 answers 400,
 # and the ACME HTTP-01 challenge fails (staging bring-up, 2026-11-12). Caddy still answers
 # HTTP-01 challenges on this server before the redirect.
+# The load balancer's HTTP health check of port 80 (backlog O-53) needs no certificate, so a
+# new cluster can answer its first ACME HTTP-01 challenges.
 http:// {
-	redir https://{host}{uri} 308
+	handle {{ include "ruum.edgeAlivePath" . }} {
+		respond "alive" 200
+	}
+	handle {
+		redir https://{host}{uri} 308
+	}
 }
 {{- end }}
