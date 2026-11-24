@@ -68,6 +68,8 @@ struct MemDb {
     lens: Vec<LensEvent>,
     /// The app roles (card D-5).
     app_roles: Vec<MemAppRole>,
+    /// The apps of the database are suspended (it is in the trash).
+    apps_suspended: bool,
     /// Set by `drop_database` under the lock. A call that got the handle before the drop and
     /// waited on the lock finds the database gone.
     dropped: bool,
@@ -209,6 +211,7 @@ impl MemoryEngine {
                 points: Vec::new(),
                 lens: Vec::new(),
                 app_roles: Vec::new(),
+                apps_suspended: false,
                 dropped: false,
             })
         })
@@ -523,7 +526,7 @@ impl DatabaseEngine for MemoryEngine {
             kind,
             binding,
             role_name: neutral_name("r_"),
-            suspended: false,
+            suspended: held.apps_suspended,
         };
         held.app_roles.push(role.clone());
         Ok(role.public(db))
@@ -548,6 +551,11 @@ impl DatabaseEngine for MemoryEngine {
         {
             return Err(EngineError::InvalidRole("no such app role".to_string()));
         }
+        if held.apps_suspended {
+            return Err(EngineError::PermissionDenied(
+                "app_role_suspended".to_string(),
+            ));
+        }
         Err(EngineError::Unsupported(
             "the memory engine has no network path for an app; app credentials need the \
              Postgres engine"
@@ -571,6 +579,11 @@ impl DatabaseEngine for MemoryEngine {
     async fn resume_app_role(&self, role: &RoleRef) -> Result<(), EngineError> {
         let (kind, binding) = app_key(role)?;
         let mut held = self.lock(role.database()).await?;
+        if held.apps_suspended {
+            return Err(EngineError::PermissionDenied(
+                "app_role_suspended".to_string(),
+            ));
+        }
         for r in held
             .app_roles
             .iter_mut()
@@ -586,6 +599,24 @@ impl DatabaseEngine for MemoryEngine {
         let mut held = self.lock(role.database()).await?;
         held.app_roles
             .retain(|r| !(r.kind == kind && r.binding == binding));
+        Ok(())
+    }
+
+    async fn suspend_app_access(&self, db: &DatabaseRef) -> Result<(), EngineError> {
+        let mut held = self.lock(db).await?;
+        held.apps_suspended = true;
+        for r in held.app_roles.iter_mut() {
+            r.suspended = true;
+        }
+        Ok(())
+    }
+
+    async fn resume_app_access(&self, db: &DatabaseRef) -> Result<(), EngineError> {
+        let mut held = self.lock(db).await?;
+        held.apps_suspended = false;
+        for r in held.app_roles.iter_mut() {
+            r.suspended = false;
+        }
         Ok(())
     }
 }

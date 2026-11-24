@@ -12,7 +12,11 @@
 //!
 //! **Its grants.** `app_read`: `SELECT` on every table, view and materialized view of `public`,
 //! `USAGE, SELECT` on its sequences. `app_write`: also `INSERT, UPDATE, DELETE`, and `UPDATE` on
-//! sequences. Never `TRUNCATE`, `REFERENCES`, `TRIGGER`, ownership or DDL. Tables of a later
+//! sequences. Never `TRUNCATE`, `REFERENCES`, `TRIGGER`, ownership or DDL. This is the minimum
+//! the engine grants: the tenant's own `owner` may give its app roles more in its own database
+//! (backlog D5-11). Large objects: plain Postgres lets any role make them, but the cluster
+//! set-up revokes the volatile `lo_*` functions from `PUBLIC` (backlog D5-12); should an app
+//! role own one anyway, it goes to the owner when the role leaves a database. Tables of a later
 //! migration get the same rights through `ALTER DEFAULT PRIVILEGES` of the `owner` kind, and the
 //! engine grants again after every `apply_migration` and `sync_lens` ([`regrant_all`]). The
 //! grants on tables run in an `owner` session (the owner owns the tables); the schema grants run
@@ -21,7 +25,9 @@
 //! **Limits.** Role settings `statement_timeout` and `idle_in_transaction_session_timeout` (the
 //! app may lower or raise them in its own session; they are defaults), `temp_file_limit` (a
 //! superuser setting: the app cannot raise it; set when `ruum_dbhost` holds `SET` on it, else a
-//! warning, backlog D5-3), and a connection limit per role. The sum of the connection limits
+//! warning, backlog D5-3, and [`credentials`] refuses unless
+//! [`super::PostgresConfig::app_require_temp_file_limit`] is off), and a connection limit per
+//! role. The sum of the connection limits
 //! of every app role of the cluster stays under a budget (half of `max_connections` by default,
 //! [`super::PostgresConfig::app_connection_budget`]), checked under an advisory lock when a role
 //! is made: app roles are refused first, the platform's roles keep the rest.
@@ -36,11 +42,16 @@
 //! read fresh for each use. A role is recorded before it is made, so a crash leaves a row
 //! without a role (made on the next `create_app_role`) and never a role that no list names.
 //!
-//! **Ending a role.** Suspend: `NOLOGIN` and its sessions end. Drop: `NOLOGIN`, sessions end,
+//! **Ending a role.** Suspend: `NOLOGIN` and its sessions end; the call fails while one still
+//! runs ([`end_sessions`]). A database in the trash suspends all its app roles and keeps a flag
+//! (`ruum_meta.app_access`, [`set_access`]): a role made while it is set is made `NOLOGIN`, and
+//! no password is issued. Drop: `NOLOGIN`, sessions end, what it owns goes to the owner and
 //! every right and default privilege it holds or owns in the database goes ([`strip_in_tx`]),
-//! `DROP ROLE`, then the row. `ruum_dbhost` may only signal or revoke with the privileges of the
-//! role or the owner, so it takes `INHERIT` membership in them inside the one transaction of the
-//! step and gives it back before the commit (a failure rolls the grant back too).
+//! then in the database's restore points, then in any other database of the engine whose owner
+//! named it in a grant or a policy ([`strip_elsewhere`]), `DROP ROLE`, then the row.
+//! `ruum_dbhost` may only signal or revoke with the privileges of the role or the owner, so it
+//! takes membership in them inside the one transaction of the step and gives it back before
+//! the commit (a failure rolls the grant back too).
 //!
 //! **Copies never carry app grants.** A `TEMPLATE` copy holds the source's ACLs. The hand-over
 //! of a copy (a branch, `copyNode`, a template) and of a restore into a new node strips every
@@ -135,12 +146,12 @@ async fn can_login(engine: &PostgresEngine, name: &str) -> Result<Option<bool>, 
 }
 
 /// The role settings of an app role (after `RESET ALL`), with `temp_file_limit` when
-/// `ruum_dbhost` may set it.
+/// `ruum_dbhost` may set it; and whether it may.
 async fn settings_sql(
     engine: &PostgresEngine,
     conn: &mut PgConnection,
     name: &str,
-) -> Result<String, EngineError> {
+) -> Result<(String, bool), EngineError> {
     let c = &engine.config;
     let role = ident(name);
     let mut sql = format!(
@@ -172,7 +183,7 @@ async fn settings_sql(
              data cluster set-up grants SET on it (backlog D5-3)"
         );
     }
-    Ok(sql)
+    Ok((sql, may))
 }
 
 /// The sum of the connection limits of every app role of the cluster, and the budget.
@@ -200,11 +211,14 @@ async fn budget(
 }
 
 /// Makes the cluster role of an app (or nothing when it exists), with its settings and
-/// `CONNECT` on its own database, in one transaction under the budget lock.
+/// `CONNECT` on its own database, in one transaction under the budget lock. While the apps of
+/// its database are suspended (`login` false: the database is in the trash), the role is made,
+/// or made again, `NOLOGIN`.
 async fn make_cluster_role(
     engine: &PostgresEngine,
     database: &str,
     name: &str,
+    login: bool,
 ) -> Result<(), EngineError> {
     let mut admin = engine.admin().await?;
     let result = async {
@@ -236,8 +250,18 @@ async fn make_cluster_role(
                 "create role {role} login noinherit nosuperuser nocreatedb nocreaterole \
                    noreplication nobypassrls connection limit {limit} password null;\n"
             );
-            sql.push_str(&settings_sql(engine, &mut admin, name).await?);
+            if !login {
+                sql.push_str(&format!("alter role {role} nologin;\n"));
+            }
+            sql.push_str(&settings_sql(engine, &mut admin, name).await?.0);
             run(&mut admin, "create the app role", sql).await?;
+        } else if !login {
+            run(
+                &mut admin,
+                "suspend the app role",
+                format!("alter role {} nologin", ident(name)),
+            )
+            .await?;
         }
         run(
             &mut admin,
@@ -317,10 +341,17 @@ async fn grant(
     }
 }
 
-/// Grants again to every app role of the database (after a migration, a lens sync and a
-/// restore in place), so a table that a migration made in another way, or revoked, follows
-/// the kinds table. Logs a failure and goes on: the change it follows is committed.
+/// Grants again to every app role of the database (after a migration and a lens sync), so a
+/// table that a migration made in another way, or revoked, follows the kinds table. Logs a
+/// failure and goes on: the change it follows is committed. Takes `state.ops`, so a grant never
+/// lands between the strip and the `DROP ROLE` of [`drop_role`].
 pub(crate) async fn regrant_all(engine: &PostgresEngine, state: &DbState) {
+    let _ops = state.ops.lock().await;
+    regrant_all_held(engine, state).await
+}
+
+/// [`regrant_all`] for a caller that holds `state.ops` (a restore in place).
+pub(crate) async fn regrant_all_held(engine: &PostgresEngine, state: &DbState) {
     let result = async {
         let mut conn = engine.dbhost(&state.name).await?;
         let r = async {
@@ -335,6 +366,110 @@ pub(crate) async fn regrant_all(engine: &PostgresEngine, state: &DbState) {
     if let Err(e) = result {
         tracing::warn!(database = %state.name, error = %e, "app role grants not renewed");
     }
+}
+
+// ------------------------------------------------------------- the apps of a database in the trash
+
+/// The table of the flag "the apps of this database are suspended" (its database is in the
+/// trash). Made when it is first needed: a database made before it has none (not suspended).
+const ACCESS_TABLE_SQL: &str = "create table if not exists ruum_meta.app_access \
+     (id int primary key check (id = 1), suspended boolean not null)";
+
+/// Whether the apps of the database of `conn` (a `ruum_dbhost` connection) are suspended.
+pub(crate) async fn access_suspended(conn: &mut PgConnection) -> Result<bool, EngineError> {
+    let exists: bool =
+        sqlx::query("select pg_catalog.to_regclass('ruum_meta.app_access') is not null")
+            .persistent(false)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| internal("look for the app access flag", e))?
+            .get(0);
+    if !exists {
+        return Ok(false);
+    }
+    let row = sqlx::query("select suspended from ruum_meta.app_access where id = 1")
+        .persistent(false)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| internal("read the app access flag", e))?;
+    Ok(row.map(|r| r.get::<bool, _>(0)).unwrap_or(false))
+}
+
+/// Sets the flag (in the caller's transaction, or as one statement each).
+pub(crate) async fn write_access(
+    conn: &mut PgConnection,
+    suspended: bool,
+) -> Result<(), EngineError> {
+    run(
+        conn,
+        "make the app access flag",
+        ACCESS_TABLE_SQL.to_string(),
+    )
+    .await?;
+    sqlx::query(
+        "insert into ruum_meta.app_access (id, suspended) values (1, $1)
+         on conflict (id) do update set suspended = excluded.suspended",
+    )
+    .persistent(false)
+    .bind(suspended)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| internal("write the app access flag", e))?;
+    Ok(())
+}
+
+/// A copy starts with its apps not suspended (it has no app role; its source may be in the
+/// trash).
+pub(crate) async fn forget_access(conn: &mut PgConnection) -> Result<(), EngineError> {
+    if access_suspended(conn).await? {
+        write_access(conn, false).await?;
+    }
+    Ok(())
+}
+
+/// `suspend_app_access` and `resume_app_access`: the flag first (so a role made later is made
+/// `NOLOGIN`, and no password is issued), then every app role of the list; on suspend their
+/// sessions end, and the call fails while one is still running.
+pub(crate) async fn set_access(
+    engine: &PostgresEngine,
+    db: &DatabaseRef,
+    login: bool,
+) -> Result<(), EngineError> {
+    let state = engine.resolve(db).await?;
+    let _ops = state.ops.lock().await;
+    let mut conn = engine.dbhost(&state.name).await?;
+    let rows = async {
+        write_access(&mut conn, !login).await?;
+        read_rows(&mut conn).await
+    }
+    .await;
+    let _ = conn.close().await;
+    let mut names = Vec::new();
+    for row in rows? {
+        if can_login(engine, &row.role_name).await?.is_some() {
+            names.push(row.role_name);
+        }
+    }
+    if names.is_empty() {
+        return Ok(());
+    }
+    let list: Vec<String> = names.iter().map(|n| ident(n)).collect();
+    let mut admin = engine.admin().await?;
+    let sql: String = list
+        .iter()
+        .map(|r| {
+            format!(
+                "alter role {r} {};\n",
+                if login { "login" } else { "nologin" }
+            )
+        })
+        .collect();
+    run(&mut admin, "suspend or resume the app roles", sql).await?;
+    drop(admin);
+    if !login {
+        end_sessions(engine, &names, None).await?;
+    }
+    Ok(())
 }
 
 /// `create_app_role`.
@@ -381,7 +516,8 @@ pub(crate) async fn create(
                 row
             }
         };
-        if let Err(e) = make_cluster_role(engine, &state.name, &row.role_name).await {
+        let login = !access_suspended(&mut conn).await?;
+        if let Err(e) = make_cluster_role(engine, &state.name, &row.role_name, login).await {
             // Over the budget: no role and no row.
             if matches!(&e, EngineError::PermissionDenied(_)) {
                 let _ = sqlx::query("delete from ruum_meta.roles where role_name = $1")
@@ -527,6 +663,18 @@ pub(crate) async fn credentials(
     let row = find(engine, &state, role)
         .await?
         .ok_or_else(|| EngineError::InvalidRole("no such app role".to_string()))?;
+    // The database is in the trash: no password, whatever the role's own state.
+    let suspended = {
+        let mut conn = engine.dbhost(&state.name).await?;
+        let r = access_suspended(&mut conn).await;
+        let _ = conn.close().await;
+        r?
+    };
+    if suspended {
+        return Err(EngineError::PermissionDenied(
+            "app_role_suspended".to_string(),
+        ));
+    }
     match can_login(engine, &row.role_name).await? {
         None => return Err(EngineError::InvalidRole("no such app role".to_string())),
         Some(false) => {
@@ -538,7 +686,10 @@ pub(crate) async fn credentials(
     }
     let password = new_password()?;
     let verifier = scram_verifier(&password)?;
-    let valid_until = OffsetDateTime::now_utc() + valid_for.max(Duration::from_secs(1));
+    let valid_until = time::Duration::try_from(valid_for.max(Duration::from_secs(1)))
+        .ok()
+        .and_then(|d| OffsetDateTime::now_utc().checked_add(d))
+        .ok_or_else(|| EngineError::InvalidRole("the password lifetime is too long".to_string()))?;
     let until = valid_until
         .format(&time::macros::format_description!(
             "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:6]+00"
@@ -552,7 +703,15 @@ pub(crate) async fn credentials(
          alter role {name} in database {db} reset all;\n",
         db = ident(&state.name),
     );
-    sql.push_str(&settings_sql(engine, &mut admin, &row.role_name).await?);
+    let (settings, limited) = settings_sql(engine, &mut admin, &row.role_name).await?;
+    // Without a temp file limit one app could fill the cluster's disk (backlog D5-3): no
+    // password unless the configuration says that is accepted (tests, the laptop).
+    if !limited && engine.config.app_require_temp_file_limit {
+        return Err(EngineError::PermissionDenied(
+            "temp_file_limit_not_enforced".to_string(),
+        ));
+    }
+    sql.push_str(&settings);
     sql.push_str(&format!(
         "alter role {name} password {pw} valid until {until};\ncommit;",
         pw = literal(&verifier),
@@ -637,7 +796,54 @@ pub(crate) async fn signal(
     result
 }
 
-/// `suspend_app_role` and `resume_app_role`.
+/// How many sessions of `names` (in `database`, or anywhere) are running.
+async fn live_sessions(
+    engine: &PostgresEngine,
+    names: &[String],
+    database: Option<&str>,
+) -> Result<i64, EngineError> {
+    let mut admin = engine.admin().await?;
+    let row = sqlx::query(
+        "select count(*) from pg_catalog.pg_stat_activity
+          where usename = any($1::text[]) and ($2::text is null or datname = $2)
+            and pid <> pg_catalog.pg_backend_pid()",
+    )
+    .persistent(false)
+    .bind(names)
+    .bind(database)
+    .fetch_one(&mut *admin)
+    .await
+    .map_err(|e| internal("count the app role's sessions", e))?;
+    Ok(row.get(0))
+}
+
+/// Ends the sessions of `names` and checks that none is left (a new transaction each time:
+/// `pg_stat_activity` is a snapshot per transaction). Tries twice, then fails, so a caller never
+/// reports an app role suspended or dropped while one of its sessions still runs.
+pub(crate) async fn end_sessions(
+    engine: &PostgresEngine,
+    names: &[String],
+    database: Option<&str>,
+) -> Result<(), EngineError> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    for _ in 0..2 {
+        signal(engine, names, database, true).await?;
+        for _ in 0..10 {
+            if live_sessions(engine, names, database).await? == 0 {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    Err(EngineError::Internal(
+        "a session of an app role did not end".to_string(),
+    ))
+}
+
+/// `suspend_app_role` and `resume_app_role`. A role of a database whose apps are suspended
+/// (in the trash) is not resumed alone: [`set_access`] resumes them all.
 pub(crate) async fn set_login(
     engine: &PostgresEngine,
     role: &RoleRef,
@@ -652,6 +858,16 @@ pub(crate) async fn set_login(
     if can_login(engine, &row.role_name).await?.is_none() {
         return Ok(());
     }
+    if login {
+        let mut conn = engine.dbhost(&state.name).await?;
+        let suspended = access_suspended(&mut conn).await;
+        let _ = conn.close().await;
+        if suspended? {
+            return Err(EngineError::PermissionDenied(
+                "app_role_suspended".to_string(),
+            ));
+        }
+    }
     let mut admin = engine.admin().await?;
     run(
         &mut admin,
@@ -665,7 +881,7 @@ pub(crate) async fn set_login(
     .await?;
     drop(admin);
     if !login {
-        signal(engine, std::slice::from_ref(&row.role_name), None, true).await?;
+        end_sessions(engine, std::slice::from_ref(&row.role_name), None).await?;
     }
     Ok(())
 }
@@ -776,30 +992,46 @@ async fn clear_default_acl(conn: &mut PgConnection, names: &[String]) -> Result<
     Ok(())
 }
 
-/// Takes every right, default privilege and policy of `names` out of the database of `conn`
-/// (a `ruum_dbhost` connection inside a transaction). `owner` is the role that owns the
-/// database's objects now: `ruum_dbhost` takes `INHERIT` membership in it and in `names` for this
-/// transaction only (granted and revoked here, so a rollback takes the grant back too). `None`:
-/// the caller holds the owner's privileges already (the hand-over of a copy). Fails
-/// when anything of the database still depends on one of `names`. The caller holds
-/// `engine.membership`.
+/// Takes every object, right, default privilege and policy of `names` out of the database of
+/// `conn` (a `ruum_dbhost` connection inside a transaction). What they own (a large object a
+/// superuser gave them: the cluster set-up keeps `lo_create` from them) goes to `owner`, the role that owns the
+/// database's objects now, with `REASSIGN OWNED`. `ruum_dbhost` takes `INHERIT` membership in
+/// `names` and, unless `owner_held` (the hand-over of a copy holds it already), `INHERIT` and
+/// `SET` in `owner` for this transaction only (granted and revoked here, so a rollback takes
+/// the grant back too). Fails when anything of the database still depends on one of `names`.
+/// The caller holds `engine.membership`.
 pub(crate) async fn strip_in_tx(
     conn: &mut PgConnection,
-    owner: Option<&str>,
+    owner: &str,
+    owner_held: bool,
     names: &[String],
 ) -> Result<(), EngineError> {
     if names.is_empty() {
         return Ok(());
     }
-    let mut members: Vec<String> = names.iter().map(|n| ident(n)).collect();
-    members.extend(owner.map(ident));
+    let list: Vec<String> = names.iter().map(|n| ident(n)).collect();
+    let mut grant = format!(
+        "grant {} to ruum_dbhost with inherit true, set false",
+        list.join(", ")
+    );
+    let mut members = list.clone();
+    if !owner_held {
+        grant.push_str(&format!(
+            ";\ngrant {} to ruum_dbhost with inherit true, set true",
+            ident(owner)
+        ));
+        members.push(ident(owner));
+    }
     run(
         conn,
         "take the privileges of the owner and the roles",
-        format!(
-            "grant {} to ruum_dbhost with inherit true, set false",
-            members.join(", ")
-        ),
+        grant,
+    )
+    .await?;
+    run(
+        conn,
+        "give what the roles own to the owner",
+        format!("reassign owned by {} to {}", list.join(", "), ident(owner)),
     )
     .await?;
     let roles: Vec<EngineRole> = names
@@ -847,7 +1079,7 @@ pub(crate) async fn drop_role(engine: &PostgresEngine, role: &RoleRef) -> Result
         )
         .await?;
         drop(admin);
-        signal(engine, std::slice::from_ref(&name), None, true).await?;
+        end_sessions(engine, std::slice::from_ref(&name), None).await?;
         // Its rights in the database (as the owner and as the role itself).
         {
             let _membership = engine.membership.lock().await;
@@ -856,7 +1088,8 @@ pub(crate) async fn drop_role(engine: &PostgresEngine, role: &RoleRef) -> Result
                 run(&mut conn, "begin", "begin".to_string()).await?;
                 strip_in_tx(
                     &mut conn,
-                    Some(state.meta.role(RoleKind::Owner)),
+                    state.meta.role(RoleKind::Owner),
+                    false,
                     std::slice::from_ref(&name),
                 )
                 .await?;
@@ -866,15 +1099,15 @@ pub(crate) async fn drop_role(engine: &PostgresEngine, role: &RoleRef) -> Result
             let _ = conn.close().await;
             r?;
         }
-        // Its rights in the restore points of the database (snapshot databases).
-        for snapshot in dependent_databases(engine, &name, &state.name).await? {
-            let points = restore_points(engine, &state.name).await?;
-            if !points.iter().any(|(_, _, s)| *s == snapshot) {
-                return Err(EngineError::Internal(
-                    "an app role has rights in a database that is not its own".to_string(),
-                ));
+        // Its rights in the restore points of the database (snapshot databases), and any right
+        // that another database's owner gave it (a grant or a policy may name any role).
+        let points = restore_points(engine, &state.name).await?;
+        for other in dependent_databases(engine, &name, &state.name).await? {
+            if points.iter().any(|(_, _, s)| *s == other) {
+                strip_snapshot(engine, &state, &other, &name).await?;
+            } else {
+                strip_elsewhere(engine, &other, &name).await?;
             }
-            strip_snapshot(engine, &state, &snapshot, &name).await?;
         }
         let mut admin = engine.admin().await?;
         run(
@@ -899,6 +1132,180 @@ pub(crate) async fn drop_role(engine: &PostgresEngine, role: &RoleRef) -> Result
         .map_err(|e| internal("delete the app role's row", e));
     let _ = conn.close().await;
     r.map(|_| ())
+}
+
+/// Drops the app roles `names` of a database that `drop_database` has dropped (with its
+/// restore points): each leaves every other database that names it ([`strip_elsewhere`]), then
+/// `DROP ROLE`. Goes on after a failure and returns the first one.
+pub(crate) async fn drop_orphans(
+    engine: &PostgresEngine,
+    names: &[String],
+) -> Result<(), EngineError> {
+    let mut first = None;
+    for name in names {
+        let r = async {
+            for other in dependent_databases(engine, name, "").await? {
+                strip_elsewhere(engine, &other, name).await?;
+            }
+            let mut admin = engine.admin().await?;
+            run(
+                &mut admin,
+                "drop the app role",
+                format!("drop role if exists {}", ident(name)),
+            )
+            .await
+        }
+        .await;
+        if let Err(e) = r
+            && first.is_none()
+        {
+            first = Some(e);
+        }
+    }
+    first.map_or(Ok(()), Err)
+}
+
+/// Refuses logins of the app roles `names` and ends their sessions (`drop_database`, before its
+/// drain). A role that is gone is no error.
+pub(crate) async fn refuse_logins(
+    engine: &PostgresEngine,
+    names: &[String],
+) -> Result<(), EngineError> {
+    let mut live = Vec::new();
+    for name in names {
+        if can_login(engine, name).await?.is_some() {
+            live.push(name.clone());
+        }
+    }
+    if live.is_empty() {
+        return Ok(());
+    }
+    let sql: String = live
+        .iter()
+        .map(|n| format!("alter role {} nologin;\n", ident(n)))
+        .collect();
+    let mut admin = engine.admin().await?;
+    run(&mut admin, "refuse logins of the app roles", sql).await?;
+    drop(admin);
+    end_sessions(engine, &live, None).await
+}
+
+/// Takes the app role `name` out of `database`, a database of the engine that is not the
+/// role's own and not one of its restore points: another database's owner granted it a right
+/// or named it in a policy (a role name is readable in `pg_roles`). [`strip_in_tx`] with that
+/// database's owner (from its `ruum_meta.roles`) removes such grants, policy entries and
+/// default privileges; the role owns nothing there (it cannot connect), and the call fails
+/// closed if it does. A database the engine does not manage (not a neutral name or
+/// not owned by `ruum_dbhost`) is an error. A closed database is waited for 2 seconds (a
+/// drain is short); one that stays closed is opened for the strip and closed again if it is a
+/// restore point of another database (`ruum_meta.ident` says `snapshot`), else the call fails
+/// with `NotReady` (try again).
+async fn strip_elsewhere(
+    engine: &PostgresEngine,
+    database: &str,
+    name: &str,
+) -> Result<(), EngineError> {
+    let read = || async {
+        let mut admin = engine.admin().await?;
+        let row = sqlx::query(
+            "select d.datallowconn, d.datdba = (select oid from pg_catalog.pg_roles
+                                                  where rolname = current_user)
+               from pg_catalog.pg_database d where d.datname = $1",
+        )
+        .persistent(false)
+        .bind(database)
+        .fetch_optional(&mut *admin)
+        .await
+        .map_err(|e| internal("read a database that names the app role", e))?;
+        Ok::<_, EngineError>(row.map(|r| (r.get::<bool, _>(0), r.get::<bool, _>(1))))
+    };
+    let Some((mut open, ours)) = read().await? else {
+        return Ok(());
+    };
+    if !ours || !super::is_db_name(database) {
+        return Err(EngineError::Internal(
+            "an app role has rights in a database the engine does not manage".to_string(),
+        ));
+    }
+    for _ in 0..10 {
+        if open {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        match read().await? {
+            Some((o, _)) => open = o,
+            None => return Ok(()),
+        }
+    }
+    let opened = !open;
+    if opened {
+        set_allow_connections(engine, database, true).await?;
+    }
+    let result = async {
+        let _membership = engine.membership.lock().await;
+        let mut conn = engine.dbhost(database).await?;
+        let r = async {
+            run(&mut conn, "begin", "begin".to_string()).await?;
+            if opened {
+                let state: Option<String> =
+                    sqlx::query("select state from ruum_meta.ident where id = 1")
+                        .persistent(false)
+                        .fetch_optional(&mut conn)
+                        .await
+                        .map_err(|e| internal("read a closed database", e))?
+                        .map(|r| r.get(0));
+                if state.as_deref() != Some("snapshot") {
+                    return Err(EngineError::NotReady);
+                }
+            }
+            let owned: i64 = sqlx::query(
+                "select count(*) from pg_catalog.pg_shdepend
+                  where dbid = (select oid from pg_catalog.pg_database
+                                 where datname = pg_catalog.current_database())
+                    and refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass
+                    and refobjid = (select oid from pg_catalog.pg_roles where rolname = $1)
+                    and deptype = 'o'",
+            )
+            .persistent(false)
+            .bind(name)
+            .fetch_one(&mut conn)
+            .await
+            .map_err(|e| internal("look for objects of the app role", e))?
+            .get(0);
+            if owned > 0 {
+                return Err(EngineError::Internal(
+                    "an app role owns objects in a database that is not its own".to_string(),
+                ));
+            }
+            // The other database's owner (its grants and policies are revoked with its
+            // rights; `ruum_dbhost` holds them for this transaction only).
+            let owner: Option<String> = sqlx::query(
+                "select role_name from ruum_meta.roles where kind = 'owner' and binding is null",
+            )
+            .persistent(false)
+            .fetch_optional(&mut conn)
+            .await
+            .map_err(|e| internal("read the owner of another database", e))?
+            .map(|r| r.get(0));
+            let Some(owner) = owner else {
+                return Err(EngineError::Internal(
+                    "an app role has rights in a database without an owner role".to_string(),
+                ));
+            };
+            strip_in_tx(&mut conn, &owner, false, &[name.to_string()]).await?;
+            run(&mut conn, "commit", "commit".to_string()).await
+        }
+        .await;
+        let _ = conn.close().await;
+        r
+    }
+    .await;
+    if opened {
+        let closed = set_allow_connections(engine, database, false).await;
+        result?;
+        return closed;
+    }
+    result
 }
 
 /// The databases other than `own` in which something depends on the role `name`
@@ -943,7 +1350,8 @@ async fn strip_snapshot(
             run(&mut conn, "begin", "begin".to_string()).await?;
             strip_in_tx(
                 &mut conn,
-                Some(state.meta.role(RoleKind::Owner)),
+                state.meta.role(RoleKind::Owner),
+                false,
                 &[name.to_string()],
             )
             .await?;

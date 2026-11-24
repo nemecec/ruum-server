@@ -894,3 +894,279 @@ async fn passwords_are_never_logged() {
         assert!(!out.contains(pw.as_str()), "a password is in the log");
     }
 }
+
+/// How many roles named `name` the cluster has.
+async fn role_count(engine: &PostgresEngine, name: &str) -> String {
+    let mut admin = engine.admin().await.unwrap();
+    psql(
+        &mut admin,
+        &format!("SELECT count(*) FROM pg_roles WHERE rolname = '{name}'"),
+    )
+    .await
+    .unwrap()
+}
+
+/// The owner kind's role of a fixture.
+fn owner_of<'a>(f: &'a Fixture<'_>) -> &'a str {
+    &f.created
+        .roles
+        .iter()
+        .find(|r| r.kind == RoleKind::Owner)
+        .unwrap()
+        .role_name
+}
+
+/// Large objects (review D-5, 1): an app role cannot make one (the cluster set-up revokes the
+/// volatile `lo_*` functions from `PUBLIC`). One that the superuser gives it blocks neither a
+/// copy nor the drop of the role: a copy gives it to its owner, a drop to the database's
+/// owner, also in the restore point; a large-object grant to another app role leaves with that
+/// role.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_objects_of_an_app_role_block_neither_copies_nor_the_drop() {
+    let Some(engine) = engine().await else { return };
+    let f = seeded(&engine).await;
+    let read = app_role(&f, RoleKind::AppRead, Uuid::now_v7()).await;
+    let other = app_role(&f, RoleKind::AppRead, Uuid::now_v7()).await;
+    let mut s = login(
+        &engine,
+        &creds(&engine, &read, Duration::from_secs(300)).await,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ok(&mut s, "SELECT count(*) FROM notes").await, "2");
+    assert_eq!(refused(&mut s, "SELECT lo_create(0)").await, "42501");
+    assert_eq!(
+        refused(&mut s, "SELECT lo_from_bytea(0, decode('6869', 'hex'))").await,
+        "42501"
+    );
+    close(s).await;
+    let Some(made) = superuser(
+        &f.db().engine_name,
+        &format!(
+            "SELECT lo_create(0) \\gset\n\
+             SELECT lo_from_bytea(0, decode('6869', 'hex')) AS second \\gset\n\
+             ALTER LARGE OBJECT :lo_create OWNER TO {r};\n\
+             ALTER LARGE OBJECT :second OWNER TO {r};\n\
+             GRANT SELECT ON LARGE OBJECT :lo_create TO {o};\n\
+             SELECT count(*) FROM pg_largeobject_metadata;",
+            r = lens::ident(&read.role_name),
+            o = lens::ident(&other.role_name),
+        ),
+    ) else {
+        return;
+    };
+    assert_eq!(made.trim(), "2", "{made}");
+    assert_ne!(mentions(&engine, f.db(), &read.role_name).await, "0");
+    assert_ne!(mentions(&engine, f.db(), &other.role_name).await, "0");
+    let point = engine.create_restore_point(f.db()).await.unwrap();
+    let new = || conformance::new_database(f.db().tenant_id);
+    let full = engine
+        .copy_database(f.db(), &f.key, &new(), &CopyData::Full, &f.key)
+        .await
+        .expect("a full copy");
+    let schema_only = engine
+        .copy_database(f.db(), &f.key, &new(), &CopyData::SchemaOnly, &f.key)
+        .await
+        .expect("a schema-only copy");
+    let restored = engine
+        .restore_into_new(f.db(), &point, &new(), &f.key)
+        .await
+        .expect("a restore into a new database");
+    for copy in [&full, &schema_only, &restored] {
+        for role in [&read, &other] {
+            assert_eq!(
+                mentions(&engine, &copy.database, &role.role_name).await,
+                "0"
+            );
+        }
+    }
+    for copy in [full, schema_only, restored] {
+        engine.drop_database(&copy.database).await.unwrap();
+    }
+    engine
+        .drop_app_role(&read.role_ref().unwrap())
+        .await
+        .expect("drop with large objects");
+    assert_eq!(role_count(&engine, &read.role_name).await, "0");
+    // The large objects stay, with the owner; the grant to the other role stays until it goes.
+    let mut conn = dbhost(&engine, f.db()).await;
+    assert_eq!(
+        psql(
+            &mut conn,
+            &format!(
+                "SELECT count(*) FROM pg_largeobject_metadata \
+                 WHERE lomowner = (SELECT oid FROM pg_roles WHERE rolname = '{}')",
+                owner_of(&f)
+            )
+        )
+        .await
+        .unwrap(),
+        "2"
+    );
+    close(conn).await;
+    assert_ne!(mentions(&engine, f.db(), &other.role_name).await, "0");
+    engine
+        .drop_app_role(&other.role_ref().unwrap())
+        .await
+        .expect("drop with a large-object grant");
+    assert_eq!(role_count(&engine, &other.role_name).await, "0");
+}
+
+/// Another database's owner cannot block the drop of an app role (review D-5, 2): a grant and
+/// policies of database B that name the role, also in a restore point of B, leave with it; B
+/// keeps working and its restore point too. `drop_database` does the same for its app roles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn another_database_cannot_block_the_drop() {
+    let Some(engine) = engine().await else { return };
+    let f = seeded(&engine).await;
+    let b = seeded(&engine).await;
+    let doomed_db = seeded(&engine).await;
+    let a = app_role(&f, RoleKind::AppRead, Uuid::now_v7()).await;
+    let doomed = app_role(&doomed_db, RoleKind::AppWrite, Uuid::now_v7()).await;
+    b.migrate(&format!(
+        "GRANT SELECT ON notes TO {a}, {d}; \
+         ALTER TABLE notes ENABLE ROW LEVEL SECURITY; \
+         CREATE POLICY only_a ON notes FOR SELECT TO {a} USING (true); \
+         CREATE POLICY a_and_public ON notes FOR SELECT TO {a}, {d}, public USING (true);",
+        a = lens::ident(&a.role_name),
+        d = lens::ident(&doomed.role_name),
+    ))
+    .await
+    .expect("B names other databases' app roles");
+    let point = engine.create_restore_point(b.db()).await.unwrap();
+    assert_ne!(mentions(&engine, b.db(), &a.role_name).await, "0");
+    engine
+        .drop_app_role(&a.role_ref().unwrap())
+        .await
+        .expect("drop although B names the role");
+    assert_eq!(role_count(&engine, &a.role_name).await, "0");
+    let mut conn = dbhost(&engine, b.db()).await;
+    assert_eq!(
+        psql(
+            &mut conn,
+            "SELECT string_agg(polname, ',' ORDER BY polname) FROM pg_policy"
+        )
+        .await
+        .unwrap(),
+        "a_and_public"
+    );
+    close(conn).await;
+    assert_eq!(
+        b.run(
+            RoleKind::Owner,
+            StatementMode::Read,
+            "SELECT count(*) FROM notes",
+            vec![]
+        )
+        .await
+        .expect("B works")
+        .rows
+        .len(),
+        1
+    );
+    // The database goes with its app role, although B (and B's restore point) name it.
+    engine.drop_database(doomed_db.db()).await.unwrap();
+    assert_eq!(role_count(&engine, &doomed.role_name).await, "0");
+    // B's restore point still restores.
+    engine
+        .restore_in_place(b.db(), &point, &b.key)
+        .await
+        .expect("restore B");
+}
+
+/// A database in the trash (review D-5, 3 and 4): every app role is suspended and its
+/// sessions end; a role made afterwards is made `NOLOGIN` and gets no password; the restore
+/// lets them all in again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_database_in_the_trash_suspends_its_apps() {
+    let Some(engine) = engine().await else { return };
+    let f = seeded(&engine).await;
+    let early = app_role(&f, RoleKind::AppWrite, Uuid::now_v7()).await;
+    let c = creds(&engine, &early, Duration::from_secs(300)).await;
+    let mut s = login(&engine, &c, None).await.unwrap();
+    assert_eq!(ok(&mut s, "SELECT count(*) FROM notes").await, "2");
+    engine.suspend_app_access(f.db()).await.unwrap();
+    assert!(ended_within(&mut s, Duration::from_secs(1)).await);
+    match login(&engine, &c, None).await {
+        Ok(_) => panic!("an app of a database in the trash logged in"),
+        Err(e) => assert_eq!(code(&e), "28000", "{e}"),
+    }
+    let late = app_role(&f, RoleKind::AppRead, Uuid::now_v7()).await;
+    assert!(late.suspended);
+    let mut admin = engine.admin().await.unwrap();
+    assert_eq!(
+        psql(
+            &mut admin,
+            &format!(
+                "SELECT rolcanlogin::text FROM pg_roles WHERE rolname = '{}'",
+                late.role_name
+            )
+        )
+        .await
+        .unwrap(),
+        "false"
+    );
+    drop(admin);
+    for role in [&early, &late] {
+        assert!(matches!(
+            engine
+                .app_credentials(&role.role_ref().unwrap(), Duration::from_secs(60))
+                .await,
+            Err(EngineError::PermissionDenied(m)) if m == "app_role_suspended"
+        ));
+    }
+    engine.resume_app_access(f.db()).await.unwrap();
+    for role in [&early, &late] {
+        let mut s = login(
+            &engine,
+            &creds(&engine, role, Duration::from_secs(300)).await,
+            None,
+        )
+        .await
+        .expect("restored");
+        assert_eq!(ok(&mut s, "SELECT count(*) FROM notes").await, "2");
+        close(s).await;
+    }
+}
+
+/// While `ruum_dbhost` may not set `temp_file_limit`, no password is issued unless the
+/// configuration accepts it (review D-5, 6; backlog D5-3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn credentials_need_the_temp_file_limit() {
+    let Some(strict) = engine_with(|c| c.app_require_temp_file_limit = true).await else {
+        return;
+    };
+    let f = seeded(&strict).await;
+    let role = app_role(&f, RoleKind::AppRead, Uuid::now_v7()).await;
+    let may = || async {
+        let mut admin = strict.admin().await.unwrap();
+        let out = psql(
+            &mut admin,
+            "SELECT has_parameter_privilege('temp_file_limit', 'SET')::text",
+        )
+        .await
+        .unwrap();
+        drop(admin);
+        out
+    };
+    let before = may().await;
+    let got = strict
+        .app_credentials(&role.role_ref().unwrap(), Duration::from_secs(60))
+        .await;
+    if may().await != before {
+        // Another test granted the right meanwhile.
+        return;
+    }
+    match (before.as_str(), got) {
+        ("false", Err(EngineError::PermissionDenied(m))) => {
+            assert_eq!(m, "temp_file_limit_not_enforced")
+        }
+        ("true", Ok(c)) => {
+            let mut s = login(&strict, &c, None).await.unwrap();
+            assert_eq!(ok(&mut s, "SHOW temp_file_limit").await, "1GB");
+            close(s).await;
+        }
+        (may, other) => panic!("SET on temp_file_limit: {may}; {:?}", other.map(|_| ())),
+    }
+}

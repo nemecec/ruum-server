@@ -91,6 +91,10 @@ pub struct PostgresConfig {
     pub app_idle_in_transaction_timeout: Duration,
     /// The role setting `temp_file_limit` of an app role, in kB (a superuser setting).
     pub app_temp_file_limit_kb: u64,
+    /// `app_credentials` refuses (`permission denied: temp_file_limit_not_enforced`) while
+    /// `ruum_dbhost` may not set `temp_file_limit` (backlog D5-3): without it one app could
+    /// fill the cluster's disk. `false` only where that is accepted (tests, the laptop).
+    pub app_require_temp_file_limit: bool,
 }
 
 impl std::fmt::Debug for PostgresConfig {
@@ -119,6 +123,7 @@ impl PostgresConfig {
             app_statement_timeout: Duration::from_secs(30),
             app_idle_in_transaction_timeout: Duration::from_secs(60),
             app_temp_file_limit_kb: 1024 * 1024,
+            app_require_temp_file_limit: true,
         }
     }
 
@@ -586,5 +591,13 @@ impl DatabaseEngine for PostgresEngine {
 
     async fn drop_app_role(&self, role: &RoleRef) -> Result<(), EngineError> {
         app_roles::drop_role(self, role).await
+    }
+
+    async fn suspend_app_access(&self, db: &DatabaseRef) -> Result<(), EngineError> {
+        app_roles::set_access(self, db, false).await
+    }
+
+    async fn resume_app_access(&self, db: &DatabaseRef) -> Result<(), EngineError> {
+        app_roles::set_access(self, db, true).await
     }
 }
