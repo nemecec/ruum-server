@@ -823,8 +823,44 @@ if has helm; then
   want "$TMP/edge.yaml" "the certificate storage is the edge namespace" "namespace edge"
   want "$TMP/edge.yaml" "Caddy drains open connections for 30 s" "grace_period 30s"
   has_line "$TMP/edge.yaml" "file_system" && bad "the edge still keeps certificates in a file system" || ok "no file system storage for certificates"
+  # Backlog O-53: the edge is ready only with its certificates, and port 80 has its own Service.
+  [[ "$(grep -c 'path: /_edge/ready$' "$TMP/edge.yaml")" == 3 && "$(grep -c 'scheme: HTTPS$' "$TMP/edge.yaml")" == 3 ]] &&
+    ok "the edge's startup, readiness and liveness probes ask the ready path over HTTPS (backlog O-53)" || bad "the edge probes do not all ask /_edge/ready over HTTPS"
+  for p in startupProbe readinessProbe livenessProbe; do
+    awk -v p="          $p:" '$0 == p {on=1; next} on && /^          [a-zA-Z]/ {on=0} on' "$TMP/edge.yaml" | grep -qF '{ name: Host, value: staging.ruum.space }' ||
+      bad "the edge's $p does not ask for the public host"
+  done
+  has_line "$TMP/edge.yaml" "tcpSocket:" && bad "an edge probe is still a TCP check" || ok "no TCP probe on the edge"
+  want "$TMP/edge.yaml" "an edge without certificates restarts after its startup probe's 5 minutes" "failureThreshold: 60"
+  awk '/^      initContainers:/ {on=1} /^      containers:/ {on=0} on' "$TMP/edge.yaml" >"$TMP/edge-init.yaml"
+  grep -qF -- '- name: wait-api-server' "$TMP/edge-init.yaml" && grep -qF "image: $e" "$TMP/edge-init.yaml" && grep -qF 'readOnlyRootFilesystem: true' "$TMP/edge-init.yaml" &&
+    ok "the edge waits for the API server in a restricted init container of its own image" || bad "the edge's init container wait-api-server"
+  grep -qF '${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/readyz' "$TMP/edge-init.yaml" && ! grep -qiE 'authorization|serviceaccount/token' "$TMP/edge-init.yaml" &&
+    ok "the init container asks the API server's /readyz and sends no token" || bad "the init container does not ask /readyz, or sends the token"
+  doc_of_e() { awk -v name="  name: $1" 'function out() { if (index(doc, "\nkind: Service\n") && index(doc, "\n" name "\n")) printf "%s", doc; doc = "\n" }
+    BEGIN { doc = "\n" } /^---/ { out(); next } { doc = doc $0 "\n" } END { out() }' "$TMP/edge.yaml"; }
+  doc_of_e ruum-edge-http >"$TMP/edge-http.yaml"
+  grep -qF 'publishNotReadyAddresses: true' "$TMP/edge-http.yaml" && grep -qF 'nodePort: 30081 }' "$TMP/edge-http.yaml" && grep -qF 'externalTrafficPolicy: Local' "$TMP/edge-http.yaml" && ! grep -qF 'port: 443' "$TMP/edge-http.yaml" &&
+    ok "port 80 reaches edges that are not ready yet (ruum-edge-http, nodePort 30081), port 443 does not" || bad "the Service ruum-edge-http"
+  doc_of_e ruum-edge >"$TMP/edge-svc.yaml"
+  grep -qF 'nodePort: 30443 }' "$TMP/edge-svc.yaml" && ! grep -qF publishNotReadyAddresses "$TMP/edge-svc.yaml" &&
+    ok "port 443 reaches only ready edges (ruum-edge)" || bad "the Service ruum-edge sends 443 to edges that are not ready"
+  want "$TMP/edge.yaml" "a handshake without a server name gets the public host's certificate" "default_sni staging.ruum.space"
+  # site NAME: the lines of that Caddyfile site, without the indentation (awk reads to the end:
+  # no SIGPIPE under pipefail).
+  site() { sed 's/^    //' "$TMP/edge.yaml" | awk -v s="$1 {" '$0 == s {on=1} on {print} on && /^\}/ {on=0}' | tr -d '\t'; }
+  [[ "$(site staging.ruum.space)" == *$'\nhandle /_edge/ready {\nrespond "ready" 200\n}\n'* ]] &&
+    ok "the public site answers the ready path itself (no upstream)" || bad "the public site does not answer /_edge/ready itself"
+  [[ "$(site http://)" == *$'\nhandle /_edge/alive {\nrespond "alive" 200\n}\nhandle {\nredir https://{host}{uri} 308\n}\n'* ]] &&
+    ok "port 80 answers the alive path without a certificate, and redirects the rest" || bad "the port 80 site does not answer /_edge/alive"
   expect 0 "render the platform for the edge and deployer rights" helm template platform "$STG/charts/platform" --set generation=202611111200 --set "deployController.image=$PCI" --set-string "deployController.commit=$PCC"
   cp "$TMP/out" "$TMP/platform.yaml"
+  # Backlog O-55: finished blob-copy Jobs do not stay.
+  awk '/^# Source: [a-z-]*\/templates\/blob-copy.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/platform.yaml" >"$TMP/blob-copy.yaml"
+  grep -qxF '  failedJobsHistoryLimit: 1' "$TMP/blob-copy.yaml" && grep -qxF '      ttlSecondsAfterFinished: 172800' "$TMP/blob-copy.yaml" &&
+    ok "blob-copy keeps one failed Job and deletes finished Jobs after two days (backlog O-55)" || bad "blob-copy's Job history limit or ttlSecondsAfterFinished"
+  grep -qF "rclone copy hetzner:ruum-staging-blobs-768usm secure:" "$TMP/blob-copy.yaml" && grep -qF "value: \"https://$HCLOUD_LOCATION.your-objectstorage.com\"" "$TMP/blob-copy.yaml" &&
+    ok "blob-copy reads the blob bucket at the endpoint of its location ($HCLOUD_LOCATION)" || bad "blob-copy's source bucket or endpoint"
   awk '/^# Source: [a-z-]*\/templates\/edge-rbac.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/platform.yaml" >"$TMP/edge-rbac.yaml"
   want "$TMP/edge-rbac.yaml" "the platform makes the ServiceAccount ruum-edge" "name: ruum-edge"
   if grep -qE 'kind: Cluster(Role|RoleBinding)' "$TMP/edge-rbac.yaml"; then bad "the edge gets cluster-wide rights"; else ok "the edge's rights are namespaced"; fi
@@ -1118,6 +1154,8 @@ YAML
     jq -e '[.apps.http.servers[]] as $s | ($s | map(.listen[]) | index(":8080")) != null and ($s | all((.listener_wrappers // []) | map(.wrapper) | index("proxy_protocol") != null))' "$TMP/caddy.json" >/dev/null &&
       ok "port 80 is an explicit server, and every server has the proxy_protocol wrapper" ||
       bad "a Caddy server without the proxy_protocol wrapper, or no explicit port 80 server"
+    jq -e '[.apps.http.servers[] | (.tls_connection_policies // [])[] | .default_sni] | index("staging.ruum.space") != null' "$TMP/caddy.json" >/dev/null &&
+      ok "Caddy gives a handshake without a server name the public host's certificate (default_sni, backlog O-53)" || bad "no default_sni staging.ruum.space in the adapted Caddyfile"
   fi
 else
   echo "== charts: skipped (no helm; setup.sh installs it, or Docker for the tools image)"
@@ -1883,6 +1921,97 @@ grep -qF 'ignore_changes = [image, ssh_keys]' "$STG/tofu/cluster/main.tf" && ok 
 ut="$STG/ops/upgrade-talos.sh"
 grep -qF '"$schematic" == "$TALOS_SCHEMATIC"' "$ut" && grep -qF 'stopping before the next node' "$ut" &&
   ok "upgrade-talos.sh upgrades a node whose schematic differs, and checks it before the next node" || bad "upgrade-talos.sh compares the version only"
+# Backlog O-54: upgrade-talos.sh with a fake talosctl and kubectl (one node, stg-1). Its node wait
+# fails twice as through the tunnel after a reboot ("Unable to connect to the server: EOF"), then
+# answers; the edge pod of the node answers TLS through a fake port-forward to openssl s_server.
+if command -v openssl >/dev/null && command -v jq >/dev/null && openssl x509 -help 2>&1 | grep checkhost >/dev/null; then
+  FU="$TMP/upgrade" && mkdir -p "$FU/ops" "$FU/talos" "$FU/charts/ruum" "$FU/bin" "$FU/fake"
+  cp "$ut" "$FU/ops/upgrade-talos.sh" && cp "$STG/versions.env" "$FU/versions.env" && cp "$STG/talos/schematic.yaml" "$FU/talos/"
+  cp "$STG/charts/ruum/values.yaml" "$FU/charts/ruum/values.yaml"
+  printf '#!/bin/sh\nexit 0\n' >"$FU/ops/check-capacity.sh"
+  cat >"$FU/bin/talosctl" <<'FAKE'
+#!/usr/bin/env bash
+# talosctl -n IP <command>: the node is old until "upgrade" ran.
+. "$FAKE_DIR/../versions.env"
+shift 2
+up=0; [[ -f "$FAKE_DIR/upgraded" ]] && up=1
+case "$1" in
+  version) printf 'Client:\n\tTag: %s\nServer:\n\tTag: %s\n' "$TALOS_VERSION" "$([[ $up == 1 ]] && echo "$TALOS_VERSION" || echo v0.0.1)" ;;
+  get) s=old; [[ $up == 1 ]] && s="$TALOS_SCHEMATIC"
+       printf '{"spec":{"metadata":{"name":"schematic","version":"%s"}}}\n' "$s"
+       [[ $up == 1 ]] && for e in $FAKE_EXT; do printf '{"spec":{"metadata":{"name":"siderolabs/%s","version":"1"}}}\n' "$e"; done ;;
+  etcd) [[ "$2" == members ]] && printf 'NODE ID\na\nb\nc\n' ;;
+  upgrade) touch "$FAKE_DIR/upgraded" ;;
+esac
+exit 0
+FAKE
+  cat >"$FU/bin/kubectl" <<'FAKE'
+#!/usr/bin/env bash
+echo "$*" >>"$FAKE_DIR/calls"
+case "$*" in
+  "get nodes "*) echo "stg-1=10.20.1.11" ;;
+  "get pods -A "*) ;;
+  "-n data get cluster pg "*) printf pg-1 ;;
+  "-n data get pod pg-1 "*) printf stg-2 ;;
+  "wait --for=condition=Ready node/stg-1 "*)
+    n=$(( $(cat "$FAKE_DIR/node-waits" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$FAKE_DIR/node-waits"
+    [[ $n -gt 2 ]] || { echo "Unable to connect to the server: EOF" >&2; exit 1; } ;;
+  "-n data wait "*) ;;
+  "-n edge get pods "*) printf ruum-edge-x1 ;;
+  "-n edge wait "*) ;;
+  "-n edge port-forward pod/ruum-edge-x1 :8443") echo "Forwarding from 127.0.0.1:$FAKE_TLS_PORT -> 8443"; exec sleep 60 ;;
+  *) echo "fake kubectl: unexpected: $*" >&2; exit 9 ;;
+esac
+FAKE
+  chmod +x "$FU/bin/"* "$FU/ops/upgrade-talos.sh"
+  fu_ext="$(sed -n 's#^ *- siderolabs/\([a-z0-9-]*\) *$#\1#p' "$STG/talos/schematic.yaml" | tr '\n' ' ')"
+  # tls_server CN: openssl s_server with a self-signed certificate for CN on a free port (FU_PORT).
+  tls_server() {
+    openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=$1" -addext "subjectAltName=DNS:$1" \
+      -keyout "$FU/key.pem" -out "$FU/cert.pem" >/dev/null 2>&1
+    FU_PORT=$(( 20000 + RANDOM % 20000 ))
+    openssl s_server -quiet -accept "$FU_PORT" -cert "$FU/cert.pem" -key "$FU/key.pem" </dev/null >/dev/null 2>&1 &
+    FU_PID=$!
+    sleep 1
+  }
+  upg() { rm -f "$FU/fake/"*; env PATH="$FU/bin:$PATH" FAKE_DIR="$FU/fake" FAKE_EXT="$fu_ext" FAKE_TLS_PORT="$FU_PORT" RUUM_UPGRADE_RETRY_PAUSE=0.2 \
+    RUUM_STAGING_WORK="$FU" "$@" bash "$FU/ops/upgrade-talos.sh"; }
+  tls_server staging.ruum.space
+  expect 0 "upgrade-talos.sh retries kubectl wait while the API forward is down, then checks the edge (backlog O-54)" upg
+  [[ "$(cat "$FU/fake/node-waits" 2>/dev/null)" == 3 ]] && ok "upgrade-talos.sh waited for the node three times (two connection failures)" || bad "upgrade-talos.sh did not retry the node wait: $(cat "$FU/fake/node-waits" 2>/dev/null)"
+  grep -qF 'edge pod ruum-edge-x1 is ready and answers with a certificate for staging.ruum.space' "$TMP/out" &&
+    ok "upgrade-talos.sh checks that the node's edge pod is ready and answers with a certificate" || bad "upgrade-talos.sh did not check the edge pod: $(tail -3 "$TMP/out")"
+  grep -qF -- '-n edge wait --for=condition=Ready pod/ruum-edge-x1' "$FU/fake/calls" && ok "upgrade-talos.sh waits for the edge pod's readiness" || bad "upgrade-talos.sh does not wait for the edge pod's readiness"
+  kill "$FU_PID" 2>/dev/null; wait "$FU_PID" 2>/dev/null
+  tls_server other.example
+  expect 1 "upgrade-talos.sh stops when the node's edge answers without a certificate for the public host" upg RUUM_UPGRADE_EDGE_SECONDS=2
+  grep -qF 'stopping before the next node' "$TMP/out" && ok "... and says it stops before the next node" || bad "upgrade-talos.sh's edge failure message: $(tail -2 "$TMP/out")"
+  kill "$FU_PID" 2>/dev/null; wait "$FU_PID" 2>/dev/null
+  FU_PORT=1
+  expect 1 "upgrade-talos.sh stops when the node's edge does not answer TLS" upg RUUM_UPGRADE_EDGE_SECONDS=2
+else
+  echo "== upgrade-talos.sh with fakes: skipped (no openssl with x509 -checkhost, or no jq)"
+fi
+
+# Backlog O-53: the load balancer's health checks ask the edge's own paths (charts/ruum
+# _helpers.tpl) for the public host; port 80 goes to the Service ruum-edge-http.
+lbsvc() { awk -v r="resource \"hcloud_load_balancer_service\" \"$1\" {" '$0 == r {on=1} on && /^}/ {print; exit} on' "$STG/tofu/cluster/main.tf"; }
+ready_path="$(sed -n '/define "ruum.edgeReadyPath"/{n;p;}' "$STG/charts/ruum/templates/_helpers.tpl")"
+alive_path="$(sed -n '/define "ruum.edgeAlivePath"/{n;p;}' "$STG/charts/ruum/templates/_helpers.tpl")"
+public_host="$(sed -n 's/^  public: *\([a-z0-9.-]*\) *$/\1/p' "$STG/charts/ruum/values.yaml")"
+lbsvc https | tr -s ' ' | grep -qxF ' protocol = "http"' && lbsvc https | grep -qE "^ +path += \"$ready_path\"$" && lbsvc https | grep -qE '^ +tls += true$' &&
+  lbsvc https | grep -qE "^ +domain += \"$public_host\"" && lbsvc https | grep -qE '^ +destination_port += 30443$' &&
+  ok "the load balancer checks port 443 over HTTPS on $ready_path for $public_host (backlog O-53)" || bad "the load balancer's port 443 health check is not HTTPS on the edge's ready path"
+lbsvc http | grep -qE '^ +destination_port += 30081$' && lbsvc http | grep -qE '^ +port += 30081$' && lbsvc http | grep -qE "^ +path += \"$alive_path\"$" && ! lbsvc http | grep -qE '^ +tls += true' &&
+  ok "the load balancer sends port 80 to ruum-edge-http (30081) and checks $alive_path over HTTP" || bad "the load balancer's port 80 service or health check"
+lbsvc https | grep -qE '^ +protocol += "tcp"$' && [[ "$(lbsvc https | grep -cE '^ +protocol += "tcp"$')" == 1 ]] && [[ "$(lbsvc http | grep -cE '^ +protocol += "tcp"$')" == 1 ]] &&
+  ok "no TCP health check is left (the services stay TCP with the proxy protocol)" || bad "a TCP health check is left on the load balancer"
+# Backlog O-55: blob-copy reads the bucket that tofu makes, at the endpoint of its location.
+grep -qF 'minio_server = "${var.location}.your-objectstorage.com"' "$STG/tofu/cluster/versions.tf" && grep -qF 'TF_VAR_location="$HCLOUD_LOCATION"' "$STG/steps.sh" &&
+  grep -qxF "  sourceEndpoint: https://$HCLOUD_LOCATION.your-objectstorage.com" "$STG/charts/platform/values.yaml" &&
+  ok "blob-copy's source endpoint is the location of the tofu buckets ($HCLOUD_LOCATION, backlog O-55)" || bad "blob-copy's source endpoint is not the location where tofu makes the blob bucket"
+bb="$(awk '/^variable "bucket_blobs"/ {on=1} on && /default/ {gsub(/[" ]/, "", $3); print $3; exit}' "$STG/tofu/cluster/variables.tf")"
+grep -qxF "  source: $bb" "$STG/charts/platform/values.yaml" && ok "blob-copy copies the blob bucket of tofu ($bb)" || bad "blob-copy's source is not tofu's bucket_blobs ($bb)"
 rc="$STG/k8s/manifests/runtimeclass.yaml"
 grep -qx 'handler: runsc' "$rc" && grep -qx '  name: gvisor' "$rc" && ok "the runtime class gvisor uses the handler runsc" || bad "no runtime class gvisor with handler runsc"
 gl="$(grep -nF 'ops/gvisor-check.sh" --class-only' "$STG/k8s/apply.sh" | cut -d: -f1)" rl="$(grep -nF 'manifests/runtimeclass.yaml' "$STG/k8s/apply.sh" | cut -d: -f1)"

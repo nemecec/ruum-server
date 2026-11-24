@@ -14,6 +14,12 @@
 # Before each node: etcd has 3 healthy members, every pod is Running, and the CNPG primary is
 # moved away from the node (switchover). The sum of requests must fit on N-1 nodes (review 2
 # U-2, ops/check-capacity.sh), or the drain hangs.
+#
+# After each node (backlog O-54): the kubectl calls retry for a while, because the admin
+# tunnel's Kubernetes forward can go to the node that just rebooted, whose API server is still
+# starting ("Unable to connect to the server: EOF"). Then the node's edge pod must be ready and
+# answer TLS with a certificate for the public host (through kubectl port-forward), or the script
+# stops before the next node: an edge without certificates fails requests (backlog O-53).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../versions.env
@@ -22,6 +28,63 @@ WORK="${RUUM_STAGING_WORK:-$HOME/.config/ruum/staging}"
 export TALOSCONFIG="$WORK/talosconfig" KUBECONFIG="$WORK/kubeconfig"
 log() { printf '==> %s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+# Seconds between two tries of retry (tests/run.sh makes it short).
+RETRY_PAUSE="${RUUM_UPGRADE_RETRY_PAUSE:-5}"
+# The public host of the edge (hosts.public of charts/ruum).
+EDGE_HOST="$(sed -n 's/^  public: *\([a-z0-9.-]*\) *$/\1/p' "$HERE/../charts/ruum/values.yaml" | head -1)"
+
+# retry SECONDS COMMAND...: runs COMMAND until it succeeds, at most SECONDS long (backlog O-54).
+retry() {
+  local limit="$1" start=$SECONDS
+  shift
+  until "$@"; do
+    (( SECONDS - start < limit )) || return 1
+    log "failed: $* (the API forward may be on the node that rebooted); again in ${RETRY_PAUSE} s"
+    sleep "$RETRY_PAUSE"
+  done
+}
+
+# edge_pod NODE: the name of a running edge pod on NODE (the DaemonSet ruum-edge), or nothing.
+edge_pod() {
+  kubectl -n edge get pods -l app=ruum-edge --field-selector "spec.nodeName=$1,status.phase=Running" \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
+}
+
+# edge_tls POD: the pod answers TLS on 8443 with a certificate for EDGE_HOST (kubectl
+# port-forward to the pod; the connection comes from inside the pod, so Caddy wants no PROXY
+# header). Prints the certificate's subject and end date.
+edge_tls() {
+  local pod="$1" pf port rc=1 out
+  out="$(mktemp)"
+  kubectl -n edge port-forward "pod/$pod" :8443 >"$out" 2>&1 </dev/null &
+  pf=$!
+  port=""
+  for _ in $(seq 1 50); do
+    port="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) .*/\1/p' "$out" | head -1)"
+    [[ -n "$port" ]] && break
+    kill -0 "$pf" 2>/dev/null || break
+    sleep 0.2
+  done
+  if [[ -n "$port" ]]; then
+    openssl s_client -connect "127.0.0.1:$port" -servername "$EDGE_HOST" </dev/null 2>/dev/null |
+      openssl x509 -noout -checkhost "$EDGE_HOST" -subject -enddate >"$out.cert" 2>/dev/null &&
+      grep -q 'does match certificate' "$out.cert" && { grep -v 'match certificate' "$out.cert" >&2; rc=0; }
+  fi
+  kill "$pf" 2>/dev/null || true
+  wait "$pf" 2>/dev/null || true
+  rm -f "$out" "$out.cert"
+  return "$rc"
+}
+
+# edge_ok NODE: a running edge pod on NODE is Ready and answers with a certificate.
+edge_ok() {
+  local pod
+  pod="$(edge_pod "$1")"
+  [[ -n "$pod" ]] || return 1
+  kubectl -n edge wait --for=condition=Ready "pod/$pod" --timeout=30s >/dev/null || return 1
+  edge_tls "$pod" || return 1
+  log "$1: edge pod $pod is ready and answers with a certificate for $EDGE_HOST"
+}
 
 check_only=0
 [[ "${1:-}" == --check ]] && check_only=1
@@ -78,7 +141,7 @@ while IFS='=' read -r name ip; do
   [[ "$members" -ge 3 ]] || die "etcd has $members members, not 3"
   talosctl -n "$ip" etcd status >/dev/null
   notready="$(kubectl get pods -A --no-headers --field-selector=status.phase!=Succeeded,status.phase!=Failed | awk '$4 != "Running"' | wc -l)"
-  [[ "$notready" == 0 ]] || die "$notready pods are not Running"
+  [[ "$notready" -eq 0 ]] || die "$((notready)) pods are not Running"
   primary="$(kubectl -n data get cluster pg -o jsonpath='{.status.currentPrimary}')"
   primary_node="$(kubectl -n data get pod "$primary" -o jsonpath='{.spec.nodeName}')"
   if [[ "$primary_node" == "$name" ]]; then
@@ -89,10 +152,16 @@ while IFS='=' read -r name ip; do
   fi
   log "$name: talosctl upgrade to $TALOS_INSTALLER_IMAGE (--preserve); was: $st"
   talosctl -n "$ip" upgrade --legacy --image "$TALOS_INSTALLER_IMAGE" --preserve --wait --timeout 15m
-  kubectl wait --for=condition=Ready "node/$name" --timeout=10m >/dev/null
-  kubectl -n data wait --for=condition=Ready cluster/pg --timeout=15m >/dev/null
+  retry 600 kubectl wait --for=condition=Ready "node/$name" --timeout=10m >/dev/null ||
+    die "$name is not Ready after 10 minutes; stopping before the next node"
+  retry 900 kubectl -n data wait --for=condition=Ready cluster/pg --timeout=15m >/dev/null ||
+    die "the CNPG cluster pg is not Ready after 15 minutes; stopping before the next node"
   st="$(node_state "$ip")"
   current "$st" || die "$name after the upgrade: $st, not $TALOS_VERSION $TALOS_SCHEMATIC with $want_ext; stopping before the next node"
   log "$name: $st"
+  # The edge restarts the startup probe's 5 minutes after a failed certificate load; 6 minutes
+  # cover one restart.
+  retry "${RUUM_UPGRADE_EDGE_SECONDS:-360}" edge_ok "$name" ||
+    die "$name: no ready edge pod that answers with a certificate for $EDGE_HOST after 6 minutes; stopping before the next node (look at: kubectl -n edge get pods -o wide --field-selector spec.nodeName=$name; kubectl -n edge logs <pod>; delete the pod to start it again)"
 done <<<"$nodes"
 log "every node is at $TALOS_VERSION with schematic $TALOS_SCHEMATIC (extensions: $want_ext)"
