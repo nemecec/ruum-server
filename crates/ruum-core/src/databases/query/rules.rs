@@ -965,8 +965,8 @@ pub fn catalog_text_refusal(engine: EngineKind, sql: &str) -> Option<Refusal> {
 ///
 /// - transaction control (rule 3, hint `remove_transaction_control`);
 /// - `SET` (also `SET LOCAL`, `SET ROLE`), `RESET`, `DISCARD` and `set_config` (rule 4);
-/// - role statements: `CREATE`, `ALTER` or `DROP` of a `ROLE`, `USER` or `GROUP`, `GRANT` and
-///   `REVOKE`;
+/// - role statements: `CREATE`, `ALTER` or `DROP` of a `ROLE`, `USER` or `GROUP`, `GRANT`,
+///   `REVOKE`, `ALTER DEFAULT PRIVILEGES`, `REASSIGN OWNED` and `DROP OWNED`;
 /// - Unicode-escaped names on Postgres, `ruum_*` names, `public.` / `main.` before a name and
 ///   the SQLite file functions (rules 5 to 7);
 /// - on SQLite, `ATTACH`, `DETACH`, `VACUUM` and `PRAGMA`.
@@ -1029,17 +1029,23 @@ fn check_migration_statement(
             Some("leave the option out"),
         ));
     }
+    // `ALTER DEFAULT PRIVILEGES` is a grant in another form (it grants future tables to a
+    // role, `PUBLIC` too); `REASSIGN OWNED` and `DROP OWNED` change what a role owns or may
+    // do (review D-2, 4).
     let role = match first.as_deref() {
-        Some("GRANT" | "REVOKE") => true,
+        Some("GRANT" | "REVOKE" | "REASSIGN") => true,
         Some("CREATE" | "ALTER" | "DROP") => {
             matches!(second.as_deref(), Some("ROLE" | "USER" | "GROUP"))
+                || (first.as_deref() == Some("ALTER") && second.as_deref() == Some("DEFAULT"))
+                || (first.as_deref() == Some("DROP") && second.as_deref() == Some("OWNED"))
         }
         _ => false,
     };
     if role {
         return Err(Refusal::not_allowed(
-            "role statements (CREATE, ALTER or DROP of a role, GRANT, REVOKE) never run in up: \
-             the platform keeps the roles and their rights",
+            "role statements (CREATE, ALTER or DROP of a role, GRANT, REVOKE, ALTER DEFAULT \
+             PRIVILEGES, REASSIGN OWNED, DROP OWNED) never run in up: the platform keeps the \
+             roles and their rights",
             Some("leave the statement out; the platform grants the roles their rights"),
         ));
     }
@@ -1118,6 +1124,10 @@ mod migration_tests {
                 "create role r",
                 "grant select on t to public",
                 "revoke all on t from public",
+                "alter default privileges grant select on tables to public",
+                "ALTER DEFAULT PRIVILEGES IN SCHEMA s GRANT ALL ON TABLES TO PUBLIC",
+                "reassign owned by current_user to public",
+                "drop owned by current_user",
             ] {
                 assert_eq!(refused_at(e, up).0, 1, "{up}");
             }

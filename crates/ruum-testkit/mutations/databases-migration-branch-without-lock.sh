@@ -3,6 +3,6 @@
 # as applied whose schema change is not in its copy (review D-3a 6).
 DESCRIPTION="branch copy without the migration lock"
 FILE="crates/ruum-core/src/databases/branches.rs"
-PERL='s/let _migrations = deps\.store\.lock_migrations\(tenant, source\)\.await\?;//'
+PERL='s/let _migrations = deps\n\s+\.store\n\s+\.lock_migrations\(tenant, source, super::migrations::BRANCH_LOCK_WAIT\)\n\s+\.await\?;//'
 TESTS="-p ruum-core --lib databases::migrations::tests::a_migration_and_a_branch_never_overlap -- --exact"
 PLACEHOLDER=0

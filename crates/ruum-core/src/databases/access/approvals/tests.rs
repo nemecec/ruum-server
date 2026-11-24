@@ -385,6 +385,44 @@ fn a_migration_up_that_does_not_parse_is_shown_as_unparsed() {
     assert_eq!(a.statement.as_deref(), Some("delete from t"));
 }
 
+/// Backlog S-31 (Kimi review D-2, 5): a quoted type modifier reaches `planned_columns[].type`
+/// without its quotes; only a person with `manage` reads it, everyone else reads `name(?)`.
+#[test]
+fn a_planned_columns_type_hides_its_literals_from_readers_without_manage() {
+    let at = crate::now();
+    let up = "create table t (a mytype('Mari Tamm'), b varchar(80), c numeric(10, 2), \
+              d mytype('x) Mari Tamm'), e text, f timestamp(3) with time zone)";
+    let planned = planned_columns(EngineKind::Postgres, up, &HashMap::new()).unwrap();
+    let raw: Vec<String> = planned.iter().filter_map(|c| c.data_type.clone()).collect();
+    assert!(raw.iter().any(|t| t.contains("Mari Tamm")), "{raw:?}");
+    let mut a = sample(ApprovalSubject::Migration, ApprovalStatus::Pending, at);
+    a.statement = Some(up.into());
+    a.planned_columns = planned.clone();
+    let mut full = a.clone();
+    shown_statement(&mut full, Some(EngineKind::Postgres), true);
+    assert_eq!(full.planned_columns, planned);
+    shown_statement(&mut a, Some(EngineKind::Postgres), false);
+    let shown: Vec<String> = a
+        .planned_columns
+        .iter()
+        .filter_map(|c| c.data_type.clone())
+        .collect();
+    let text = format!("{shown:?} {}", a.view("https://ruum.localhost", at));
+    assert!(!text.contains("Mari") && !text.contains("Tamm"), "{text}");
+    assert_eq!(shown[0], "mytype(?)");
+    assert_eq!(shown[3], "mytype(?)");
+    for (i, t) in [
+        (1, "varchar"),
+        (2, "numeric"),
+        (4, "text"),
+        (5, "timestamp"),
+    ] {
+        assert_eq!(shown[i], raw[i], "{t}");
+    }
+    assert_eq!(shown_type("x'y"), "<unparsed statement>");
+    assert_eq!(shown_type("x(1"), "<unparsed statement>");
+}
+
 #[test]
 fn the_view_shows_markers_and_no_hash() {
     let now = crate::now();
