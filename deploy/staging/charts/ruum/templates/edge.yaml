@@ -80,6 +80,13 @@ spec:
         - name: wait-api-server
           image: {{ include "ruum.byDigest" .Values.images.edge }}
           command: [/bin/sh, -c]
+          # BusyBox wget (Alpine's ssl_client) verifies the server certificate, and the cluster
+          # CA is not in the system trust store: without this every try fails with "certificate
+          # verify failed" and the wait always runs out (review of O-53, R-1). The API server's
+          # certificate has the Service IP as an IP SAN. The CA file is mounted with the
+          # ServiceAccount token; the script reads only the CA, never the token.
+          env:
+            - { name: SSL_CERT_FILE, value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt }
           args:
             - |
               url="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/readyz"

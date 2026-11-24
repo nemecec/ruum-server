@@ -52,6 +52,9 @@
 #   off main, an older commit without a rollback...);
 # - with docker: the rendered Caddyfile adapts (caddy adapt --validate; without the storage
 #   block, which only the edge image has);
+# - with docker: the edge's init container wait-api-server runs in the edge's base image against
+#   a stand-in API server with a private CA (review of O-53): it trusts the cluster CA, refuses
+#   a certificate it cannot verify, and gives up on a closed port;
 # - Talos through the admin tunnel (backlog O-21): talos-access.sh (the plan's kind, the touched
 #   Talos resources, the endpoints kept from the state without printing another state value, the
 #   checks of the servers and full phases), steps.sh and up.sh in the right order, the tunnel
@@ -837,6 +840,8 @@ if has helm; then
     ok "the edge waits for the API server in a restricted init container of its own image" || bad "the edge's init container wait-api-server"
   grep -qF '${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/readyz' "$TMP/edge-init.yaml" && ! grep -qiE 'authorization|serviceaccount/token' "$TMP/edge-init.yaml" &&
     ok "the init container asks the API server's /readyz and sends no token" || bad "the init container does not ask /readyz, or sends the token"
+  grep -qF '{ name: SSL_CERT_FILE, value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt }' "$TMP/edge-init.yaml" &&
+    ok "the init container trusts the cluster CA (wget verifies the API server's certificate, review of O-53)" || bad "the init container does not set SSL_CERT_FILE to the cluster CA"
   doc_of_e() { awk -v name="  name: $1" 'function out() { if (index(doc, "\nkind: Service\n") && index(doc, "\n" name "\n")) printf "%s", doc; doc = "\n" }
     BEGIN { doc = "\n" } /^---/ { out(); next } { doc = doc $0 "\n" } END { out() }' "$TMP/edge.yaml"; }
   doc_of_e ruum-edge-http >"$TMP/edge-http.yaml"
@@ -1156,6 +1161,48 @@ YAML
       bad "a Caddy server without the proxy_protocol wrapper, or no explicit port 80 server"
     jq -e '[.apps.http.servers[] | (.tls_connection_policies // [])[] | .default_sni] | index("staging.ruum.space") != null' "$TMP/caddy.json" >/dev/null &&
       ok "Caddy gives a handshake without a server name the public host's certificate (default_sni, backlog O-53)" || bad "no default_sni staging.ruum.space in the adapted Caddyfile"
+
+    echo "== the edge's init container wait-api-server, run in the edge's base image (review of O-53, R-1)"
+    # The rendered script and CA path; a stand-in API server: Caddy with a private CA (tls
+    # internal) that answers 401 on 127.0.0.1:8443, like the API server for a request without a
+    # token. The init container runs as in the pod: user 65532, read-only root, no capabilities.
+    awk '/^            - \|$/ {on=1; next} /^          resources:/ {on=0} on {sub(/^              /, ""); print}' "$TMP/edge-init.yaml" >"$TMP/wait-api.sh"
+    cafile="$(sed -n 's/.*{ name: SSL_CERT_FILE, value: \(.*\) }.*/\1/p' "$TMP/edge-init.yaml")"
+    sed 's/-lt 60/-lt 2/' "$TMP/wait-api.sh" >"$TMP/wait-api-short.sh"
+    printf '{\n\tadmin off\n\tskip_install_trust\n\tauto_https disable_redirects\n}\nhttps://127.0.0.1:8443 {\n\ttls internal\n\trespond "no" 401\n}\n' >"$TMP/api.Caddyfile"
+    apisrv="ruum-stg-apisrv-$$"
+    if docker run -d --rm --name "$apisrv" -v "$TMP/api.Caddyfile:/etc/caddy/Caddyfile:ro" "caddy:$CADDY_VERSION-alpine" >/dev/null 2>"$TMP/apisrv.err"; then
+      for _ in $(seq 30); do
+        docker exec "$apisrv" cat /data/caddy/pki/authorities/local/root.crt >"$TMP/apica.crt" 2>/dev/null && [[ -s "$TMP/apica.crt" ]] && break
+        sleep 1
+      done
+      chmod 644 "$TMP/apica.crt"
+      # init SCRIPT [CA]: run the script against the stand-in, with the CA at the chart's path.
+      init() {
+        local m=()
+        [[ -n "${2:-}" ]] && m=(-v "$2:${cafile:-/nonexistent}:ro")
+        docker run --rm --network "container:$apisrv" --user 65532:65532 --read-only --cap-drop ALL \
+          -e KUBERNETES_SERVICE_HOST=127.0.0.1 -e KUBERNETES_SERVICE_PORT="${PORT_OVERRIDE:-8443}" -e "SSL_CERT_FILE=${cafile:-/nonexistent}" \
+          ${m[@]+"${m[@]}"} --entrypoint /bin/sh "caddy:$CADDY_VERSION-alpine" -c "$(cat "$1")"
+      }
+      grep -qF -- '-lt 2 ]' "$TMP/wait-api-short.sh" && [[ -s "$TMP/wait-api.sh" && -n "$cafile" ]] || bad "could not take the init script or its CA path from the rendered edge"
+      t0=$SECONDS
+      out="$(init "$TMP/wait-api.sh" "$TMP/apica.crt" 2>&1)"; rc=$?
+      [[ $rc == 0 && -z "$out" && $((SECONDS - t0)) -lt 30 ]] &&
+        ok "with the cluster CA, the init container sees an API server that answers 401 at once" ||
+        bad "the init container did not see the API server (rc $rc, $((SECONDS - t0)) s): $out"
+      out="$(init "$TMP/wait-api-short.sh" 2>&1)"
+      [[ "$out" == *"did not answer"* ]] &&
+        ok "without the CA the same server does not count (wget verifies the certificate)" ||
+        bad "the init container accepted a server whose certificate it cannot verify: $out"
+      out="$(PORT_OVERRIDE=1 init "$TMP/wait-api-short.sh" "$TMP/apica.crt" 2>&1)"; rc=$?
+      [[ $rc == 0 && "$out" == *"the API server did not answer"*"Caddy starts anyway"* ]] &&
+        ok "a closed port: the init container gives up with a message and lets Caddy start" ||
+        bad "the init container on a closed port (rc $rc): $out"
+      docker rm -f "$apisrv" >/dev/null 2>&1
+    else
+      bad "could not start the stand-in API server: $(head -3 "$TMP/apisrv.err")"
+    fi
   fi
 else
   echo "== charts: skipped (no helm; setup.sh installs it, or Docker for the tools image)"
