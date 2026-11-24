@@ -32,6 +32,7 @@ conformance_cases!(
     restore_point,
     export,
     tenant_code,
+    app_roles,
 );
 
 #[tokio::test]

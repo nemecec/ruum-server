@@ -141,6 +141,8 @@ pub(crate) async fn execute(
     role: &RoleRef,
     request: &StatementRequest,
 ) -> Result<StatementOutcome, EngineError> {
+    // The platform never runs a statement as an app kind (card D-5).
+    role.require_platform()?;
     let state = engine.resolve(role.database()).await?;
     let kind = role.kind();
     let pieces = split::split(&request.sql);

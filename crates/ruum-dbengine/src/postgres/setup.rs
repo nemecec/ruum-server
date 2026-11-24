@@ -419,7 +419,13 @@ pub(crate) async fn read_meta(conn: &mut PgConnection) -> Result<Option<Meta>, E
     if ident.get::<String, _>("state") != "live" {
         return Ok(None);
     }
-    let roles = read_roles(conn).await?;
+    // The meta data holds the roles of step 2; the app roles (card D-5) are read fresh for each
+    // use (`app_roles.rs`), so a cached `Meta` never misses one made later.
+    let roles = read_roles(conn)
+        .await?
+        .into_iter()
+        .filter(|r| !r.kind.is_app())
+        .collect();
     Ok(Some(Meta {
         tenant_id: ident.get("tenant_id"),
         node_id: ident.get("node_id"),

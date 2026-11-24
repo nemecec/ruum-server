@@ -12,6 +12,9 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+# The SCRAM-SHA-256 verifier of an app role's password (card D-5): the password never reaches
+# the server, also not its statement log.
+base64.workspace = true
 bytes.workspace = true
 futures.workspace = true
 hex.workspace = true
@@ -21,8 +24,13 @@ rusqlite.workspace = true
 sqlx.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# Card D-5: a test captures the tracing output while passwords are issued.
+tracing-subscriber.workspace = true

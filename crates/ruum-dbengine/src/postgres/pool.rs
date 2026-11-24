@@ -30,6 +30,9 @@ pub(crate) fn search_path(kind: RoleKind) -> &'static str {
         RoleKind::Read | RoleKind::Write => "ruum_nosecret, extensions",
         RoleKind::MaskedRead | RoleKind::MaskedWrite => "ruum_masked, extensions",
         RoleKind::Mask => "pg_catalog",
+        // App roles (card D-5) never log in through a platform pool; their role setting is set
+        // by `app_roles.rs`, with this path.
+        RoleKind::AppRead | RoleKind::AppWrite => super::app_roles::APP_SEARCH_PATH,
     }
 }
 
@@ -107,6 +110,7 @@ impl Lease {
 
 impl RolePool {
     pub fn new(database: &str, role_name: &str, kind: RoleKind, max: usize) -> RolePool {
+        assert!(!kind.is_app(), "the platform never pools an app role");
         RolePool {
             database: database.to_string(),
             role_name: role_name.to_string(),
