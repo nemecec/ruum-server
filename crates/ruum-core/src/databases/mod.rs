@@ -449,6 +449,70 @@ pub trait DatabaseStore: Send + Sync {
         &self,
         grants: Arc<dyn access::grants::GrantStore>,
     ) -> Arc<dyn access::approvals::ApprovalStore>;
+
+    // ------------------------------------------------- migrations (card D-2, `migrations`)
+
+    /// Takes the migration lock of a database (DB-2) and holds it until the lock is released
+    /// or dropped: a migration holds it while it runs, a branch of the database from before its
+    /// engine copy until [`DatabaseStore::insert_branch`] wrote its rows. Waits while another
+    /// holder has it.
+    async fn lock_migrations(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+    ) -> Result<migrations::MigrationLock>;
+
+    /// Writes a `database_restore_points` row of the database (no label; `reason` of
+    /// `restore_point_reason`; the actor and `on_behalf_of` of `ctx`). Returns its ID.
+    async fn insert_restore_point(
+        &self,
+        ctx: &Context,
+        node: NodeId,
+        reason: &str,
+        mark: &ruum_dbengine::RestorePointMark,
+    ) -> Result<uuid::Uuid>;
+
+    /// Writes a migration in one transaction: the take of its approval (`approvals` is the
+    /// approval store of this backend; Postgres takes in the same transaction), the
+    /// `database_migrations` row and its journal entry. An applied row of the same name is
+    /// `409 conflict`; then nothing is written.
+    async fn record_migration(
+        &self,
+        ctx: &Context,
+        record: migrations::MigrationRecord,
+        approvals: &dyn access::approvals::ApprovalStore,
+    ) -> Result<(
+        migrations::MigrationRow,
+        Option<crate::journal::JournalEntry>,
+    )>;
+
+    /// The applied migration of a name, if any.
+    async fn applied_migration(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+        name: &str,
+    ) -> Result<Option<migrations::MigrationRow>>;
+
+    /// The migrations of a database, newest first (by time, then ID).
+    async fn list_migrations(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+        page: &PageRequest,
+    ) -> Result<Page<migrations::MigrationRow>>;
+
+    /// The migrations of every tenant whose lens waits for a rebuild
+    /// ([`migrations::LENS_PENDING`]): a system scan of IDs.
+    async fn lens_pending(&self) -> Result<Vec<(TenantId, NodeId, uuid::Uuid)>>;
+
+    /// Clears [`migrations::LENS_PENDING`] of a migration. True when it was set.
+    async fn clear_lens_pending(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+        id: uuid::Uuid,
+    ) -> Result<bool>;
 }
 
 /// The journal entry `database.branch_created` that [`DatabaseStore::insert_branch`] writes
@@ -502,6 +566,8 @@ pub struct MemoryDatabaseStore {
     /// a branch's column rows under this store's lock ([`Self::columns`]).
     columns: Arc<classes::MemoryColumnStore>,
     inner: Mutex<MemDbInner>,
+    /// The migration locks (card D-2).
+    migration_locks: migrations::store::MemoryLocks,
 }
 
 #[derive(Default)]
@@ -514,6 +580,10 @@ struct MemDbInner {
     rows: HashMap<(TenantId, NodeId), (DatabaseRow, Vec<EngineRole>)>,
     /// The database nodes whose first manifest names a `template` (branches), until purged.
     branches: std::collections::HashSet<(TenantId, NodeId)>,
+    /// `database_migrations` (card D-2).
+    migrations: Vec<migrations::MigrationRow>,
+    /// `database_restore_points` of migrations (card D-2).
+    restore_points: Vec<access::grants::RestorePointRow>,
 }
 
 impl MemoryDatabaseStore {
@@ -532,6 +602,7 @@ impl MemoryDatabaseStore {
             typed,
             columns,
             inner: Mutex::new(MemDbInner::default()),
+            migration_locks: migrations::store::MemoryLocks::default(),
         }
     }
 
@@ -770,6 +841,14 @@ impl DatabaseStore for MemoryDatabaseStore {
             ));
         }
         self.columns.put_new(row.tenant_id, row.node_id, columns)?;
+        if let Some(source) = row.branch_of {
+            migrations::store::mem_copy_applied(
+                &mut inner.migrations,
+                row.tenant_id,
+                source,
+                row.node_id,
+            );
+        }
         inner.rows.insert(key, (row.clone(), roles.to_vec()));
         inner.nodes.entry(key).or_insert(row.engine);
         inner.branches.insert(key);
@@ -819,6 +898,69 @@ impl DatabaseStore for MemoryDatabaseStore {
             e.size_bytes += row.map(|r| r.size_bytes).unwrap_or(0);
         }
         Ok(u)
+    }
+
+    async fn lock_migrations(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+    ) -> Result<migrations::MigrationLock> {
+        Ok(self.migration_locks.lock(tenant, node).await)
+    }
+
+    async fn insert_restore_point(
+        &self,
+        ctx: &Context,
+        node: NodeId,
+        reason: &str,
+        mark: &ruum_dbengine::RestorePointMark,
+    ) -> Result<uuid::Uuid> {
+        migrations::store::mem_insert_restore_point(self, ctx, node, reason, mark)
+    }
+
+    async fn record_migration(
+        &self,
+        ctx: &Context,
+        record: migrations::MigrationRecord,
+        approvals: &dyn access::approvals::ApprovalStore,
+    ) -> Result<(
+        migrations::MigrationRow,
+        Option<crate::journal::JournalEntry>,
+    )> {
+        migrations::store::mem_record(self, ctx, record, approvals).await
+    }
+
+    async fn applied_migration(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+        name: &str,
+    ) -> Result<Option<migrations::MigrationRow>> {
+        Ok(migrations::store::mem_applied(self, tenant, node, name))
+    }
+
+    async fn list_migrations(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+        page: &PageRequest,
+    ) -> Result<Page<migrations::MigrationRow>> {
+        migrations::store::mem_list(self, tenant, node, page)
+    }
+
+    async fn lens_pending(&self) -> Result<Vec<(TenantId, NodeId, uuid::Uuid)>> {
+        Ok(migrations::store::mem_lens_pending(self))
+    }
+
+    async fn clear_lens_pending(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+        id: uuid::Uuid,
+    ) -> Result<bool> {
+        Ok(migrations::store::mem_clear_lens_pending(
+            self, tenant, node, id,
+        ))
     }
 }
 
@@ -948,13 +1090,12 @@ fn database_row(r: &sqlx::postgres::PgRow) -> Result<DatabaseRow> {
 /// (card D-3a, decision 0004-17), so it never runs a migration of its source again. Each copy
 /// gets a new ID; its restore point stays with the source (`NULL`).
 ///
-/// TODO(D-2): the rows are read when the branch's `databases` row is written, after the engine
-/// copy. A migration applied on the source in between is recorded here as applied, but its
-/// schema change is not in the copy. Nothing can apply a migration before D-2, so this holds
-/// today. D-2 must close the gap: it holds the source's migration lock (`lock_database` of the
-/// source) while a migration runs, and the branch takes the same lock from before the engine
-/// copy until this insert (or reads the applied names under it). See card D-2 in
-/// `docs/STEP2.md` (review D-3a 6).
+/// The rows are read when the branch's `databases` row is written, after the engine copy. No
+/// migration of the source runs in between (card D-2, DB-2): a migration holds the source's
+/// migration lock ([`DatabaseStore::lock_migrations`]) from before `up` runs until its row is
+/// committed, and the branch's task (`branches::make_branch`) holds the same lock from before
+/// the engine copy until this insert. So the applied names read here are exactly the
+/// migrations whose schema changes are in the copy.
 async fn copy_applied_migrations(
     conn: &mut sqlx::PgConnection,
     tenant: TenantId,
@@ -1397,6 +1538,67 @@ impl DatabaseStore for PgDatabaseStore {
             e.size_bytes += r.try_get::<i64, _>("size")?;
         }
         Ok(u)
+    }
+
+    async fn lock_migrations(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+    ) -> Result<migrations::MigrationLock> {
+        migrations::store::pg_lock(&self.pool, tenant, node).await
+    }
+
+    async fn insert_restore_point(
+        &self,
+        ctx: &Context,
+        node: NodeId,
+        reason: &str,
+        mark: &ruum_dbengine::RestorePointMark,
+    ) -> Result<uuid::Uuid> {
+        migrations::store::pg_insert_restore_point(&self.pool, ctx, node, reason, mark).await
+    }
+
+    async fn record_migration(
+        &self,
+        ctx: &Context,
+        record: migrations::MigrationRecord,
+        _approvals: &dyn access::approvals::ApprovalStore,
+    ) -> Result<(
+        migrations::MigrationRow,
+        Option<crate::journal::JournalEntry>,
+    )> {
+        migrations::store::pg_record(&self.pool, ctx, record).await
+    }
+
+    async fn applied_migration(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+        name: &str,
+    ) -> Result<Option<migrations::MigrationRow>> {
+        migrations::store::pg_applied(&self.pool, tenant, node, name).await
+    }
+
+    async fn list_migrations(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+        page: &PageRequest,
+    ) -> Result<Page<migrations::MigrationRow>> {
+        migrations::store::pg_list(&self.pool, tenant, node, page).await
+    }
+
+    async fn lens_pending(&self) -> Result<Vec<(TenantId, NodeId, uuid::Uuid)>> {
+        migrations::store::pg_lens_pending(&self.pool).await
+    }
+
+    async fn clear_lens_pending(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+        id: uuid::Uuid,
+    ) -> Result<bool> {
+        migrations::store::pg_clear_lens_pending(&self.pool, tenant, node, id).await
     }
 }
 
@@ -2738,7 +2940,10 @@ mod tests {
 
     /// A tenant with a user, a root folder and a database node (`nodes`, `versions`,
     /// `typed_nodes`), written as the system. Returns (tenant, node, version).
-    async fn seed_pg_database(pool: &sqlx::PgPool, engine: &str) -> (TenantId, NodeId, VersionId) {
+    pub(crate) async fn seed_pg_database(
+        pool: &sqlx::PgPool,
+        engine: &str,
+    ) -> (TenantId, NodeId, VersionId) {
         let (t, u, root, node, v) = (
             TenantId::new(),
             UserId::new(),
@@ -2827,7 +3032,7 @@ mod tests {
         (t, node, v)
     }
 
-    fn row(t: TenantId, node: NodeId, engine: EngineKind) -> DatabaseRow {
+    pub(crate) fn row(t: TenantId, node: NodeId, engine: EngineKind) -> DatabaseRow {
         DatabaseRow {
             tenant_id: t,
             node_id: node,

@@ -194,6 +194,9 @@ pub fn undo_action(event: crate::journal::EventType) -> Option<&'static str> {
         ShareLinkRevoked => None,
         // Only a person confirms classes (card K-1); an agent never wrote one.
         DatabaseColumnsConfirmed => None,
+        // A migration is undone by a restore to its restore point (card D-4), by a person; a
+        // failed one changed nothing (card D-2).
+        DatabaseMigrationApplied | DatabaseMigrationFailed => None,
         NodeSharingUpdated => Some("set the old editors_can_share"),
         // Only people give grants, so an agent never writes `database.grant_created`; its
         // inverse would end the grant. A grant that ended (given back) cannot start again: a

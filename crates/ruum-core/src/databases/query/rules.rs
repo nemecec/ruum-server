@@ -956,6 +956,189 @@ pub fn catalog_text_refusal(engine: EngineKind, sql: &str) -> Option<Refusal> {
     None
 }
 
+// ------------------------------------------------------------------------- migrations
+
+/// The statement rules of a migration's `up` (card D-2; `applyDatabaseMigration` "Statements
+/// that never run in `up`", decisions 0004-35 a, b): `up` holds several statements, and each
+/// statement gets the word rules of [`analyze`] that do not need a parse, so a `DO` block or a
+/// function body (which the parser cannot read) still runs as the schema owner:
+///
+/// - transaction control (rule 3, hint `remove_transaction_control`);
+/// - `SET` (also `SET LOCAL`, `SET ROLE`), `RESET`, `DISCARD` and `set_config` (rule 4);
+/// - role statements: `CREATE`, `ALTER` or `DROP` of a `ROLE`, `USER` or `GROUP`, `GRANT` and
+///   `REVOKE`;
+/// - Unicode-escaped names on Postgres, `ruum_*` names, `public.` / `main.` before a name and
+///   the SQLite file functions (rules 5 to 7);
+/// - on SQLite, `ATTACH`, `DETACH`, `VACUUM` and `PRAGMA`.
+///
+/// Every other statement goes to the engine, which runs `up` as the owner of the tables in its
+/// own schema: `CREATE SCHEMA` and `CREATE EXTENSION` fail there on the engine rights
+/// (decision 0004-35), not here. The text is split into statements by the tokenizer of the
+/// engine's dialect, so a `;` inside a string, a quoted name or a dollar-quoted body does not
+/// split. Returns the number of statements, or the number (from 1) of the first refused
+/// statement with its refusal. An `up` that does not tokenize is refused as statement 0
+/// (fail closed); an `up` without a statement is `validation_failed`.
+pub fn check_migration(engine: EngineKind, up: &str) -> Result<usize, (usize, Refusal)> {
+    let dialect = dialect(engine);
+    let tokens = Tokenizer::new(&*dialect, up)
+        .with_unescape(false)
+        .tokenize()
+        .map_err(|_| (0, unparsed()))?;
+    let mut n = 0;
+    for group in tokens.split(|t| matches!(t, Token::SemiColon)) {
+        let sig = significant(group);
+        if sig.is_empty() {
+            continue;
+        }
+        n += 1;
+        check_migration_statement(engine, group, &sig).map_err(|r| (n, r))?;
+    }
+    if n == 0 {
+        return Err((
+            0,
+            Refusal::validation("up holds no statement", "/up: send one or more statements"),
+        ));
+    }
+    Ok(n)
+}
+
+/// The word rules of one statement of `up` ([`check_migration`]).
+fn check_migration_statement(
+    engine: EngineKind,
+    tokens: &[Token],
+    sig: &[&Token],
+) -> Result<(), Refusal> {
+    let first = keyword(sig.first());
+    let second = keyword(sig.get(1));
+    let transaction = match first.as_deref() {
+        Some("BEGIN" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "SAVEPOINT" | "RELEASE") => true,
+        Some("START" | "PREPARE") => second.as_deref() == Some("TRANSACTION"),
+        _ => false,
+    };
+    if transaction {
+        return Err(Refusal::not_allowed(
+            "transaction control (BEGIN, COMMIT, ROLLBACK, SAVEPOINT, ...) never runs in up: the \
+             platform runs up in one transaction that it opens and ends",
+            Some(HINT_TRANSACTION_CONTROL),
+        ));
+    }
+    if matches!(first.as_deref(), Some("SET" | "RESET" | "DISCARD")) {
+        return Err(Refusal::not_allowed(
+            "SET (also SET LOCAL and SET ROLE), RESET, DISCARD and set_config never run in up: \
+             the platform sets its own options before each statement",
+            Some("leave the option out"),
+        ));
+    }
+    let role = match first.as_deref() {
+        Some("GRANT" | "REVOKE") => true,
+        Some("CREATE" | "ALTER" | "DROP") => {
+            matches!(second.as_deref(), Some("ROLE" | "USER" | "GROUP"))
+        }
+        _ => false,
+    };
+    if role {
+        return Err(Refusal::not_allowed(
+            "role statements (CREATE, ALTER or DROP of a role, GRANT, REVOKE) never run in up: \
+             the platform keeps the roles and their rights",
+            Some("leave the statement out; the platform grants the roles their rights"),
+        ));
+    }
+    if engine == EngineKind::Sqlite
+        && matches!(
+            first.as_deref(),
+            Some("ATTACH" | "DETACH" | "VACUUM" | "PRAGMA")
+        )
+    {
+        return Err(not_allowed_kind());
+    }
+    if engine == EngineKind::Postgres {
+        check_unicode_names(tokens)?;
+    }
+    check_names(engine, sig)
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    fn refused_at(engine: EngineKind, up: &str) -> (usize, Refusal) {
+        match check_migration(engine, up) {
+            Ok(n) => panic!("{engine:?}: {up:?} was allowed ({n} statements)"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn up_runs_ddl_dml_do_blocks_and_schema_statements() {
+        let pg = EngineKind::Postgres;
+        assert_eq!(
+            check_migration(
+                pg,
+                "create table beds (id integer primary key);\n\
+                 insert into beds values (1);\n\
+                 do $$ begin insert into beds values (2); end $$;\n\
+                 create function f() returns int language sql as $$ select 1; $$;"
+            ),
+            Ok(4)
+        );
+        // The engine refuses these on its rights (decision 0004-35), not the rules.
+        assert_eq!(check_migration(pg, "create schema s"), Ok(1));
+        assert_eq!(check_migration(pg, "create extension hstore"), Ok(1));
+        assert_eq!(
+            check_migration(EngineKind::Sqlite, "create table t (id integer); "),
+            Ok(1)
+        );
+        // A `;` in a literal does not split.
+        assert_eq!(
+            check_migration(pg, "insert into t values ('a;begin')"),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn up_refuses_transaction_control_session_and_role_statements_by_number() {
+        for e in [EngineKind::Postgres, EngineKind::Sqlite] {
+            let (n, r) = refused_at(e, "begin;\ncreate table b (id int);\ncommit;");
+            assert_eq!(n, 1);
+            assert_eq!(r.hint.as_deref(), Some(HINT_TRANSACTION_CONTROL));
+            let (n, r) = refused_at(e, "create table b (id int);\ncommit;");
+            assert_eq!(n, 2);
+            assert_eq!(r.hint.as_deref(), Some(HINT_TRANSACTION_CONTROL));
+            for up in [
+                "create table b (id int); set local statement_timeout = 0",
+                "create table b (id int); SET statement_timeout = 0",
+                "create table b (id int); reset all",
+                "create table b (id int); select set_config('a', 'b', true)",
+            ] {
+                let (n, r) = refused_at(e, up);
+                assert_eq!(n, 2, "{up}");
+                assert_eq!(r.code, RefusalCode::StatementNotAllowed, "{up}");
+            }
+            for up in [
+                "create role r",
+                "grant select on t to public",
+                "revoke all on t from public",
+            ] {
+                assert_eq!(refused_at(e, up).0, 1, "{up}");
+            }
+            assert_eq!(refused_at(e, "select * from ruum_mask.k").0, 1);
+            assert_eq!(
+                refused_at(e, "  ;  -- nothing\n").1.code,
+                RefusalCode::ValidationFailed
+            );
+        }
+        let (_, r) = refused_at(EngineKind::Postgres, "create table public.beds (id int)");
+        assert_eq!(r.hint.as_deref(), Some(HINT_UNQUALIFIED_NAMES));
+        let (_, r) = refused_at(EngineKind::Sqlite, "create table main.beds (id int)");
+        assert_eq!(r.hint.as_deref(), Some(HINT_UNQUALIFIED_NAMES));
+        assert_eq!(refused_at(EngineKind::Sqlite, "attach 'x' as y").0, 1);
+        assert_eq!(
+            refused_at(EngineKind::Postgres, "create table U&\"b\" (id int)").0,
+            1
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

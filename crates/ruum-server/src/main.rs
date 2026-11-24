@@ -112,6 +112,10 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(ruum_core::databases::access::grants::run_sweeper(
         services.databases.clone(),
     ));
+    // The lens rebuild after a migration whose catalog sync failed (card D-2).
+    tokio::spawn(ruum_core::databases::migrations::run_lens_sweeper(
+        services.databases.clone(),
+    ));
     let state = AppState::new(
         services.clone(),
         ApiConfig {
