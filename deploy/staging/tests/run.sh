@@ -1937,6 +1937,15 @@ al="$(grep -nF 'manifests/apps-admission.yaml' "$STG/k8s/apply.sh" | cut -d: -f1
 gc="$STG/ops/gvisor-check.sh"
 grep -qx 'CONTROL_NS=ops' "$gc" && grep -qF '[[ -n "$class" ]] || ns="$CONTROL_NS"' "$gc" && ok "the control pod without gVisor runs in ops, not in ruum-apps" || bad "gvisor-check.sh runs its control pod in ruum-apps"
 grep -qF 'kubectl create --dry-run=server' "$gc" && grep -qF 'the positive' "$gc" && ok "gvisor-check.sh proves the admission rule live, with a positive control" || bad "gvisor-check.sh does not check the admission rule"
+# Review of I6-1 change 5, Kimi I6-1 finding 1: no projected token, no other Secret, no envFrom, no
+# init or ephemeral containers, the default service account, checked live with dry runs.
+grep -qF 'resources: ["pods", "pods/ephemeralcontainers"]' "$va" && grep -qF "v.secret.secretName == variables.own" "$va" &&
+  grep -qF "e.valueFrom.secretKeyRef.name == variables.own" "$va" && grep -qF "size(c.envFrom) == 0" "$va" &&
+  grep -qF "size(object.spec.ephemeralContainers) == 0" "$va" && grep -qF "object.spec.serviceAccountName == 'default'" "$va" &&
+  ok "the admission policy of ruum-apps lets a pod reach only its own Secret (no projected token, envFrom or extra containers)" || bad "apps-admission.yaml does not bind a pod to its own Secret"
+grep -qF 'refused "with a projected service account token"' "$gc" && grep -qF "refused \"that mounts another instance's Secret\"" "$gc" &&
+  grep -qF "refused \"that takes a value of another instance's Secret\"" "$gc" && grep -qF 'refused "with envFrom"' "$gc" &&
+  ok "gvisor-check.sh proves the Secret rules live (projected token, another Secret, envFrom)" || bad "gvisor-check.sh does not check the Secret rules"
 grep -qF 'want no "$r" "$APPS_NS" "$verb" secrets' "$STG/ops/rbac-check.sh" && grep -qF 'want yes "$r" "$APPS_NS" get pods log' "$STG/ops/rbac-check.sh" &&
   ok "rbac-check.sh live checks the runtime driver's rights" || bad "rbac-check.sh does not check the runtime driver"
 for i in ruum-gateway ruum-egress; do
