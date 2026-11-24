@@ -77,7 +77,7 @@ while IFS='=' read -r name ip; do
   members="$(talosctl -n "$ip" etcd members 2>/dev/null | tail -n +2 | wc -l)"
   [[ "$members" -ge 3 ]] || die "etcd has $members members, not 3"
   talosctl -n "$ip" etcd status >/dev/null
-  notready="$(kubectl get pods -A --no-headers | awk '$4 != "Running" && $4 != "Completed"' | wc -l)"
+  notready="$(kubectl get pods -A --no-headers --field-selector=status.phase!=Succeeded,status.phase!=Failed | awk '$4 != "Running"' | wc -l)"
   [[ "$notready" == 0 ]] || die "$notready pods are not Running"
   primary="$(kubectl -n data get cluster pg -o jsonpath='{.status.currentPrimary}')"
   primary_node="$(kubectl -n data get pod "$primary" -o jsonpath='{.spec.nodeName}')"
