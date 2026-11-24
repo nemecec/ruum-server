@@ -747,8 +747,9 @@ fn is_sqlstate(code: &str) -> bool {
             .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
 }
 
-/// The answer of an engine error. `manage`: the caller may read the engine's text.
-fn engine_problem(e: EngineError, manage: bool) -> Error {
+/// The answer of an engine error. `manage`: the caller may read the engine's text. Card D-2 sanitizes
+/// the error of a failed migration with it too.
+pub(crate) fn engine_problem(e: EngineError, manage: bool) -> Error {
     // `in_routine`: tenant code (a trigger, a function, a `RAISE`) may have written the text and
     // chosen the SQLSTATE, with the values of the real row, so no part of it is shown
     // (review-Q-2-2 P-2).

@@ -192,6 +192,10 @@ pub(super) async fn make_branch(
     let source_key = deps.keys.engine_key(tenant, src.key_node_id).await?;
     let key_node_id = Some(target);
     let key = deps.keys.engine_key(tenant, key_node_id).await?;
+    // DB-2 (card D-2): the source's migration lock from before the engine copy until the
+    // branch's rows (with the copies of the applied migration rows) are written, so no
+    // migration of the source runs in between. Released when this function returns.
+    let _migrations = deps.store.lock_migrations(tenant, source).await?;
     let created = engine
         .copy_database(
             &src.database_ref(),

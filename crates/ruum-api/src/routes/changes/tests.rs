@@ -160,6 +160,14 @@ fn sample(event: EventType, user: UserId) -> Value {
             "columns": [{ "schema": "main", "table": "plants", "column": "latin_name",
                           "class": "normal", "old_class": null }]
         }),
+        EventType::DatabaseMigrationApplied => json!({
+            "migration_id": id(), "name": "0002_add_beds", "checksum": hash(),
+            "restore_point_id": id(), "approval_id": null, "new_columns": 1, "reset_columns": 0
+        }),
+        EventType::DatabaseMigrationFailed => json!({
+            "migration_id": id(), "name": "0002_add_beds", "checksum": hash(),
+            "sqlstate": "23505", "statement_index": null
+        }),
         EventType::DatabaseGrantCreated => json!({
             "grant_id": id(), "kind": "read_personal", "agent_id": id(),
             "expires_at": "2026-11-08T12:00:00Z", "restore_point_id": null, "approval_id": null

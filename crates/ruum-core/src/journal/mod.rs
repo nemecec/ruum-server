@@ -61,6 +61,12 @@ pub enum EventType {
     ShareLinkRevoked,
     NodeSharingUpdated,
     DatabaseColumnsConfirmed,
+    /// A migration ran and was committed (card D-2). On the database node; names, IDs and
+    /// counts only. It changes no one's access to a node, so it needs no feed rule of its own.
+    DatabaseMigrationApplied,
+    /// A migration failed and was rolled back (card D-2), like
+    /// [`EventType::DatabaseMigrationApplied`].
+    DatabaseMigrationFailed,
     DatabaseGrantCreated,
     DatabaseGrantRevoked,
     DatabaseApprovalDecided,
@@ -106,6 +112,8 @@ impl EventType {
         EventType::ShareLinkRevoked,
         EventType::NodeSharingUpdated,
         EventType::DatabaseColumnsConfirmed,
+        EventType::DatabaseMigrationApplied,
+        EventType::DatabaseMigrationFailed,
         EventType::DatabaseGrantCreated,
         EventType::DatabaseGrantRevoked,
         EventType::DatabaseApprovalDecided,
@@ -143,6 +151,8 @@ impl EventType {
             ShareLinkRevoked => "share_link.revoked",
             NodeSharingUpdated => "node.sharing_updated",
             DatabaseColumnsConfirmed => "database.columns_confirmed",
+            DatabaseMigrationApplied => "database.migration_applied",
+            DatabaseMigrationFailed => "database.migration_failed",
             DatabaseGrantCreated => "database.grant_created",
             DatabaseGrantRevoked => "database.grant_revoked",
             DatabaseApprovalDecided => "database.approval_decided",
@@ -585,6 +595,13 @@ mod tests {
                     // Only a person confirms classes (`confirmColumnClasses` is users only), so
                     // `undoAgent` never meets this entry among an agent's changes.
                     || *e == EventType::DatabaseColumnsConfirmed
+                    // A migration is not undone by `undoAgent`: a failed one changed nothing,
+                    // and an applied one is undone by a restore to its restore point (card
+                    // D-4), by a person (card D-2).
+                    || matches!(
+                        e,
+                        EventType::DatabaseMigrationApplied | EventType::DatabaseMigrationFailed
+                    )
                     // Only a person confirms telemetry classes (`confirmAppTelemetryFields` is
                     // users only, card O-2), so `undoAgent` never meets this entry.
                     || *e == EventType::AppTelemetryFieldsConfirmed
