@@ -36,6 +36,11 @@
 //!   made.
 //! - `purged` and `tenant_deleted` drop the engine databases, delete the rows and drop the
 //!   provider's copy of the key (review-P-1 note 6). Both are idempotent.
+//! - App roles of bindings (card D-5, [`super::app_roles`]): `trashed` suspends every app role
+//!   of the database (its sessions end, logins fail), `restored` resumes them; `purged` drops
+//!   them with the engine database (`drop_database`), and the purge deletes their
+//!   `database_roles` rows with the others. A copy or a branch gets no app role: the engine copy
+//!   makes none and keeps no grant of one, and the copy's rows are the seven roles of step 2.
 //!
 //! Status texts are fixed texts of this file: never an engine message, never a value
 //! (decision 0004-8).
@@ -571,6 +576,35 @@ impl Inner {
             .await
     }
 
+    /// Suspends (`trashed`) or resumes (`restored`) every app role of the database of a node
+    /// (card D-5), from the engine's own list. A node without a database is no error.
+    async fn app_roles_follow_trash(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+        trashed: bool,
+    ) -> Result<()> {
+        let Some(row) = self.deps.store.get(tenant, node).await? else {
+            return Ok(());
+        };
+        let engine = self.engine(row.engine)?;
+        let roles = match engine.app_roles(&row.database_ref()).await {
+            Ok(roles) => roles,
+            Err(EngineError::NotFound) => return Ok(()),
+            Err(e) => return Err(engine_error(e)),
+        };
+        for role in roles {
+            let r = role.role_ref().map_err(engine_error)?;
+            let done = if trashed {
+                engine.suspend_app_role(&r).await
+            } else {
+                engine.resume_app_role(&r).await
+            };
+            done.map_err(engine_error)?;
+        }
+        Ok(())
+    }
+
     /// Drops the database of a node: the engine database first, then the rows and the key.
     async fn drop_node(&self, tenant: TenantId, node: NodeId) -> Result<()> {
         if let Some(row) = self.deps.store.get(tenant, node).await? {
@@ -878,6 +912,9 @@ impl Provider for DatabaseProvider {
             }
             HookKind::Trashed | HookKind::Restored => {
                 if let Some(node) = hook.node_id {
+                    self.inner
+                        .app_roles_follow_trash(tenant, node, hook.hook == HookKind::Trashed)
+                        .await?;
                     self.inner
                         .trash_state(tenant, node, hook.hook == HookKind::Trashed)
                         .await?;
@@ -1385,6 +1422,76 @@ mod tests {
         assert_eq!(db.manifest_version_id, restored.value.id);
         assert_eq!(db.manifest["data_classes"]["main.people.email"], "personal");
         assert_eq!(db.status.state, ProviderState::Ready);
+    }
+
+    /// App roles (card D-5): `trashed` suspends them, `restored` resumes them, a copy gets none,
+    /// `purged` drops them with the database.
+    #[tokio::test]
+    async fn app_roles_follow_trash_restore_copy_and_purge() {
+        let w = world().await;
+        let a = ctx(w.team.id, w.alice);
+        let id = garden(&w, w.folder, "With an app").await;
+        let row = w
+            .handles
+            .databases
+            .get(w.team.id, id)
+            .await
+            .unwrap()
+            .unwrap();
+        let engine = w.s.database_engines.get(row.engine).unwrap().clone();
+        let db = row.database_ref();
+        let role = engine
+            .create_app_role(&db, RoleKind::AppWrite, uuid::Uuid::now_v7())
+            .await
+            .unwrap();
+        let suspended = |roles: Vec<ruum_dbengine::AppRole>| roles[0].suspended;
+        w.s.nodes.trash(&a, w.folder, None).await.unwrap();
+        deliver(&w.s).await;
+        assert!(suspended(engine.app_roles(&db).await.unwrap()));
+        w.s.nodes
+            .restore(&a, w.folder, RestoreRequest::default())
+            .await
+            .unwrap();
+        deliver(&w.s).await;
+        assert!(!suspended(engine.app_roles(&db).await.unwrap()));
+        // A copy gets no app role.
+        let copy =
+            w.s.nodes
+                .copy(&a, id, copy_to(w.folder))
+                .await
+                .unwrap()
+                .value;
+        deliver(&w.s).await;
+        assert_eq!(
+            settled(&w.s, &a, copy.id).await.status.state,
+            ProviderState::Ready
+        );
+        let copy_row = w
+            .handles
+            .databases
+            .get(w.team.id, copy.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            engine
+                .app_roles(&copy_row.database_ref())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            engine.app_roles(&db).await.unwrap()[0].role_name,
+            role.role_name
+        );
+        // Purge: the engine database goes with its app roles.
+        w.s.nodes.trash(&a, id, None).await.unwrap();
+        w.s.nodes.purge(&a, id).await.unwrap();
+        deliver(&w.s).await;
+        assert!(matches!(
+            engine.app_roles(&db).await,
+            Err(EngineError::NotFound)
+        ));
     }
 
     /// `trashed` suspends, `restored` serves again, `purged` drops the database, its key and

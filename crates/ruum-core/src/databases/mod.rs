@@ -34,6 +34,7 @@
 //! `access` (A-1).
 
 pub mod access;
+pub mod app_roles;
 pub mod backups;
 pub mod branches;
 pub mod classes;
