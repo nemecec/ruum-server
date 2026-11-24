@@ -33,6 +33,7 @@ conformance_cases!(
     export,
     tenant_code,
     app_roles,
+    app_access,
 );
 
 #[tokio::test]

@@ -232,6 +232,7 @@ pub async fn run_all(engine: &dyn DatabaseEngine) {
     export(engine).await;
     tenant_code(engine).await;
     app_roles(engine).await;
+    app_access(engine).await;
 }
 
 /// A new database has neutral names, one role per kind, and an empty catalog.
@@ -1542,4 +1543,72 @@ pub async fn app_roles(engine: &dyn DatabaseEngine) {
     for created in [copy, restored] {
         engine.drop_database(&created.database).await.unwrap();
     }
+}
+
+/// A database in the trash suspends its apps (card D-5, review 3): every app role is
+/// suspended, a role made afterwards is made suspended, no role gets a password or is resumed
+/// alone; a copy does not inherit it; the restore resumes them all. Both calls are idempotent.
+pub async fn app_access(engine: &dyn DatabaseEngine) {
+    let f = Fixture::new(engine).await;
+    let db = f.db();
+    let early = engine
+        .create_app_role(db, RoleKind::AppRead, Uuid::now_v7())
+        .await
+        .unwrap();
+    engine.suspend_app_access(db).await.unwrap();
+    engine.suspend_app_access(db).await.unwrap();
+    let late = engine
+        .create_app_role(db, RoleKind::AppWrite, Uuid::now_v7())
+        .await
+        .unwrap();
+    assert!(late.suspended, "a role made in the trash is suspended");
+    let listed = engine.app_roles(db).await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().all(|r| r.suspended));
+    for role in [&early, &late] {
+        let r = role.role_ref().unwrap();
+        match engine.app_credentials(&r, Duration::from_secs(60)).await {
+            Err(EngineError::PermissionDenied(m)) => assert_eq!(m, "app_role_suspended"),
+            other => panic!("a password in the trash: {:?}", other.map(|_| ())),
+        }
+        assert!(matches!(
+            engine.resume_app_role(&r).await,
+            Err(EngineError::PermissionDenied(_))
+        ));
+    }
+    // A copy of a database in the trash does not inherit it.
+    let copy = engine
+        .copy_database(
+            db,
+            &f.key,
+            &new_database(db.tenant_id),
+            &CopyData::Full,
+            &f.key,
+        )
+        .await
+        .unwrap();
+    let in_copy = engine
+        .create_app_role(&copy.database, RoleKind::AppRead, Uuid::now_v7())
+        .await
+        .unwrap();
+    assert!(!in_copy.suspended);
+    engine.resume_app_access(db).await.unwrap();
+    engine.resume_app_access(db).await.unwrap();
+    assert!(
+        engine
+            .app_roles(db)
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| !r.suspended)
+    );
+    match engine
+        .app_credentials(&early.role_ref().unwrap(), Duration::from_secs(60))
+        .await
+    {
+        Ok(_) | Err(EngineError::Unsupported(_)) => {}
+        Err(e) => panic!("app_credentials after the restore: {e}"),
+    }
+    engine.drop_database(&copy.database).await.unwrap();
+    engine.drop_database(db).await.unwrap();
 }

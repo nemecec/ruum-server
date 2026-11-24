@@ -268,6 +268,10 @@ pub(crate) async fn revoke_old_rights(
            from pg_catalog.pg_namespace n, pg_catalog.aclexplode(n.nspacl) a, old o
           where a.grantee = o.oid
          union
+         select pg_catalog.format('revoke all on large object %s from %I cascade', l.oid, o.rolname)
+           from pg_catalog.pg_largeobject_metadata l, pg_catalog.aclexplode(l.lomacl) a, old o
+          where a.grantee = o.oid
+         union
          select pg_catalog.format('revoke all on type %s from %I cascade', t.oid::pg_catalog.regtype, o.rolname)
            from pg_catalog.pg_type t, pg_catalog.aclexplode(t.typacl) a, old o
           where a.grantee = o.oid
@@ -425,16 +429,19 @@ async fn hand_over(
             ),
         )
         .await?;
-        revoke_old_rights(&mut conn, old).await?;
         // Copies never carry app grants (card D-5): every other role that the copy depends on
-        // (the source's app roles, any role a grant of the source named) leaves it too.
+        // (the source's app roles, any role a grant of the source named) leaves it, with what
+        // it owns (to the new owner). Before the old roles' rights: a default privilege that an
+        // app role made for itself may name an old role, and only a holder of the app role's
+        // privileges may change it.
         let keep: Vec<String> = old
             .iter()
             .chain(new_roles)
             .map(|r| r.role_name.clone())
             .collect();
         let foreign = app_roles::foreign_roles(&mut conn, &keep).await?;
-        app_roles::strip_in_tx(&mut conn, None, &foreign).await?;
+        app_roles::strip_in_tx(&mut conn, &new_owner, true, &foreign).await?;
+        revoke_old_rights(&mut conn, old).await?;
         let left = leftover_dependencies(&mut conn, old).await?;
         if left > 0 {
             return Err(EngineError::Internal(format!(
@@ -442,6 +449,7 @@ async fn hand_over(
             )));
         }
         setup::write_meta(&mut conn, new.tenant_id, new.node_id, new_roles).await?;
+        app_roles::forget_access(&mut conn).await?;
         let mask = ident(&new_mask);
         run(
             &mut conn,
@@ -1715,12 +1723,14 @@ pub(crate) async fn restore_in_place(
     let _ops = state.ops.lock().await;
     let points = restore_points(engine, &state.name).await?;
     let snapshot = find_point(&points, at)?;
-    // The app roles of now stay (card D-5), not those of the restore point.
-    let apps = {
+    // The app roles of now stay (card D-5), not those of the restore point, and so does the
+    // flag of a database in the trash.
+    let (apps, apps_suspended) = {
         let mut conn = engine.dbhost(&state.name).await?;
         let rows = app_roles::read_rows(&mut conn).await;
+        let suspended = app_roles::access_suspended(&mut conn).await;
         let _ = conn.close().await;
-        rows?
+        (rows?, suspended?)
     };
     let fresh = neutral_name("d_");
     setup::create_closed_database(engine, &fresh, Some(&snapshot), true).await?;
@@ -1763,9 +1773,12 @@ pub(crate) async fn restore_in_place(
                 .chain(apps.iter().map(|r| r.role_name.clone()))
                 .collect();
             let foreign = app_roles::foreign_roles(&mut conn, &keep).await?;
-            app_roles::strip_in_tx(&mut conn, Some(state.meta.role(RoleKind::Owner)), &foreign)
+            app_roles::strip_in_tx(&mut conn, state.meta.role(RoleKind::Owner), false, &foreign)
                 .await?;
             app_roles::write_rows(&mut conn, &apps).await?;
+            if apps_suspended || app_roles::access_suspended(&mut conn).await? {
+                app_roles::write_access(&mut conn, apps_suspended).await?;
+            }
             run(&mut conn, "commit", "commit".to_string()).await
         }
         .await;
@@ -1812,7 +1825,7 @@ pub(crate) async fn restore_in_place(
     drop(guard);
     drop_snapshot(engine, &old).await;
     opened?;
-    app_roles::regrant_all(engine, &state).await;
+    app_roles::regrant_all_held(engine, &state).await;
     Ok(())
 }
 
@@ -1827,16 +1840,10 @@ pub(crate) async fn drop_database(
         return Err(EngineError::NotFound);
     }
     let points = restore_points(engine, &state.name).await?;
-    // Its app roles go with it (card D-5); the drain ends their sessions.
-    let apps: Vec<EngineRole> = app_roles::names(engine, &state.name)
-        .await
-        .into_iter()
-        .map(|role_name| EngineRole {
-            kind: RoleKind::AppRead,
-            binding: None,
-            role_name,
-        })
-        .collect();
+    // Its app roles go with it (card D-5): no login from now on, their sessions end, and after
+    // the database they leave every other database that names them.
+    let apps = app_roles::names(engine, &state.name).await;
+    app_roles::refuse_logins(engine, &apps).await?;
     let guard = drain(engine, &state).await?;
     state.dropped.store(true, Ordering::SeqCst);
     engine.forget(&state.name);
@@ -1860,7 +1867,7 @@ pub(crate) async fn drop_database(
     for (_, _, snapshot) in points {
         drop_snapshot(engine, &snapshot).await;
     }
-    let apps_dropped = setup::drop_roles(engine, &apps).await;
+    let apps_dropped = app_roles::drop_orphans(engine, &apps).await;
     setup::drop_roles(engine, &state.meta.roles).await?;
     apps_dropped
 }

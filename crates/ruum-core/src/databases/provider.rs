@@ -576,8 +576,9 @@ impl Inner {
             .await
     }
 
-    /// Suspends (`trashed`) or resumes (`restored`) every app role of the database of a node
-    /// (card D-5), from the engine's own list. A node without a database is no error.
+    /// Suspends (`trashed`) or resumes (`restored`) the apps of the database of a node (card
+    /// D-5). The engine keeps the state with the database, so an app role made while it is in
+    /// the trash is made suspended and gets no password. A node without a database is no error.
     async fn app_roles_follow_trash(
         &self,
         tenant: TenantId,
@@ -588,21 +589,16 @@ impl Inner {
             return Ok(());
         };
         let engine = self.engine(row.engine)?;
-        let roles = match engine.app_roles(&row.database_ref()).await {
-            Ok(roles) => roles,
-            Err(EngineError::NotFound) => return Ok(()),
-            Err(e) => return Err(engine_error(e)),
+        let db = row.database_ref();
+        let done = if trashed {
+            engine.suspend_app_access(&db).await
+        } else {
+            engine.resume_app_access(&db).await
         };
-        for role in roles {
-            let r = role.role_ref().map_err(engine_error)?;
-            let done = if trashed {
-                engine.suspend_app_role(&r).await
-            } else {
-                engine.resume_app_role(&r).await
-            };
-            done.map_err(engine_error)?;
+        match done {
+            Ok(()) | Err(EngineError::NotFound) => Ok(()),
+            Err(e) => Err(engine_error(e)),
         }
-        Ok(())
     }
 
     /// Drops the database of a node: the engine database first, then the rows and the key.
@@ -1444,16 +1440,34 @@ mod tests {
             .create_app_role(&db, RoleKind::AppWrite, uuid::Uuid::now_v7())
             .await
             .unwrap();
-        let suspended = |roles: Vec<ruum_dbengine::AppRole>| roles[0].suspended;
+        let suspended = |roles: Vec<ruum_dbengine::AppRole>| roles.iter().all(|r| r.suspended);
         w.s.nodes.trash(&a, w.folder, None).await.unwrap();
         deliver(&w.s).await;
+        assert!(suspended(engine.app_roles(&db).await.unwrap()));
+        // A role made while the database is in the trash is suspended too (review D-5 3).
+        let late = engine
+            .create_app_role(&db, RoleKind::AppRead, uuid::Uuid::now_v7())
+            .await
+            .unwrap();
+        assert!(late.suspended);
         assert!(suspended(engine.app_roles(&db).await.unwrap()));
         w.s.nodes
             .restore(&a, w.folder, RestoreRequest::default())
             .await
             .unwrap();
         deliver(&w.s).await;
-        assert!(!suspended(engine.app_roles(&db).await.unwrap()));
+        assert!(
+            engine
+                .app_roles(&db)
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| !r.suspended)
+        );
+        engine
+            .drop_app_role(&late.role_ref().unwrap())
+            .await
+            .unwrap();
         // A copy gets no app role.
         let copy =
             w.s.nodes

@@ -217,8 +217,19 @@ pub trait DatabaseEngine: Send + Sync {
     /// trash).
     async fn suspend_app_role(&self, role: &RoleRef) -> Result<(), EngineError>;
 
-    /// The app role may log in again (its database left the trash).
+    /// The app role may log in again. Refused ([`EngineError::PermissionDenied`]) while the
+    /// apps of its database are suspended ([`DatabaseEngine::suspend_app_access`]).
     async fn resume_app_role(&self, role: &RoleRef) -> Result<(), EngineError>;
+
+    /// The apps of the database are suspended (it is in the trash): every app role may not log
+    /// in, its sessions end, and the call fails while one still runs. The engine keeps this
+    /// with the database, so an app role made afterwards is made suspended, and no password is
+    /// issued ([`EngineError::PermissionDenied`] `app_role_suspended`) until
+    /// [`DatabaseEngine::resume_app_access`]. A copy does not inherit it.
+    async fn suspend_app_access(&self, db: &DatabaseRef) -> Result<(), EngineError>;
+
+    /// The apps of the database may log in again (it left the trash).
+    async fn resume_app_access(&self, db: &DatabaseRef) -> Result<(), EngineError>;
 
     /// Ends the sessions of the app role, takes back its grants and drops it. A role that does
     /// not exist is not an error.

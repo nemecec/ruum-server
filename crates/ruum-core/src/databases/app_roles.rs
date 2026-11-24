@@ -24,13 +24,26 @@
 //! beyond). With the engine's connection limit per role (5 on Postgres) a tenant holds at most
 //! 100 connections of the data cluster, and the engine refuses any app role over the cluster's
 //! app budget (half of `max_connections` by default), so app roles are refused before the
-//! platform's own roles run out of connections.
+//! platform's own roles run out of connections. The bound protects the platform, not the other
+//! tenants: 100 connections may be all of the app budget (100 on a cluster with
+//! `max_connections` 200), so one tenant can leave no room for another tenant's new binding
+//! (backlog D5-10, a per-tenant share of the budget).
+//!
+//! **The kinds table is the minimum the engine grants.** The tenant's own `owner` (its
+//! migrations) may give its app roles more in its own database: a `GRANT` to the role or to
+//! `PUBLIC`, a `SECURITY DEFINER` function that `PUBLIC` may run (new functions are executable
+//! by `PUBLIC` by default). The engine only adds its grants again; it does not take such rights
+//! back (backlog D5-11). No right reaches another tenant's database.
 //!
 //! **The contract with B-1d.** `binding_id` is opaque here: this module does not read
 //! `app_bindings`. B-1d checks that the binding belongs to an app of the same tenant, that the
 //! deployer holds the role the binding asks for, and that the database is not in the trash
 //! before it calls [`AppRoles::ensure_binding_role`]. The database lifecycle (trash suspends,
-//! restore resumes, purge drops, copies get none) is in `provider.rs` and the engine.
+//! restore resumes, purge drops, copies get none) is in `provider.rs` and the engine. The
+//! engine keeps "in the trash" with the database, so a role made after the trash hook (an
+//! `ensure` that raced it) is made suspended and gets no password. `issue_credentials` answers
+//! `unavailable` (`temp_file_limit_not_enforced`) while the data cluster cannot limit an app's
+//! temporary files: B-1d hands out no credentials before backlog D5-3 lands.
 
 use super::{DatabaseStore, Engines};
 use crate::error::{ApiError, Error, ErrorCode, Result};
@@ -356,6 +369,13 @@ fn engine_problem(e: EngineError) -> Error {
         EngineError::PermissionDenied(m) if m == "app_role_suspended" => Error::api(
             ErrorCode::Conflict,
             "the database is in the trash; restore it first",
+        ),
+        EngineError::PermissionDenied(m) if m == "temp_file_limit_not_enforced" => Error::Api(
+            ApiError::new(
+                ErrorCode::Unavailable,
+                "the data cluster cannot limit the temporary files of an app yet",
+            )
+            .with_hint("temp_file_limit_not_enforced"),
         ),
         EngineError::Unsupported(_) => Error::api(
             ErrorCode::NotImplemented,
