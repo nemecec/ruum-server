@@ -4,7 +4,7 @@
 # shellcheck disable=SC2016,SC2034,SC2154
 #
 # Checks the data cluster postgres-data (docs/STEP2.md "Infrastructure work" 1 and 2, decision
-# 0004-34 d and g, card I-1). It prints PASS or FAIL per check and exits non-zero on a failure.
+# 0004-34 d and g, card I-1; the app roles of card D-5). It prints PASS or FAIL per check and exits non-zero on a failure.
 #
 #   scripts/dbhost_check.sh
 #
@@ -345,6 +345,38 @@ err "(masked_write) that grant is useless without USAGE on public" A_masked_writ
 err "(owner) cannot ALTER the default privileges of mask" A_owner "$DBA" "alter default privileges for role $ROLE_A_mask grant select on tables to $ROLE_A_masked_write" 'permission denied|must be member'
 err "(owner) cannot GRANT another role to itself" A_owner "$DBA" "grant $ROLE_A_mask to $ROLE_A_owner" 'permission denied|must have admin option'
 err "(B owner) cannot read database A" B_owner "$DBA" "select * from public.t" 'permission denied for database|not have CONNECT'
+
+echo "== app roles of a binding (card D-5): LOGIN with a short-lived password, own database only"
+# As the engine does (crates/ruum-dbengine/src/postgres/app_roles.rs): an app_read role of
+# database A with a connection limit, CONNECT on A, USAGE on public, SELECT on its table.
+ROLE_A_app="r_$(hex16)"
+PW_A_app=$(newpw)
+if as dbhost "$ADMIN_DB" "create role $ROLE_A_app login noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls connection limit 5 password '$PW_A_app' valid until '$VALID_UNTIL'"; then
+  MADE_ROLES="$MADE_ROLES $ROLE_A_app"
+else fail "ruum_dbhost creates an app role"; fi
+as dbhost "$ADMIN_DB" "grant connect on database $DBA to $ROLE_A_app" || fail "grant connect to the app role"
+ok "ruum_dbhost: a ruum_mask schema with a pseudonym function in database A" dbhost "$DBA" "
+  create schema ruum_mask; revoke all on schema ruum_mask from public;
+  create function ruum_mask.pseudonym(v text) returns text language sql as 'select ''p_'' || md5(v)';
+  grant usage on schema public to $ROLE_A_app"
+ok "(owner) grants SELECT on its table to the app role" A_owner "$DBA" "grant select on t to $ROLE_A_app"
+ok "(app_read) reads its own table" A_app "$DBA" "select v from public.t" 'row of A'
+err "(app_read) cannot write" A_app "$DBA" "insert into public.t values ('x')" 'permission denied for table t'
+err "(app_read) cannot connect to database B" A_app "$DBB" "select 1" 'permission denied for database|not have CONNECT'
+err "(app_read) cannot connect to postgres" A_app postgres "select 1" 'permission denied for database|not have CONNECT'
+err "(app_read) cannot connect to template1" A_app template1 "select 1" 'permission denied for database|not have CONNECT'
+err "(app_read) cannot call ruum_mask.pseudonym" A_app "$DBA" "select ruum_mask.pseudonym('alice')" 'permission denied for schema ruum_mask'
+same "(app_read) SET ROLE <owner>" A_app "$DBA" "set role $ROLE_A_owner; select current_user"
+same "(app_read) SET ROLE ruum_dbhost" A_app "$DBA" "set role ruum_dbhost; select current_user"
+err "(app_read) cannot CREATE TABLE" A_app "$DBA" "create table public.mine (i int)" 'permission denied for schema public'
+err "(app_read) cannot make a TEMP table" A_app "$DBA" "create temp table mine (i int)" 'permission denied to create temporary tables'
+SHORT_UNTIL=""
+as dbhost "$ADMIN_DB" "select to_char((now() + interval '2 seconds') at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00'" && SHORT_UNTIL=$OUT
+PW_A_app=$(newpw)
+as dbhost "$ADMIN_DB" "alter role $ROLE_A_app password '$PW_A_app' valid until '$SHORT_UNTIL'" || fail "a short-lived password for the app role"
+ok "(app_read) logs in before VALID UNTIL" A_app "$DBA" "select 1" 1
+sleep 3
+err "(app_read) a login after VALID UNTIL fails" A_app "$DBA" "select 1" 'password authentication failed'
 
 echo "== result: $PASS passed, $FAIL failed"
 printf '%s' "$FAILED"
