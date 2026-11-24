@@ -218,6 +218,25 @@ async fn app_role_grants_follow_the_kinds_table() {
         assert_eq!(refused(&mut r, sql).await, "42501", "{sql}");
         assert_eq!(refused(&mut w, sql).await, "42501", "{sql}");
     }
+    // No right in a Ruum schema and no CREATE anywhere (not only a refused function call).
+    for conn in [&mut r, &mut w] {
+        assert_eq!(
+            ok(
+                conn,
+                "SELECT has_schema_privilege('public', 'USAGE'), \
+                 has_schema_privilege('extensions', 'USAGE'), \
+                 has_schema_privilege('public', 'CREATE'), \
+                 has_schema_privilege('ruum_mask', 'USAGE'), \
+                 has_schema_privilege('ruum_meta', 'USAGE'), \
+                 has_schema_privilege('ruum_masked', 'USAGE'), \
+                 has_schema_privilege('ruum_nosecret', 'USAGE'), \
+                 has_database_privilege(current_database(), 'CREATE'), \
+                 has_database_privilege(current_database(), 'TEMPORARY')"
+            )
+            .await,
+            "t|t|f|f|f|f|f|f|f"
+        );
+    }
     // pg_roles: no power, no membership, the connection limit and the role settings.
     for role in [&read, &write] {
         let mut admin = engine.admin().await.unwrap();
@@ -258,6 +277,13 @@ async fn app_role_connects_only_to_its_own_database() {
         .await
         .unwrap();
     let role = app_role(&a, RoleKind::AppWrite, Uuid::now_v7()).await;
+    // The other databases have app roles of their own, so a CONNECT given to PUBLIC on them
+    // would show here.
+    app_role(&b, RoleKind::AppRead, Uuid::now_v7()).await;
+    engine
+        .create_app_role(&same_tenant.database, RoleKind::AppRead, Uuid::now_v7())
+        .await
+        .unwrap();
     let c = creds(&engine, &role, Duration::from_secs(300)).await;
     let mut own = login(&engine, &c, None).await.expect("own database");
     assert_eq!(ok(&mut own, "SELECT count(*) FROM notes").await, "2");
