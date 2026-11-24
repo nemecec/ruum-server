@@ -5,8 +5,8 @@
 # address of staging: ConfigMap ruum/ruum-egress-deny, k8s/apply.sh). Network policy: only pods of
 # ruum-apps reach it; it reaches DNS and public addresses on 443, never a private range.
 # The control listener is a Unix socket in the pod (an emptyDir): no network reaches it. The
-# runtime driver that registers app networks over it does not exist on Kubernetes yet (backlog
-# I6-1), so every connection gets deny=unknown_source until then: it fails closed.
+# Kubernetes runtime driver (backlog I6-1) cannot reach it yet (backlog I6-2), so no sandbox is
+# registered and every connection gets deny=unknown_source: it fails closed.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

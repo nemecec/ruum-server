@@ -95,7 +95,8 @@ metadata:
 ---
 # App sandboxes (card I-6): pods of the runtime class gvisor only (charts/platform networkpolicies:
 # no ingress but from the app gateway, no egress but to the egress proxy). Restricted like the
-# rest. Nothing runs here until a Kubernetes runtime driver exists (backlog I6-1).
+# rest. ruum-server's runtime driver makes the pods (backlog I6-1); apps-admission.yaml refuses
+# any pod here without gVisor (backlog S-83).
 apiVersion: v1
 kind: Namespace
 metadata:

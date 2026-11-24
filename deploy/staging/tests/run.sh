@@ -872,6 +872,21 @@ if has helm; then
   [[ "$(grep -cE '^  namespace: edge$' "$TMP/edge-rbac.yaml")" == 3 ]] && ok "the edge's ServiceAccount, Role and RoleBinding are in edge" || bad "edge-rbac.yaml objects outside the edge namespace"
   [[ "$(grep -E 'resources: \[' "$TMP/edge-rbac.yaml" | tr -d ' ' | sort | tr '\n' ' ')" == "resources:[leases] resources:[secrets] " ]] &&
     ok "the edge may touch only Secrets and Leases" || bad "the edge Role names other resources: $(grep -E 'resources:' "$TMP/edge-rbac.yaml" | tr '\n' ' ')"
+  # The runtime driver's rights (I6-1): its Role in ruum-apps only, exactly these rules (the
+  # driver's tests read the same file and the fake API server refuses everything else).
+  awk '/^# Source: [a-z-]*\/templates\/runtime-rbac.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/platform.yaml" >"$TMP/runtime-rbac.yaml"
+  want_rules='  - { apiGroups: [""], resources: [pods], verbs: [create, get, list, delete] }
+  - { apiGroups: [""], resources: [pods/log], verbs: [get] }
+  - { apiGroups: [""], resources: [configmaps], verbs: [create, get, list, update, delete] }
+  - { apiGroups: [""], resources: [secrets], verbs: [create, patch, delete] }'
+  [[ "$(grep -E '^  - \{ apiGroups' "$TMP/runtime-rbac.yaml")" == "$want_rules" ]] &&
+    ok "the runtime driver may make pods, records and Secrets of sandboxes, and read no Secret" || bad "the runtime driver's Role differs: $(grep -E 'apiGroups' "$TMP/runtime-rbac.yaml" | tr '\n' ' ')"
+  grep -qE 'kind: Cluster(Role|RoleBinding)' "$TMP/runtime-rbac.yaml" && bad "the runtime driver gets cluster-wide rights" || ok "the runtime driver's rights are namespaced"
+  [[ "$(grep -cE '^  namespace: ruum-apps$' "$TMP/runtime-rbac.yaml")" == 2 && "$(grep -cE '^  namespace: ruum$' "$TMP/runtime-rbac.yaml")" == 1 ]] &&
+    ok "its Role and RoleBinding are in ruum-apps, its ServiceAccount in ruum" || bad "runtime-rbac.yaml objects in other namespaces"
+  awk 'BEGIN{RS="---"} /kind: RoleBinding\n/' "$TMP/runtime-rbac.yaml" | grep -qE '^    name: ruum-server$' &&
+    ok "the Role is bound to ruum/ruum-server only" || bad "the runtime driver's RoleBinding has another subject"
+  grep -qxF 'automountServiceAccountToken: false' "$TMP/runtime-rbac.yaml" && ok "the ServiceAccount mounts no token by default" || bad "the ServiceAccount ruum-server mounts a token in every pod"
   awk '/^  name: pg-clients$/ {on=1} on && /^---/ {exit} on' "$TMP/platform.yaml" | grep -qF "matchLabels: { app: ruum-migrate }" &&
     ok "the network policy lets the migration Job reach Postgres" || bad "the migration Job cannot reach Postgres (pg-clients)"
   # Backlog O-34: the deploy controller runs the migration Job, the deployer does not.
@@ -1051,6 +1066,19 @@ YAML
     awk -v kind="kind: $2" -v name="  name: $3" 'function out() { if (index(doc, "\n" kind "\n") && index(doc, "\n" name "\n")) printf "%s", doc; doc = "\n" }
       BEGIN { doc = "\n" } /^---/ { out(); next } { doc = doc $0 "\n" } END { out() }' "$1"
   }
+  # The Kubernetes runtime driver (I6-1): with the app runtime only, its account and token.
+  doc_of "$TMP/ruum-apps.yaml" Deployment ruum-server >"$TMP/srv-apps.yaml"
+  grep -qF 'serviceAccountName: ruum-server' "$TMP/srv-apps.yaml" && grep -qF '{ name: RUUM_RUNTIME_DRIVER, value: kubernetes }' "$TMP/srv-apps.yaml" &&
+    grep -qF 'serviceAccountToken: { path: token, expirationSeconds: 3600 }' "$TMP/srv-apps.yaml" && grep -qF 'automountServiceAccountToken: false' "$TMP/srv-apps.yaml" &&
+    ok "with the app runtime the server runs the Kubernetes driver with a projected token only" || bad "the server has no Kubernetes driver, or its token is not the projected one"
+  grep -qF 'name: RUUM_REGISTRY' "$TMP/srv-apps.yaml" && bad "a registry is set although none is given" || ok "no registry unless one is given (app images fail closed)"
+  grep -qF 'RUUM_RUNTIME_DRIVER' "$TMP/ruum.yaml" && bad "the Kubernetes driver renders without the app runtime" || ok "without the app runtime no Kubernetes driver"
+  expect 0 "the server env with the app runtime is what the server reads" bash "$HERE/server-env.sh" "$TMP/ruum-apps.yaml"
+  expect 0 "render charts/ruum with a registry" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.registry=registry.ruum-apps.svc:5000
+  grep -qF '{ name: RUUM_REGISTRY, value: "registry.ruum-apps.svc:5000" }' "$TMP/out" && ok "the registry reaches the server" || bad "runtime.registry is not RUUM_REGISTRY"
+  expect 1 "charts/ruum refuses a registry that is not host:port" helm template ruum "$STG/charts/ruum" "${A[@]}" --set 'runtime.registry=http://x/y'
+  expect 0 "render charts/ruum with the driver off" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.kubernetes=false
+  grep -qF 'RUUM_RUNTIME_DRIVER' "$TMP/out" && bad "runtime.kubernetes=false still renders the driver" || ok "runtime.kubernetes=false keeps the in-memory driver"
   doc_of "$TMP/ruum-apps.yaml" Deployment ruum-gateway >"$TMP/gw.yaml"
   doc_of "$TMP/ruum-apps.yaml" Deployment ruum-egress >"$TMP/eg.yaml"
   [[ -s "$TMP/gw.yaml" && -s "$TMP/eg.yaml" ]] && ok "the gateway and the egress proxy are Deployments in ruum" || bad "no ruum-gateway or ruum-egress Deployment"
@@ -1655,6 +1683,12 @@ D=system:serviceaccount:ruum:deployer K=system:serviceaccount:ruum-deploy:deploy
 printf '%s\n' "$D ruum-deploy create configmaps -" "$D ruum get configmaps/ruum-release -" \
   "$K ruum create jobs.batch -" "$K ruum update leases.coordination.k8s.io/ruum-deploy -" "$K ruum patch deployments.apps -" \
   "$K edge patch daemonsets.apps -" "$K data create backups.postgresql.cnpg.io -" "$K ruum-deploy update configmaps -" >"$FA/allow"
+# The runtime driver's Role in ruum-apps (I6-1, charts/platform runtime-rbac.yaml).
+R=system:serviceaccount:ruum:ruum-server
+for verb in create get list delete; do echo "$R ruum-apps $verb pods -" >>"$FA/allow"; done
+echo "$R ruum-apps get pods log" >>"$FA/allow"
+for verb in create get list update delete; do echo "$R ruum-apps $verb configmaps -" >>"$FA/allow"; done
+for verb in create patch delete; do echo "$R ruum-apps $verb secrets -" >>"$FA/allow"; done
 O=system:serviceaccount:ruum:observer
 for ns in ruum edge ruum-deploy; do
   for resource in pods events events.events.k8s.io deployments.apps daemonsets.apps replicasets.apps jobs.batch; do
@@ -1708,6 +1742,11 @@ livecheck() (
     FAKE_QUERIES="$FA/queries" PATH="$FA/bin:$PATH" FAKE_ALLOW="$1" bash "$STG/ops/rbac-check.sh" live
 )
 expect 0 "the live check passes when the deployer may only write release requests" livecheck "$FA/allow"
+cp "$FA/allow" "$FA/allow-runtime-secrets"
+echo "$R ruum-apps get secrets -" >>"$FA/allow-runtime-secrets"
+expect 1 "the live check fails when the runtime driver may read Secrets" livecheck "$FA/allow-runtime-secrets"
+grep -v "^$R ruum-apps create pods -$" "$FA/allow" >"$FA/allow-runtime-nopods"
+expect 1 "the live check fails when the runtime driver cannot make pods" livecheck "$FA/allow-runtime-nopods"
 # Every namespace and a no-namespace review must be requested for both accounts.
 for identity in "$O" "$D"; do
   for ns in ruum edge ruum-deploy data auth new-tenant -; do
@@ -2064,6 +2103,18 @@ grep -qx 'handler: runsc' "$rc" && grep -qx '  name: gvisor' "$rc" && ok "the ru
 gl="$(grep -nF 'ops/gvisor-check.sh" --class-only' "$STG/k8s/apply.sh" | cut -d: -f1)" rl="$(grep -nF 'manifests/runtimeclass.yaml' "$STG/k8s/apply.sh" | cut -d: -f1)"
 [[ -n "$gl" && -n "$rl" && "$gl" -lt "$rl" ]] && ok "apply.sh applies the runtime class only after every node runs the gVisor extension" || bad "apply.sh applies the runtime class before the extension check"
 awk '/^  name: ruum-apps$/ {on=1} on && /enforce: restricted/ {print; exit}' "$STG/k8s/manifests/namespaces.yaml" | grep -q . && ok "ruum-apps is a restricted namespace" || bad "ruum-apps is not restricted"
+# Backlog S-83: ruum-apps admits only gVisor pods without a token; the control pod is elsewhere.
+va="$STG/k8s/manifests/apps-admission.yaml"
+grep -qF "object.spec.runtimeClassName == 'gvisor'" "$va" && grep -qF 'object.spec.automountServiceAccountToken == false' "$va" &&
+  [[ "$(grep -cF 'kubernetes.io/metadata.name: ruum-apps' "$va")" == 2 ]] && grep -qF 'validationActions: [Deny]' "$va" && grep -qF 'failurePolicy: Fail' "$va" &&
+  ok "the admission policy of ruum-apps refuses a pod without gVisor or with a token (fails closed)" || bad "apps-admission.yaml"
+al="$(grep -nF 'manifests/apps-admission.yaml' "$STG/k8s/apply.sh" | cut -d: -f1)" sl="$(grep -nF 'log "secrets, one per consumer"' "$STG/k8s/apply.sh" | cut -d: -f1)"
+[[ -n "$al" && -n "$rl" && -n "$sl" && "$rl" -lt "$al" && "$al" -lt "$sl" ]] && ok "apply.sh applies the admission policy after the runtime class, before anything else" || bad "apply.sh does not apply apps-admission.yaml in its place"
+gc="$STG/ops/gvisor-check.sh"
+grep -qx 'CONTROL_NS=ops' "$gc" && grep -qF '[[ -n "$class" ]] || ns="$CONTROL_NS"' "$gc" && ok "the control pod without gVisor runs in ops, not in ruum-apps" || bad "gvisor-check.sh runs its control pod in ruum-apps"
+grep -qF 'kubectl create --dry-run=server' "$gc" && grep -qF 'the positive' "$gc" && ok "gvisor-check.sh proves the admission rule live, with a positive control" || bad "gvisor-check.sh does not check the admission rule"
+grep -qF 'want no "$r" "$APPS_NS" "$verb" secrets' "$STG/ops/rbac-check.sh" && grep -qF 'want yes "$r" "$APPS_NS" get pods log' "$STG/ops/rbac-check.sh" &&
+  ok "rbac-check.sh live checks the runtime driver's rights" || bad "rbac-check.sh does not check the runtime driver"
 for i in ruum-gateway ruum-egress; do
   [[ "$(grep -cE "^ +- \{ image: $i, file: " "$ROOT/.github/workflows/images.yml")" == 2 ]] && ok "images.yml builds, scans and attests $i" || bad "images.yml does not publish $i"
 done
@@ -2195,7 +2246,7 @@ grep -qF 'for role in ruum ruum_app ruum_gateway zitadel spicedb; do' "$ap" && o
 bash -n "$STG/ops/gvisor-check.sh" && grep -qF 'the check proves nothing on this node' "$STG/ops/gvisor-check.sh" &&
   ok "gvisor-check.sh needs a control pod that sees the node's kernel (no pass on silence)" || bad "gvisor-check.sh"
 sa="$STG/ops/smoke-apps.sh"
-bash -n "$sa" && grep -qF 'BLOCKED' "$sa" && ok "smoke-apps.sh reports the node22 check as blocked until a Kubernetes runtime driver exists" || bad "smoke-apps.sh"
+bash -n "$sa" && grep -qF 'BLOCKED' "$sa" && grep -qF 'runtime_not_ready' "$sa" && ok "smoke-apps.sh reports the node22 check as blocked until node22 apps can be deployed on staging" || bad "smoke-apps.sh"
 if [[ $have_docker == 1 ]]; then
   gg="$STG/k8s/sql/ruum-gateway-grants.sql"
   pgc="ruum-stg-gw-grants-$$"
