@@ -43,7 +43,10 @@ fn applied_already() -> Error {
 
 /// The migration locks of the memory store: one async mutex per database.
 #[derive(Default)]
-pub(crate) struct MemoryLocks(Mutex<HashMap<(TenantId, NodeId), Arc<tokio::sync::Mutex<()>>>>);
+pub(crate) struct MemoryLocks(Mutex<HashMap<(TenantId, NodeId), DatabaseLock>>);
+
+/// The lock of one database in [`MemoryLocks`].
+type DatabaseLock = Arc<tokio::sync::Mutex<()>>;
 
 struct MemoryLock(#[allow(dead_code)] tokio::sync::OwnedMutexGuard<()>);
 
@@ -194,7 +197,7 @@ pub(crate) fn mem_list(
         .filter(|m| after.is_none_or(|(at, id)| (m.at, m.id) < (at, id)))
         .cloned()
         .collect();
-    items.sort_by(|a, b| (b.at, b.id).cmp(&(a.at, a.id)));
+    items.sort_by_key(|m| std::cmp::Reverse((m.at, m.id)));
     let limit = page.limit() as usize;
     items.truncate(limit + 1);
     Ok(page_of(node, items, limit))
