@@ -67,7 +67,7 @@ pub trait DatabaseEngine: Send + Sync {
         key: &PseudonymKey,
     ) -> Result<CreatedDatabase, EngineError>;
 
-    /// Drops the database and its roles. Its restore points go with it.
+    /// Drops the database and its roles, its app roles too. Its restore points go with it.
     async fn drop_database(&self, db: &DatabaseRef) -> Result<(), EngineError>;
 
     /// The schema of the database, without the Ruum objects.
@@ -179,4 +179,48 @@ pub trait DatabaseEngine: Send + Sync {
     /// Exports the content of the database: no Ruum schema, no role, no grant, no key
     /// (decision 0004-29).
     async fn export(&self, db: &DatabaseRef, format: ExportFormat) -> Result<Export, EngineError>;
+
+    // ------------------------------------------------------------------ app roles (card D-5)
+    //
+    // The role of an app binding (`app_read`, `app_write`; decisions 0004-14 and 0004-32): one
+    // LOGIN role per (database, kind, binding), lens `base`, `CONNECT` on its own database only,
+    // no right in the Ruum schemas (no `ruum_mask`, decision 0006-3), never a member of a role.
+    // The engine keeps its own list of them with the database (Postgres: `ruum_meta.roles`), so
+    // trash, restore, purge and copies find them without the platform's rows. A copy never
+    // carries them: `copy_database`, `restore_into_new` and a restore point make no app role and
+    // keep no grant of one. Every method is idempotent.
+
+    /// Makes the app role of `binding` with `kind` (an app kind; else
+    /// [`EngineError::InvalidRole`]), or returns the one that exists. Its grants: `SELECT` on the
+    /// tables, views and sequences of the database's own schema (`app_write` also `INSERT`,
+    /// `UPDATE`, `DELETE`), for later tables too.
+    async fn create_app_role(
+        &self,
+        db: &DatabaseRef,
+        kind: RoleKind,
+        binding: uuid::Uuid,
+    ) -> Result<AppRole, EngineError>;
+
+    /// The app roles of a database.
+    async fn app_roles(&self, db: &DatabaseRef) -> Result<Vec<AppRole>, EngineError>;
+
+    /// A new random password for the app role `role` (a [`RoleRef::app`]), valid for
+    /// `valid_for`; the old password stops working. The memory engine answers
+    /// [`EngineError::Unsupported`]: an app has no network path to it.
+    async fn app_credentials(
+        &self,
+        role: &RoleRef,
+        valid_for: std::time::Duration,
+    ) -> Result<AppCredentials, EngineError>;
+
+    /// The app role may not log in any more, and its sessions end (its database is in the
+    /// trash).
+    async fn suspend_app_role(&self, role: &RoleRef) -> Result<(), EngineError>;
+
+    /// The app role may log in again (its database left the trash).
+    async fn resume_app_role(&self, role: &RoleRef) -> Result<(), EngineError>;
+
+    /// Ends the sessions of the app role, takes back its grants and drops it. A role that does
+    /// not exist is not an error.
+    async fn drop_app_role(&self, role: &RoleRef) -> Result<(), EngineError>;
 }

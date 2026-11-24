@@ -54,11 +54,118 @@ pub struct EngineRole {
     pub role_name: String,
 }
 
-/// A database the engine made, with its roles (one per kind of [`RoleKind::ALL`]).
+/// A database the engine made, with its roles (one per kind of [`RoleKind::ALL`]; never an app
+/// role).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedDatabase {
     pub database: DatabaseRef,
     pub roles: Vec<EngineRole>,
+}
+
+// ---------------------------------------------------------------------------------- app roles
+
+/// The role of one app binding on one database (card D-5; decisions 0004-14 and 0004-32): kind
+/// `app_read` or `app_write`, a neutral name (`r_` + 16 random hex; never derived from the
+/// binding, the app or the tenant).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppRole {
+    pub database: DatabaseRef,
+    pub kind: RoleKind,
+    pub binding: Uuid,
+    pub role_name: String,
+    /// The role may not log in (`NOLOGIN`): its database is in the trash
+    /// (`suspend_app_role`).
+    pub suspended: bool,
+}
+
+impl AppRole {
+    /// The role reference of this role (`RoleRef::app`).
+    pub fn role_ref(&self) -> Result<crate::RoleRef, EngineError> {
+        crate::RoleRef::app(self.database.clone(), self.kind, self.binding)
+    }
+}
+
+/// A short-lived password of an app role and where the app connects (`app_credentials`).
+///
+/// `Debug` and `Display` never show the password; only [`AppCredentials::expose_password`] and
+/// [`AppCredentials::expose_url`] hand it out, for the one place that gives it to the app
+/// (`RUUM_BINDING_<NAME>`, card B-1d). Nobody logs, journals or audits it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AppCredentials {
+    /// The role name (`r_` + 16 hex).
+    pub role_name: String,
+    /// The database name (`d_` + 16 hex).
+    pub database: String,
+    /// The host of the data cluster as the engine reaches it (the pooler replaces it with card
+    /// I-4).
+    pub host: String,
+    pub port: u16,
+    /// When the password stops working (`VALID UNTIL`).
+    pub valid_until: OffsetDateTime,
+    password: String,
+}
+
+impl AppCredentials {
+    pub fn new(
+        role_name: String,
+        database: String,
+        host: String,
+        port: u16,
+        valid_until: OffsetDateTime,
+        password: String,
+    ) -> AppCredentials {
+        AppCredentials {
+            role_name,
+            database,
+            host,
+            port,
+            valid_until,
+            password,
+        }
+    }
+
+    /// The password. Only for the hand-over to the app; never log it.
+    pub fn expose_password(&self) -> &str {
+        &self.password
+    }
+
+    /// `postgres://role:password@host:port/database`: the connection URL of the app. Only for
+    /// the hand-over to the app; never log it. The names are neutral and the password is hex,
+    /// so no part needs escaping.
+    pub fn expose_url(&self) -> String {
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        format!(
+            "postgres://{}:{}@{}:{}/{}",
+            self.role_name, self.password, host, self.port, self.database
+        )
+    }
+}
+
+impl std::fmt::Debug for AppCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppCredentials")
+            .field("role_name", &self.role_name)
+            .field("database", &self.database)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("valid_until", &self.valid_until)
+            .field("password", &"<hidden>")
+            .finish()
+    }
+}
+
+impl std::fmt::Display for AppCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}@{}:{}/{} (valid until {})",
+            self.role_name, self.host, self.port, self.database, self.valid_until
+        )
+    }
 }
 
 // ------------------------------------------------------------------------------------ catalog

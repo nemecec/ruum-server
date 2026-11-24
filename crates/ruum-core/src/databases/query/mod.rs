@@ -1319,6 +1319,9 @@ pub fn lens_of(kind: RoleKind) -> postgres_mask::Lens {
         RoleKind::Owner | RoleKind::SecretRead | RoleKind::Mask => postgres_mask::Lens::Base,
         RoleKind::Read | RoleKind::Write => postgres_mask::Lens::NoSecret,
         RoleKind::MaskedRead | RoleKind::MaskedWrite => postgres_mask::Lens::Masked,
+        // The app kinds of a binding (card D-5) read the base tables; the query API never runs
+        // as them (the engine refuses an app role on a platform path).
+        RoleKind::AppRead | RoleKind::AppWrite => postgres_mask::Lens::Base,
     }
 }
 

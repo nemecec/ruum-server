@@ -6,6 +6,7 @@
 //! have random names, so several runs can share one cluster.
 
 mod allow_list;
+mod app_roles;
 mod hostile_copy;
 mod lens_rebuild;
 
@@ -33,6 +34,9 @@ pub(super) async fn engine_with(tune: impl FnOnce(&mut PostgresConfig)) -> Optio
         eprintln!("skipped: RUUM_DBHOST_URL is not set");
         return None;
     };
+    // The test databases are never dropped, and their app roles (card D-5) stay in the shared
+    // cluster: the tests do not count against the app connection budget (one test sets it).
+    config.app_connection_budget = Some(1_000_000);
     tune(&mut config);
     match PostgresEngine::connect(config).await {
         Ok(e) => Some(e),
@@ -77,6 +81,7 @@ conformance_cases!(
     restore_point,
     export,
     tenant_code,
+    app_roles,
 );
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

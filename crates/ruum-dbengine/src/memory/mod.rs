@@ -6,6 +6,11 @@
 //! table (the stand-in of the Ruum objects); the kinds differ only in their rights (read-only,
 //! writes, schema changes). Restore points are SQL dumps in memory.
 //!
+//! App roles (card D-5) are bookkeeping only: the roles per database, kind and binding, and
+//! whether they are suspended. An app has no network path to a memory database, so
+//! `app_credentials` answers [`EngineError::Unsupported`]. A copy and a restore into a new
+//! database get no app role; a restore in place keeps them.
+//!
 //! Masking is not here. The memory engine has no lens: a `masked_read` or `masked_write`
 //! session reads the real values, and a masked copy is [`EngineError::Unsupported`]. No card of
 //! step 2 owns a memory lens yet (card Q-3 fills the lens of the SQLite engine, `sqlite/lens.rs`,
@@ -61,9 +66,42 @@ struct MemDb {
     connection_key: Option<PseudonymKey>,
     points: Vec<(RestorePointMark, String)>,
     lens: Vec<LensEvent>,
+    /// The app roles (card D-5).
+    app_roles: Vec<MemAppRole>,
     /// Set by `drop_database` under the lock. A call that got the handle before the drop and
     /// waited on the lock finds the database gone.
     dropped: bool,
+}
+
+#[derive(Clone)]
+struct MemAppRole {
+    kind: RoleKind,
+    binding: Uuid,
+    role_name: String,
+    suspended: bool,
+}
+
+impl MemAppRole {
+    fn public(&self, db: &DatabaseRef) -> AppRole {
+        AppRole {
+            database: db.clone(),
+            kind: self.kind,
+            binding: self.binding,
+            role_name: self.role_name.clone(),
+            suspended: self.suspended,
+        }
+    }
+}
+
+/// The app role of `role` (an app kind with a binding), or `InvalidRole`.
+fn app_key(role: &RoleRef) -> Result<(RoleKind, Uuid), EngineError> {
+    match role.binding() {
+        Some(b) if role.kind().is_app() => Ok((role.kind(), b)),
+        _ => Err(EngineError::InvalidRole(format!(
+            "{} is not an app role",
+            role.kind().as_str()
+        ))),
+    }
 }
 
 struct Entry {
@@ -170,6 +208,7 @@ impl MemoryEngine {
                 connection_key: None,
                 points: Vec::new(),
                 lens: Vec::new(),
+                app_roles: Vec::new(),
                 dropped: false,
             })
         })
@@ -300,6 +339,7 @@ impl DatabaseEngine for MemoryEngine {
         key: &PseudonymKey,
         request: &StatementRequest,
     ) -> Result<StatementOutcome, EngineError> {
+        role.require_platform()?;
         let kind = role.kind();
         let key = key.clone();
         let request = request.clone();
@@ -457,5 +497,95 @@ impl DatabaseEngine for MemoryEngine {
             content_type: "application/sql",
             body: Box::pin(futures::stream::iter([chunk])),
         })
+    }
+
+    async fn create_app_role(
+        &self,
+        db: &DatabaseRef,
+        kind: RoleKind,
+        binding: Uuid,
+    ) -> Result<AppRole, EngineError> {
+        if !kind.is_app() {
+            return Err(EngineError::InvalidRole(format!(
+                "{} is not an app kind",
+                kind.as_str()
+            )));
+        }
+        let mut held = self.lock(db).await?;
+        if let Some(r) = held
+            .app_roles
+            .iter()
+            .find(|r| r.kind == kind && r.binding == binding)
+        {
+            return Ok(r.public(db));
+        }
+        let role = MemAppRole {
+            kind,
+            binding,
+            role_name: neutral_name("r_"),
+            suspended: false,
+        };
+        held.app_roles.push(role.clone());
+        Ok(role.public(db))
+    }
+
+    async fn app_roles(&self, db: &DatabaseRef) -> Result<Vec<AppRole>, EngineError> {
+        let held = self.lock(db).await?;
+        Ok(held.app_roles.iter().map(|r| r.public(db)).collect())
+    }
+
+    async fn app_credentials(
+        &self,
+        role: &RoleRef,
+        _valid_for: std::time::Duration,
+    ) -> Result<AppCredentials, EngineError> {
+        let (kind, binding) = app_key(role)?;
+        let held = self.lock(role.database()).await?;
+        if !held
+            .app_roles
+            .iter()
+            .any(|r| r.kind == kind && r.binding == binding)
+        {
+            return Err(EngineError::InvalidRole("no such app role".to_string()));
+        }
+        Err(EngineError::Unsupported(
+            "the memory engine has no network path for an app; app credentials need the \
+             Postgres engine"
+                .to_string(),
+        ))
+    }
+
+    async fn suspend_app_role(&self, role: &RoleRef) -> Result<(), EngineError> {
+        let (kind, binding) = app_key(role)?;
+        let mut held = self.lock(role.database()).await?;
+        for r in held
+            .app_roles
+            .iter_mut()
+            .filter(|r| r.kind == kind && r.binding == binding)
+        {
+            r.suspended = true;
+        }
+        Ok(())
+    }
+
+    async fn resume_app_role(&self, role: &RoleRef) -> Result<(), EngineError> {
+        let (kind, binding) = app_key(role)?;
+        let mut held = self.lock(role.database()).await?;
+        for r in held
+            .app_roles
+            .iter_mut()
+            .filter(|r| r.kind == kind && r.binding == binding)
+        {
+            r.suspended = false;
+        }
+        Ok(())
+    }
+
+    async fn drop_app_role(&self, role: &RoleRef) -> Result<(), EngineError> {
+        let (kind, binding) = app_key(role)?;
+        let mut held = self.lock(role.database()).await?;
+        held.app_roles
+            .retain(|r| !(r.kind == kind && r.binding == binding));
+        Ok(())
     }
 }

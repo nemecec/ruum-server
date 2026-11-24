@@ -37,6 +37,7 @@
 //! database.
 
 use super::allow;
+use super::app_roles;
 use super::errors::{internal, sqlstate};
 use super::lens::{self, ident};
 use super::setup::{self, run};
@@ -52,10 +53,13 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tokio::sync::RwLockWriteGuard;
 
-/// Cancels (or ends) every session of the database's roles, from a session of each role.
+/// Cancels (or ends) every session of the database's roles, from a session of each role. The
+/// sessions of its app roles (`apps`, card D-5) are signalled with the app roles' privileges
+/// ([`app_roles::signal`]): an app role is never logged in as by the platform.
 async fn signal_sessions(
     engine: &PostgresEngine,
     state: &DbState,
+    apps: &[String],
     terminate: bool,
 ) -> Result<usize, EngineError> {
     let rows = {
@@ -76,10 +80,15 @@ async fn signal_sessions(
     } else {
         "pg_catalog.pg_cancel_backend"
     };
+    let mut app_users = Vec::new();
     for row in rows {
         let user: Option<String> = row.get(0);
         let pids: Vec<i32> = row.get(1);
         let Some(user) = user else { continue };
+        if apps.contains(&user) {
+            app_users.push(user);
+            continue;
+        }
         let sql = format!("select {func}(p) from pg_catalog.unnest($1::int4[]) p");
         if user == "ruum_dbhost" {
             let mut admin = engine.admin().await?;
@@ -109,6 +118,7 @@ async fn signal_sessions(
         let _ = conn.close().await;
         signalled += pids.len();
     }
+    signalled += app_roles::signal(engine, &app_users, Some(&state.name), terminate).await?;
     Ok(signalled)
 }
 
@@ -127,7 +137,7 @@ async fn session_count(engine: &PostgresEngine, name: &str) -> Result<i64, Engin
     Ok(row.get(0))
 }
 
-async fn set_allow_connections(
+pub(crate) async fn set_allow_connections(
     engine: &PostgresEngine,
     name: &str,
     allow: bool,
@@ -147,6 +157,8 @@ pub(crate) async fn drain<'a>(
     engine: &PostgresEngine,
     state: &'a DbState,
 ) -> Result<RwLockWriteGuard<'a, ()>, EngineError> {
+    // The app roles of the database (card D-5): their sessions end with the drain too.
+    let apps = app_roles::names(engine, &state.name).await;
     let waiting = state.gate.write();
     tokio::pin!(waiting);
     // New requests wait from now on (the write lock is queued). Close what is idle.
@@ -160,11 +172,11 @@ pub(crate) async fn drain<'a>(
             Ok(g) => g,
             Err(_) => {
                 // Cancel the running statements, then end the sessions that are left.
-                signal_sessions(engine, state, false).await?;
+                signal_sessions(engine, state, &apps, false).await?;
                 match tokio::time::timeout(Duration::from_secs(1), &mut waiting).await {
                     Ok(g) => g,
                     Err(_) => {
-                        signal_sessions(engine, state, true).await?;
+                        signal_sessions(engine, state, &apps, true).await?;
                         tokio::time::timeout(Duration::from_secs(30), &mut waiting)
                             .await
                             .map_err(|_| {
@@ -189,7 +201,7 @@ pub(crate) async fn drain<'a>(
                 "the database still has sessions after the drain".to_string(),
             ));
         }
-        signal_sessions(engine, state, true).await?;
+        signal_sessions(engine, state, &apps, true).await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     set_allow_connections(engine, &state.name, false).await?;
@@ -225,7 +237,10 @@ async fn membership(
 
 /// Revokes every right of the old roles in the copy (in the caller's transaction, with
 /// `ruum_dbhost` holding the privileges of the new owner).
-async fn revoke_old_rights(conn: &mut PgConnection, old: &[EngineRole]) -> Result<(), EngineError> {
+pub(crate) async fn revoke_old_rights(
+    conn: &mut PgConnection,
+    old: &[EngineRole],
+) -> Result<(), EngineError> {
     let names: Vec<String> = old.iter().map(|r| r.role_name.clone()).collect();
     let statements = sqlx::query(
         "with old as (select oid, rolname from pg_catalog.pg_roles where rolname = any($1::text[]))
@@ -282,7 +297,7 @@ async fn revoke_old_rights(conn: &mut PgConnection, old: &[EngineRole]) -> Resul
 }
 
 /// Whether anything in the current database still depends on one of `roles`.
-async fn leftover_dependencies(
+pub(crate) async fn leftover_dependencies(
     conn: &mut PgConnection,
     roles: &[EngineRole],
 ) -> Result<i64, EngineError> {
@@ -387,7 +402,9 @@ async fn hand_over(
         _ => key,
     };
     setup::create_roles(engine, new_roles).await?;
-    // 1. ruum_dbhost takes the objects over. The memberships last for this step only.
+    // 1. ruum_dbhost takes the objects over. The memberships last for this step only; no other
+    // step of the engine changes ruum_dbhost's memberships meanwhile.
+    let membership_held = engine.membership.lock().await;
     membership(engine, &old_owner, &new_owner, true).await?;
     // `ruum_dbhost` needs SET on the old mask: it has it (decision 0004-34 a).
     let mut conn = engine.dbhost(name).await?;
@@ -409,6 +426,15 @@ async fn hand_over(
         )
         .await?;
         revoke_old_rights(&mut conn, old).await?;
+        // Copies never carry app grants (card D-5): every other role that the copy depends on
+        // (the source's app roles, any role a grant of the source named) leaves it too.
+        let keep: Vec<String> = old
+            .iter()
+            .chain(new_roles)
+            .map(|r| r.role_name.clone())
+            .collect();
+        let foreign = app_roles::foreign_roles(&mut conn, &keep).await?;
+        app_roles::strip_in_tx(&mut conn, None, &foreign).await?;
         let left = leftover_dependencies(&mut conn, old).await?;
         if left > 0 {
             return Err(EngineError::Internal(format!(
@@ -440,6 +466,7 @@ async fn hand_over(
     .await;
     let _ = conn.close().await;
     let revoked = membership(engine, &old_owner, &new_owner, false).await;
+    drop(membership_held);
     result?;
     revoked?;
     // 2. The copy's owner empties or masks its tables, in a session of its own.
@@ -1492,7 +1519,7 @@ fn finish(
 }
 
 /// The restore points of a database: (at, lsn, snapshot).
-async fn restore_points(
+pub(crate) async fn restore_points(
     engine: &PostgresEngine,
     name: &str,
 ) -> Result<Vec<(OffsetDateTime, Option<String>, String)>, EngineError> {
@@ -1688,10 +1715,18 @@ pub(crate) async fn restore_in_place(
     let _ops = state.ops.lock().await;
     let points = restore_points(engine, &state.name).await?;
     let snapshot = find_point(&points, at)?;
+    // The app roles of now stay (card D-5), not those of the restore point.
+    let apps = {
+        let mut conn = engine.dbhost(&state.name).await?;
+        let rows = app_roles::read_rows(&mut conn).await;
+        let _ = conn.close().await;
+        rows?
+    };
     let fresh = neutral_name("d_");
     setup::create_closed_database(engine, &fresh, Some(&snapshot), true).await?;
     let prepared = async {
         let mut conn = engine.dbhost(&fresh).await?;
+        let membership = engine.membership.lock().await;
         let r = async {
             run(&mut conn, "begin", "begin".to_string()).await?;
             run(
@@ -1716,9 +1751,25 @@ pub(crate) async fn restore_in_place(
             // The snapshot holds the objects of mask as they were then (also from before a
             // fix, review-masking-2 F-1): make them again, with the key, and build the lens.
             setup::rebuild_lens(&mut conn, &state.meta.roles, key).await?;
+            // The restore point holds the grants of the app roles of its time. Those that are
+            // gone since were taken out of it when they were dropped (`app_roles::drop_role`);
+            // any other role leaves, and the app roles of now get their grants again after the
+            // swap.
+            let keep: Vec<String> = state
+                .meta
+                .roles
+                .iter()
+                .map(|r| r.role_name.clone())
+                .chain(apps.iter().map(|r| r.role_name.clone()))
+                .collect();
+            let foreign = app_roles::foreign_roles(&mut conn, &keep).await?;
+            app_roles::strip_in_tx(&mut conn, Some(state.meta.role(RoleKind::Owner)), &foreign)
+                .await?;
+            app_roles::write_rows(&mut conn, &apps).await?;
             run(&mut conn, "commit", "commit".to_string()).await
         }
         .await;
+        drop(membership);
         let _ = conn.close().await;
         r?;
         set_allow_connections(engine, &fresh, false).await
@@ -1754,12 +1805,15 @@ pub(crate) async fn restore_in_place(
     }
     let opened = async {
         setup::grant_connect(engine, &state.name, &state.meta.roles).await?;
+        app_roles::grant_connect(engine, &state.name, &apps).await?;
         resume(engine, &state.name).await
     }
     .await;
     drop(guard);
     drop_snapshot(engine, &old).await;
-    opened
+    opened?;
+    app_roles::regrant_all(engine, &state).await;
+    Ok(())
 }
 
 /// `drop_database`: the drain, the snapshots, the database, its roles.
@@ -1773,6 +1827,16 @@ pub(crate) async fn drop_database(
         return Err(EngineError::NotFound);
     }
     let points = restore_points(engine, &state.name).await?;
+    // Its app roles go with it (card D-5); the drain ends their sessions.
+    let apps: Vec<EngineRole> = app_roles::names(engine, &state.name)
+        .await
+        .into_iter()
+        .map(|role_name| EngineRole {
+            kind: RoleKind::AppRead,
+            binding: None,
+            role_name,
+        })
+        .collect();
     let guard = drain(engine, &state).await?;
     state.dropped.store(true, Ordering::SeqCst);
     engine.forget(&state.name);
@@ -1796,5 +1860,7 @@ pub(crate) async fn drop_database(
     for (_, _, snapshot) in points {
         drop_snapshot(engine, &snapshot).await;
     }
-    setup::drop_roles(engine, &state.meta.roles).await
+    let apps_dropped = setup::drop_roles(engine, &apps).await;
+    setup::drop_roles(engine, &state.meta.roles).await?;
+    apps_dropped
 }

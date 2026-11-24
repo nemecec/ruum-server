@@ -23,6 +23,7 @@
 //!   of such an export into a new database.
 
 mod allow;
+mod app_roles;
 mod catalog;
 mod copy;
 mod depends;
@@ -78,6 +79,18 @@ pub struct PostgresConfig {
     pub connection_lifetime: Duration,
     /// The most connections of one role at a time.
     pub max_connections_per_role: usize,
+    /// The connection limit of each app role (`CONNECTION LIMIT`, card D-5).
+    pub app_connection_limit: u32,
+    /// The most connections that all app roles of the cluster may have together (the sum of
+    /// their limits); `None`: half of the cluster's `max_connections`. A new app role over it is
+    /// refused (`permission denied: app_connection_budget`).
+    pub app_connection_budget: Option<u32>,
+    /// The role setting `statement_timeout` of an app role (a default the app may change).
+    pub app_statement_timeout: Duration,
+    /// The role setting `idle_in_transaction_session_timeout` of an app role.
+    pub app_idle_in_transaction_timeout: Duration,
+    /// The role setting `temp_file_limit` of an app role, in kB (a superuser setting).
+    pub app_temp_file_limit_kb: u64,
 }
 
 impl std::fmt::Debug for PostgresConfig {
@@ -101,6 +114,11 @@ impl PostgresConfig {
             password_validity: Duration::from_secs(15 * 60),
             connection_lifetime: Duration::from_secs(10 * 60),
             max_connections_per_role: 8,
+            app_connection_limit: 5,
+            app_connection_budget: None,
+            app_statement_timeout: Duration::from_secs(30),
+            app_idle_in_transaction_timeout: Duration::from_secs(60),
+            app_temp_file_limit_kb: 1024 * 1024,
         }
     }
 
@@ -211,6 +229,10 @@ impl DbState {
 
     /// The pool of a role of this database.
     pub fn pool(&self, kind: RoleKind, binding: Option<Uuid>, max: usize) -> Arc<RolePool> {
+        assert!(
+            !kind.is_app() && binding.is_none(),
+            "the platform never pools an app role"
+        );
         let mut pools = self.pools.lock();
         pools
             .entry((kind, binding))
@@ -229,6 +251,9 @@ pub struct PostgresEngine {
     admin: PgPool,
     dbs: crate::lock::Mutex<HashMap<String, Arc<DbState>>>,
     hook: Option<Hook>,
+    /// Held while a step changes `ruum_dbhost`'s memberships (the hand-over of a copy, the end
+    /// of an app role), so no step takes back a membership that another one still needs.
+    pub(crate) membership: tokio::sync::Mutex<()>,
     /// Tests only: let transaction control past the splitter, to show the second line.
     #[cfg(test)]
     pub(crate) allow_transaction_control: AtomicBool,
@@ -271,6 +296,7 @@ impl PostgresEngine {
             admin,
             dbs: Default::default(),
             hook: None,
+            membership: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             allow_transaction_control: AtomicBool::new(false),
             #[cfg(test)]
@@ -458,7 +484,16 @@ impl DatabaseEngine for PostgresEngine {
         request: &MigrationRequest,
         sync: &dyn CatalogSync,
     ) -> Result<MigrationOutcome, EngineError> {
-        session::apply_migration(self, db, request, sync).await
+        let out = session::apply_migration(self, db, request, sync).await;
+        // A committed `up` may have made or changed tables: the app roles get their grants
+        // again (card D-5).
+        if !request.dry_run
+            && matches!(&out, Ok(_) | Err(EngineError::CatalogSync(_)))
+            && let Ok(state) = self.resolve(db).await
+        {
+            app_roles::regrant_all(self, &state).await;
+        }
+        out
     }
 
     async fn sync_lens(
@@ -473,6 +508,9 @@ impl DatabaseEngine for PostgresEngine {
         let _lens = state.lens.write().await;
         let catalog = setup::sync_and_rebuild(self, &state, sync, false).await?;
         state.lens_down.store(false, Ordering::SeqCst);
+        drop(_lens);
+        drop(_ops);
+        app_roles::regrant_all(self, &state).await;
         Ok(catalog)
     }
 
@@ -515,5 +553,38 @@ impl DatabaseEngine for PostgresEngine {
 
     async fn export(&self, db: &DatabaseRef, format: ExportFormat) -> Result<Export, EngineError> {
         export::export(self, db, format).await
+    }
+
+    async fn create_app_role(
+        &self,
+        db: &DatabaseRef,
+        kind: RoleKind,
+        binding: Uuid,
+    ) -> Result<AppRole, EngineError> {
+        app_roles::create(self, db, kind, binding).await
+    }
+
+    async fn app_roles(&self, db: &DatabaseRef) -> Result<Vec<AppRole>, EngineError> {
+        app_roles::list(self, db).await
+    }
+
+    async fn app_credentials(
+        &self,
+        role: &RoleRef,
+        valid_for: Duration,
+    ) -> Result<AppCredentials, EngineError> {
+        app_roles::credentials(self, role, valid_for).await
+    }
+
+    async fn suspend_app_role(&self, role: &RoleRef) -> Result<(), EngineError> {
+        app_roles::set_login(self, role, false).await
+    }
+
+    async fn resume_app_role(&self, role: &RoleRef) -> Result<(), EngineError> {
+        app_roles::set_login(self, role, true).await
+    }
+
+    async fn drop_app_role(&self, role: &RoleRef) -> Result<(), EngineError> {
+        app_roles::drop_role(self, role).await
     }
 }

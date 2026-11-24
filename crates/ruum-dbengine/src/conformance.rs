@@ -231,6 +231,7 @@ pub async fn run_all(engine: &dyn DatabaseEngine) {
     restore_point(engine).await;
     export(engine).await;
     tenant_code(engine).await;
+    app_roles(engine).await;
 }
 
 /// A new database has neutral names, one role per kind, and an empty catalog.
@@ -1316,4 +1317,229 @@ pub async fn tenant_code(engine: &dyn DatabaseEngine) {
         engine.tenant_code_on_live(f.db()).await.unwrap(),
         "an engine with a lens finds the tenant's trigger (it must not keep the trait's default)"
     );
+}
+
+/// The app roles of a binding (card D-5; decisions 0004-14 and 0004-32): one role per
+/// (database, kind, binding), with a neutral name, made again on a second call; never made by
+/// `create_database` or a copy; suspended, resumed and dropped (idempotent); gone with the
+/// database; refused on the platform's paths. `app_credentials` gives a password that no
+/// `Debug` or `Display` output shows, or `Unsupported` on an engine without a network path.
+pub async fn app_roles(engine: &dyn DatabaseEngine) {
+    let f = Fixture::new(engine).await;
+    let other = Fixture::new(engine).await;
+    f.seed_users().await;
+    let db = f.db();
+    assert!(
+        f.created
+            .roles
+            .iter()
+            .all(|r| !r.kind.is_app() && r.binding.is_none()),
+        "create_database makes no app role"
+    );
+    assert!(engine.app_roles(db).await.unwrap().is_empty());
+
+    // Only the app kinds.
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    for kind in RoleKind::ALL {
+        assert!(matches!(
+            engine.create_app_role(db, kind, a).await,
+            Err(EngineError::InvalidRole(_))
+        ));
+    }
+    let read_a = engine
+        .create_app_role(db, RoleKind::AppRead, a)
+        .await
+        .unwrap();
+    assert_eq!(
+        (read_a.kind, read_a.binding, read_a.suspended),
+        (RoleKind::AppRead, a, false)
+    );
+    assert!(
+        is_neutral(&read_a.role_name, "r_"),
+        "neutral: {}",
+        read_a.role_name
+    );
+    for id in [db.tenant_id, db.node_id, a] {
+        assert!(!holds_id(&read_a.role_name, id));
+    }
+    // A second call returns the same role.
+    let again = engine
+        .create_app_role(db, RoleKind::AppRead, a)
+        .await
+        .unwrap();
+    assert_eq!(again.role_name, read_a.role_name);
+    let write_a = engine
+        .create_app_role(db, RoleKind::AppWrite, a)
+        .await
+        .unwrap();
+    let read_b = engine
+        .create_app_role(db, RoleKind::AppRead, b)
+        .await
+        .unwrap();
+    let mut names: Vec<_> = [&read_a, &write_a, &read_b]
+        .iter()
+        .map(|r| r.role_name.clone())
+        .chain(f.created.roles.iter().map(|r| r.role_name.clone()))
+        .collect();
+    names.sort();
+    names.dedup();
+    assert_eq!(
+        names.len(),
+        3 + RoleKind::ALL.len(),
+        "one role per kind and binding"
+    );
+    let mut listed = engine.app_roles(db).await.unwrap();
+    listed.sort_by(|x, y| x.role_name.cmp(&y.role_name));
+    let mut made = vec![read_a.clone(), write_a.clone(), read_b.clone()];
+    made.sort_by(|x, y| x.role_name.cmp(&y.role_name));
+    assert_eq!(listed, made);
+
+    // Another tenant's reference finds nothing.
+    let mut foreign = db.clone();
+    foreign.tenant_id = other.db().tenant_id;
+    assert!(matches!(
+        engine.create_app_role(&foreign, RoleKind::AppRead, a).await,
+        Err(EngineError::NotFound)
+    ));
+    assert!(matches!(
+        engine.app_roles(&foreign).await,
+        Err(EngineError::NotFound)
+    ));
+    assert!(other.engine.app_roles(other.db()).await.unwrap().is_empty());
+
+    // The platform never runs a statement as an app kind.
+    let role_a = read_a.role_ref().unwrap();
+    assert!(matches!(
+        engine
+            .execute(
+                &role_a,
+                &f.key,
+                &StatementRequest {
+                    sql: "SELECT 1".into(),
+                    params: vec![],
+                    mode: StatementMode::Read,
+                    timeout: Duration::from_secs(5),
+                    max_rows: 10,
+                    max_bytes: None,
+                }
+            )
+            .await,
+        Err(EngineError::InvalidRole(_))
+    ));
+    assert!(matches!(
+        RoleRef::new(db.clone(), RoleKind::AppWrite),
+        Err(EngineError::InvalidRole(_))
+    ));
+    assert!(matches!(
+        engine
+            .app_credentials(&f.role(RoleKind::Read), Duration::from_secs(60))
+            .await,
+        Err(EngineError::InvalidRole(_))
+    ));
+
+    // Credentials: a password that no Debug or Display output shows.
+    match engine
+        .app_credentials(&role_a, Duration::from_secs(60))
+        .await
+    {
+        Ok(creds) => {
+            let pw = creds.expose_password().to_string();
+            assert!(pw.len() >= 32, "at least 128 bits");
+            assert_eq!(creds.role_name, read_a.role_name);
+            assert_eq!(creds.database, db.engine_name);
+            assert!(!format!("{creds:?}").contains(&pw));
+            assert!(!format!("{creds}").contains(&pw));
+            assert!(creds.expose_url().contains(&pw));
+        }
+        Err(EngineError::Unsupported(_)) => {}
+        Err(e) => panic!("app_credentials: {e}"),
+    }
+
+    // Suspend and resume (idempotent).
+    engine.suspend_app_role(&role_a).await.unwrap();
+    engine.suspend_app_role(&role_a).await.unwrap();
+    let state = |roles: Vec<AppRole>, name: &str| {
+        roles
+            .into_iter()
+            .find(|r| r.role_name == name)
+            .map(|r| r.suspended)
+    };
+    assert_eq!(
+        state(engine.app_roles(db).await.unwrap(), &read_a.role_name),
+        Some(true)
+    );
+    assert_eq!(
+        state(engine.app_roles(db).await.unwrap(), &read_b.role_name),
+        Some(false),
+        "binding B stays"
+    );
+    engine.resume_app_role(&role_a).await.unwrap();
+    engine.resume_app_role(&role_a).await.unwrap();
+    assert_eq!(
+        state(engine.app_roles(db).await.unwrap(), &read_a.role_name),
+        Some(false)
+    );
+
+    // A copy and a restore into a new database get no app role.
+    let copy = engine
+        .copy_database(
+            db,
+            &f.key,
+            &new_database(db.tenant_id),
+            &CopyData::Full,
+            &f.key,
+        )
+        .await
+        .unwrap();
+    assert!(copy.roles.iter().all(|r| !r.kind.is_app()));
+    assert!(engine.app_roles(&copy.database).await.unwrap().is_empty());
+    assert_eq!(f.user_names(&copy.database).await, f.user_names(db).await);
+    let point = engine.create_restore_point(db).await.unwrap();
+    let restored = engine
+        .restore_into_new(db, &point, &new_database(db.tenant_id), &f.key)
+        .await
+        .unwrap();
+    assert!(
+        engine
+            .app_roles(&restored.database)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // A restore in place keeps the app roles of now.
+    engine.restore_in_place(db, &point, &f.key).await.unwrap();
+    assert_eq!(engine.app_roles(db).await.unwrap().len(), 3);
+
+    // Drop: the role goes; a second drop is no error; binding B stays.
+    engine.drop_app_role(&role_a).await.unwrap();
+    engine.drop_app_role(&role_a).await.unwrap();
+    let left: Vec<_> = engine
+        .app_roles(db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.role_name)
+        .collect();
+    assert!(!left.contains(&read_a.role_name));
+    assert!(left.contains(&read_b.role_name) && left.contains(&write_a.role_name));
+    // A made-again role of the same binding gets a new name.
+    let read_a2 = engine
+        .create_app_role(db, RoleKind::AppRead, a)
+        .await
+        .unwrap();
+    assert_ne!(read_a2.role_name, read_a.role_name);
+
+    // The database goes with its app roles.
+    engine.drop_database(db).await.unwrap();
+    assert!(matches!(
+        engine.app_roles(db).await,
+        Err(EngineError::NotFound)
+    ));
+    assert!(matches!(
+        engine.drop_app_role(&role_a).await,
+        Err(EngineError::NotFound)
+    ));
+    for created in [copy, restored] {
+        engine.drop_database(&created.database).await.unwrap();
+    }
 }
