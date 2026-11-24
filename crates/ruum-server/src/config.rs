@@ -166,6 +166,101 @@ impl WorkloadTokenSettings {
     }
 }
 
+/// The runtime driver of the sandboxes (backlog I6-1). `RUUM_RUNTIME_DRIVER`: `memory` (the
+/// default: nothing runs) or `kubernetes` (pods in gVisor; the Docker driver of the laptop is
+/// wired by card I-4). The Kubernetes settings:
+///
+/// - `RUUM_KUBE_API_URL` (default `https://kubernetes.default.svc`), `RUUM_KUBE_TOKEN_FILE`
+///   and `RUUM_KUBE_CA_FILE` (the projected token and the cluster CA);
+/// - `RUUM_KUBE_NAMESPACE` (default `ruum-apps`) and `RUUM_KUBE_RUNTIME_CLASS` (default
+///   `gvisor`);
+/// - `RUUM_REGISTRY`: the registry the nodes pull app images from (`host:port`); without it
+///   every app image is `image_not_found` (fails closed);
+/// - `RUUM_KUBE_EGRESS_PROXY`: the egress proxy's Service as `host:port` (the sandboxes' only
+///   way out); `RUUM_KUBE_EGRESS_CONTROL` and `RUUM_KUBE_EGRESS_CONTROL_TOKEN_FILE`: its control
+///   listener, where the driver registers each pod's address (backlog I6-2; without them no pod
+///   is registered and the proxy refuses every sandbox, which fails closed);
+/// - `RUUM_KUBE_SPLIT_LOG_STREAMS` (`on` or `off`, default `off`): read standard output and
+///   standard error apart (the API server's feature gate `PodLogsQuerySplitStreams`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeSettings {
+    Memory,
+    Kubernetes(Box<KubeSettings>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KubeSettings {
+    pub api_url: String,
+    pub token_file: Option<PathBuf>,
+    pub ca_file: Option<PathBuf>,
+    pub namespace: String,
+    pub runtime_class: String,
+    pub registry: Option<String>,
+    pub egress_proxy: Option<(String, u16)>,
+    pub egress_control: Option<String>,
+    pub egress_control_token_file: Option<PathBuf>,
+    pub split_log_streams: bool,
+}
+
+impl RuntimeSettings {
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self::from_lookup(var)
+    }
+
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        match get("RUUM_RUNTIME_DRIVER").as_deref() {
+            None | Some("memory") => return Ok(Self::Memory),
+            Some("kubernetes") => {}
+            Some(other) => anyhow::bail!(
+                "RUUM_RUNTIME_DRIVER must be memory or kubernetes, not {other:?} (the Docker driver is wired by card I-4)"
+            ),
+        }
+        let egress_proxy = match get("RUUM_KUBE_EGRESS_PROXY") {
+            None => None,
+            Some(v) => {
+                let (host, port) = v
+                    .rsplit_once(':')
+                    .context("RUUM_KUBE_EGRESS_PROXY must be host:port")?;
+                let port: u16 = port
+                    .parse()
+                    .context("RUUM_KUBE_EGRESS_PROXY must be host:port")?;
+                anyhow::ensure!(
+                    !host.is_empty() && port != 0,
+                    "RUUM_KUBE_EGRESS_PROXY must be host:port"
+                );
+                Some((host.to_owned(), port))
+            }
+        };
+        let egress_control = get("RUUM_KUBE_EGRESS_CONTROL");
+        let egress_control_token_file =
+            get("RUUM_KUBE_EGRESS_CONTROL_TOKEN_FILE").map(PathBuf::from);
+        anyhow::ensure!(
+            egress_control.is_some() == egress_control_token_file.is_some(),
+            "RUUM_KUBE_EGRESS_CONTROL and RUUM_KUBE_EGRESS_CONTROL_TOKEN_FILE are set together"
+        );
+        let split_log_streams = match get("RUUM_KUBE_SPLIT_LOG_STREAMS").as_deref() {
+            None | Some("off") => false,
+            Some("on") => true,
+            Some(other) => {
+                anyhow::bail!("RUUM_KUBE_SPLIT_LOG_STREAMS must be on or off, not {other:?}")
+            }
+        };
+        Ok(Self::Kubernetes(Box::new(KubeSettings {
+            api_url: get("RUUM_KUBE_API_URL")
+                .unwrap_or_else(|| "https://kubernetes.default.svc".into()),
+            token_file: get("RUUM_KUBE_TOKEN_FILE").map(PathBuf::from),
+            ca_file: get("RUUM_KUBE_CA_FILE").map(PathBuf::from),
+            namespace: get("RUUM_KUBE_NAMESPACE").unwrap_or_else(|| "ruum-apps".into()),
+            runtime_class: get("RUUM_KUBE_RUNTIME_CLASS").unwrap_or_else(|| "gvisor".into()),
+            registry: get("RUUM_REGISTRY"),
+            egress_proxy,
+            egress_control,
+            egress_control_token_file,
+            split_log_streams,
+        })))
+    }
+}
+
 /// The settings of the telemetry role (card O-1b). Each has a safe default; the role starts in
 /// the serving process only with `RUUM_TELEMETRY=on`.
 fn telemetry_settings() -> anyhow::Result<crate::telemetry::TelemetrySettings> {
@@ -210,5 +305,46 @@ mod tests {
             default_dav_url("http://127.0.0.1:8490", "127.0.0.1:8492"),
             "http://127.0.0.1:8492/"
         );
+    }
+
+    fn runtime(pairs: &[(&str, &str)]) -> anyhow::Result<RuntimeSettings> {
+        let m: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        RuntimeSettings::from_lookup(|k| m.get(k).cloned())
+    }
+
+    #[test]
+    fn the_runtime_driver_is_memory_unless_kubernetes_is_asked() {
+        assert_eq!(runtime(&[]).unwrap(), RuntimeSettings::Memory);
+        assert!(runtime(&[("RUUM_RUNTIME_DRIVER", "docker")]).is_err());
+        let RuntimeSettings::Kubernetes(k) = runtime(&[
+            ("RUUM_RUNTIME_DRIVER", "kubernetes"),
+            (
+                "RUUM_KUBE_EGRESS_PROXY",
+                "ruum-egress.ruum.svc.cluster.local:3128",
+            ),
+        ])
+        .unwrap() else {
+            panic!("not kubernetes");
+        };
+        assert_eq!(k.namespace, "ruum-apps");
+        assert_eq!(k.runtime_class, "gvisor");
+        assert_eq!(k.registry, None);
+        assert_eq!(
+            k.egress_proxy,
+            Some(("ruum-egress.ruum.svc.cluster.local".to_owned(), 3128))
+        );
+        assert!(!k.split_log_streams);
+        for bad in [
+            &[("RUUM_KUBE_EGRESS_PROXY", "no-port")][..],
+            &[("RUUM_KUBE_EGRESS_CONTROL", "unix:/run/x.sock")][..],
+            &[("RUUM_KUBE_SPLIT_LOG_STREAMS", "yes")][..],
+        ] {
+            let mut all = vec![("RUUM_RUNTIME_DRIVER", "kubernetes")];
+            all.extend_from_slice(bad);
+            assert!(runtime(&all).is_err(), "{bad:?}");
+        }
     }
 }

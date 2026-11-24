@@ -83,6 +83,20 @@ RUUM_OPENBAO_TRANSIT_MOUNT optional
 RUUM_WORKLOAD_TOKEN_KEY_FILE optional
 RUUM_WORKLOAD_JWKS_FILE optional
 
+# The runtime driver of the sandboxes (backlog I6-1; config.rs RuntimeSettings, wiring.rs).
+# memory unless RUUM_RUNTIME_DRIVER=kubernetes; charts/ruum sets them with the app runtime.
+RUUM_RUNTIME_DRIVER optional
+RUUM_KUBE_API_URL optional
+RUUM_KUBE_TOKEN_FILE optional
+RUUM_KUBE_CA_FILE optional
+RUUM_KUBE_NAMESPACE optional
+RUUM_KUBE_RUNTIME_CLASS optional
+RUUM_REGISTRY optional
+RUUM_KUBE_EGRESS_PROXY optional
+RUUM_KUBE_EGRESS_CONTROL optional
+RUUM_KUBE_EGRESS_CONTROL_TOKEN_FILE optional
+RUUM_KUBE_SPLIT_LOG_STREAMS optional
+
 # Tests only
 RUUM_DBENGINE_REQUIRE_POSTGRES test
 RUUM_SUITE_RLS test
