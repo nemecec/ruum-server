@@ -511,8 +511,53 @@ pub(crate) async fn apply_migration(
     }
 }
 
+/// The wall-clock limit of a whole migration, in statement timeouts (decision 0004-35): a
+/// migration of many statements, each under its own timeout, still ends.
+pub(crate) const MIGRATION_WALL_CLOCK_TIMEOUTS: u32 = 10;
+
+/// How long past a limit the engine waits for the server's own cancel (its
+/// `statement_timeout`) before it sends a cancel of its own and closes the connection.
+const CANCEL_GRACE: Duration = Duration::from_secs(2);
+
+/// Sets the request's `statement_timeout` and `lock_timeout` again (decision 0004-35), before
+/// each statement of `up`: a `SET LOCAL` or a `set_config` in a `DO` block of one statement
+/// does not lift the limits of the next. The server arms a statement's timer when the statement
+/// starts, so a statement cannot lift its own.
+async fn limit(conn: &mut PgConnection, timeout: Duration) -> Result<(), EngineError> {
+    let ms = timeout.as_millis().clamp(1, i32::MAX as u128);
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "set local statement_timeout = {ms}; set local lock_timeout = {ms}"
+    )))
+    .execute(&mut *conn)
+    .await
+    .map(|_| ())
+    .map_err(|e| internal("set the limits of a migration statement", e))
+}
+
+/// Cancels the running statement of the backend `pid`, from another session of the same role
+/// (the owner may signal its own role's sessions; the copy's drain does the same). Best effort:
+/// the caller closes the connection afterwards.
+async fn cancel_backend(engine: &PostgresEngine, state: &DbState, kind: RoleKind, pid: i32) {
+    let pool = engine.pool(state, kind);
+    let Ok((mut conn, _)) = pool.open(engine).await else {
+        return;
+    };
+    let _ = sqlx::query("select pg_catalog.pg_cancel_backend($1)")
+        .persistent(false)
+        .bind(pid)
+        .execute(&mut conn)
+        .await;
+    let _ = sqlx::Connection::close(conn).await;
+}
+
 /// Runs `up` as `owner` in one transaction; returns the catalog it left (read inside the
 /// transaction). Rolls back on any failure and for a dry run.
+///
+/// Limits (decision 0004-35): each statement runs with `statement_timeout` and `lock_timeout`
+/// set again to the request's timeout or to what is left of the migration's wall clock
+/// ([`MIGRATION_WALL_CLOCK_TIMEOUTS`] timeouts), whichever is less. A statement that runs past
+/// that by [`CANCEL_GRACE`] (the server did not cancel it) is cancelled by the engine with a
+/// cancel request, and the connection is closed: `Timeout`.
 async fn run_up(
     engine: &PostgresEngine,
     state: &DbState,
@@ -524,6 +569,10 @@ async fn run_up(
     }
     let pool = engine.pool(state, RoleKind::Owner);
     let mut lease = pool.acquire(engine).await?;
+    let deadline = tokio::time::Instant::now()
+        + request
+            .timeout
+            .saturating_mul(MIGRATION_WALL_CLOCK_TIMEOUTS);
     let (marker, session_user, current_user) =
         match begin(lease.conn(), false, request.timeout).await {
             Ok(v) => v,
@@ -535,18 +584,47 @@ async fn run_up(
     let users = (session_user, current_user);
     let mut failure = None;
     for stmt in &statements {
-        call_hook(engine, state, &lease, RoleKind::Owner, &users, stmt);
-        let ran = sqlx::query(sqlx::AssertSqlSafe(stmt.to_string()))
-            .persistent(false)
-            .execute(lease.conn())
-            .await;
-        if let Err(e) = ran {
-            failure = Some(errors::untrusted(e));
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            failure = Some(EngineError::Timeout);
             break;
+        }
+        if let Err(e) = limit(lease.conn(), request.timeout.min(left)).await {
+            failure = Some(e);
+            break;
+        }
+        call_hook(engine, state, &lease, RoleKind::Owner, &users, stmt);
+        let ran = tokio::time::timeout(
+            request.timeout.min(left) + CANCEL_GRACE,
+            sqlx::query(sqlx::AssertSqlSafe(stmt.to_string()))
+                .persistent(false)
+                .execute(lease.conn()),
+        )
+        .await;
+        match ran {
+            Err(_) => {
+                cancel_backend(engine, state, RoleKind::Owner, lease.backend_pid).await;
+                failure = Some(EngineError::Timeout);
+                break;
+            }
+            Ok(Err(e)) => {
+                failure = Some(errors::untrusted(e));
+                break;
+            }
+            Ok(Ok(_)) => {}
         }
         if transaction_state(lease.conn(), marker).await == TransactionState::Ended {
             failure = Some(EngineError::TransactionEnded);
             break;
+        }
+    }
+    if failure.is_none() {
+        // The catalog read and the `COMMIT` (deferred constraints run there) get what is left.
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            failure = Some(EngineError::Timeout);
+        } else if let Err(e) = limit(lease.conn(), request.timeout.min(left)).await {
+            failure = Some(e);
         }
     }
     if let Some(e) = failure {

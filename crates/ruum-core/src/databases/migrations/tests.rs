@@ -609,7 +609,7 @@ async fn an_agents_migration_on_live_waits_for_a_person() {
     let held = db
         .deps()
         .store
-        .lock_migrations(w.team.id, node)
+        .lock_migrations(w.team.id, node, LOCK_WAIT)
         .await
         .unwrap();
     let mut dry = r.clone();
@@ -728,6 +728,75 @@ async fn an_agents_migration_on_live_waits_for_a_person() {
         used.status,
         crate::databases::access::approvals::ApprovalStatus::Used
     );
+}
+
+/// Review D-2, 3 (the card's rule "an expired approval is refused"): an approval decided more
+/// than the use window ago is `409`; nothing runs, and no restore point, row or journal entry
+/// is written; the approval is not spent.
+#[tokio::test]
+async fn an_expired_approval_runs_nothing() {
+    use crate::databases::access::approvals::{ApprovalStatus, Decision, USE_WITHIN_MINUTES};
+    let w = world().await;
+    let node = database(&w, "expired", sqlite()).await;
+    let a = ctx(w.team.id, w.alice);
+    let db = &w.s.databases;
+    ran(db
+        .apply_migration(
+            &a,
+            node,
+            req(
+                "0001_plants",
+                "create table plants (id integer primary key)",
+            ),
+            "",
+        )
+        .await
+        .unwrap());
+    let agent = agent_of(&w, w.alice, Role::Manage).await;
+    let ac = agent_ctx(&agent);
+    give_write_live(&w, node, &agent).await;
+    let r = req("0002_beds", "create table beds (id integer primary key)");
+    let pending = approval(db.apply_migration(&ac, node, r.clone(), "").await.unwrap());
+    // Decided longer ago than the use window: its time is over now.
+    let long_ago = crate::now() - time::Duration::minutes(USE_WITHIN_MINUTES + 5);
+    db.deps()
+        .approvals
+        .decide(
+            &a,
+            &*db.deps().authz,
+            node,
+            pending.id,
+            Decision {
+                approve: true,
+                comment: None,
+                classes: Vec::new(),
+                grant: None,
+            },
+            long_ago,
+        )
+        .await
+        .unwrap();
+    let (points, entries) = (
+        restore_points(&w, node).len(),
+        migration_entries(&w, node).len(),
+    );
+    let mut with_id = r.clone();
+    with_id.approval_id = Some(pending.id);
+    let (status, c, text) = code(db.apply_migration(&ac, node, with_id, "").await);
+    assert_eq!((status, c.as_str()), (409, "conflict"), "{text}");
+    assert_eq!(tables(&w, node).await, vec!["plants"]);
+    assert_eq!(rows(&w, node).await.len(), 1);
+    assert_eq!(restore_points(&w, node).len(), points);
+    assert_eq!(migration_entries(&w, node).len(), entries);
+    let after = db
+        .deps()
+        .approvals
+        .get(w.team.id, node, pending.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(after.used_at.is_none(), "an expired approval was spent");
+    assert_eq!(after.status_at(crate::now()), ApprovalStatus::Expired);
 }
 
 /// Decision 0004-40 h: a failed migration confirms nothing of the decision, and spends the
@@ -907,7 +976,10 @@ async fn a_migration_and_a_branch_never_overlap() {
         .unwrap());
     let store = db.deps().store.clone();
     // The branch waits for the lock: it stays provisioning while the lock is held.
-    let held = store.lock_migrations(w.team.id, node).await.unwrap();
+    let held = store
+        .lock_migrations(w.team.id, node, LOCK_WAIT)
+        .await
+        .unwrap();
     let branch = db
         .create_branch(
             &a,
@@ -1022,6 +1094,102 @@ async fn the_lens_sweep_makes_a_left_database_ready() {
     assert_eq!(db.sweep_lens_rebuilds().await.unwrap(), 0);
 }
 
+/// The marks of [`LENS_PENDING`]: the whole text, or the end of a failed run's text.
+#[test]
+fn the_lens_mark_is_added_and_taken_out() {
+    assert_eq!(with_lens_pending(None), LENS_PENDING);
+    let failed = with_lens_pending(Some("SQLSTATE 22P02: invalid input"));
+    assert!(failed.starts_with("SQLSTATE 22P02: invalid input; "));
+    assert_eq!(without_lens_pending(Some(LENS_PENDING)), Some(None));
+    assert_eq!(
+        without_lens_pending(Some(&failed)),
+        Some(Some("SQLSTATE 22P02: invalid input".to_string()))
+    );
+    assert_eq!(without_lens_pending(Some("SQLSTATE 22P02: x")), None);
+    assert_eq!(without_lens_pending(None), None);
+}
+
+/// A failed run whose lens rebuild failed too (Kimi review D-2, 4): the sweep finds the mark at
+/// the end of the failed row's error, rebuilds, keeps the sanitized error and sets `ready`.
+#[tokio::test]
+async fn the_lens_sweep_finds_a_failed_run_that_left_the_lens() {
+    let w = world().await;
+    let node = database(&w, "lens failed", sqlite()).await;
+    let a = ctx(w.team.id, w.alice);
+    let db = &w.s.databases;
+    let row = MigrationRow {
+        id: Uuid::now_v7(),
+        tenant_id: w.team.id,
+        node_id: node,
+        name: "0001_t".into(),
+        checksum: checksum("create table t (id integer"),
+        up_sql: "create table t (id integer".into(),
+        data_classes: json!({}),
+        status: MigrationStatus::Failed,
+        error: Some(with_lens_pending(Some("SQLSTATE 42601: syntax error"))),
+        restore_point_id: None,
+        actor: a.actor,
+        at: micros(crate::now()),
+    };
+    db.deps()
+        .store
+        .record_migration(
+            &a,
+            MigrationRecord {
+                row,
+                event: None,
+                take: None,
+            },
+            &*db.deps().approvals,
+        )
+        .await
+        .unwrap();
+    db.mark_updating(w.team.id, node, REASON_LENS_REBUILD)
+        .await
+        .unwrap();
+    assert_eq!(db.sweep_lens_rebuilds().await.unwrap(), 1);
+    assert_eq!(state(&w, node).await, ProviderState::Ready);
+    let r = rows(&w, node).await;
+    assert_eq!(r[0].status, MigrationStatus::Failed);
+    assert_eq!(r[0].error.as_deref(), Some("SQLSTATE 42601: syntax error"));
+    assert_eq!(db.sweep_lens_rebuilds().await.unwrap(), 0);
+}
+
+/// Review D-2, 1: a held migration lock makes a second locker give up after its wait with the
+/// retryable 503, and a migration that cannot get the lock runs nothing.
+#[tokio::test]
+async fn a_busy_migration_lock_gives_up_after_its_wait() {
+    let w = world().await;
+    let node = database(&w, "busy", sqlite()).await;
+    let db = &w.s.databases;
+    let store = db.deps().store.clone();
+    let held = store
+        .lock_migrations(w.team.id, node, LOCK_WAIT)
+        .await
+        .unwrap();
+    let started = Instant::now();
+    let (status, c, _) = code(
+        store
+            .lock_migrations(w.team.id, node, Duration::from_millis(200))
+            .await,
+    );
+    assert_eq!((status, c.as_str()), (503, "database_not_ready"));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    match lock_busy() {
+        Error::Api(p) => assert!(p.retry_after.is_some(), "no Retry-After"),
+        other => panic!("{other:?}"),
+    }
+    held.release().await;
+    // Free again: the next locker gets it at once.
+    store
+        .lock_migrations(w.team.id, node, Duration::from_millis(200))
+        .await
+        .unwrap()
+        .release()
+        .await;
+    assert!(rows(&w, node).await.is_empty());
+}
+
 /// `listDatabaseMigrations` needs view: a stranger gets 404.
 #[tokio::test]
 async fn the_list_needs_view() {
@@ -1097,9 +1265,13 @@ async fn postgres_store_keeps_migrations_per_tenant(pool: sqlx::PgPool) {
     tx.commit().await.unwrap();
     let ca = ctx(a, UserId(user_a));
     // The lock excludes a second holder until it is released.
-    let first = store.lock_migrations(a, na).await.unwrap();
+    let first = store.lock_migrations(a, na, LOCK_WAIT).await.unwrap();
     let s2 = store.clone();
-    let second = tokio::spawn(async move { s2.lock_migrations(a, na).await.map(|_| ()) });
+    let second = tokio::spawn(async move {
+        s2.lock_migrations(a, na, Duration::from_secs(30))
+            .await
+            .map(|_| ())
+    });
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!second.is_finished(), "two holders of one migration lock");
     first.release().await;
@@ -1109,13 +1281,16 @@ async fn postgres_store_keeps_migrations_per_tenant(pool: sqlx::PgPool) {
         .unwrap()
         .unwrap();
     // The lock of one database does not lock another.
-    let held = store.lock_migrations(a, na).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), store.lock_migrations(a, nb))
-        .await
-        .expect("another database was locked")
-        .unwrap()
-        .release()
-        .await;
+    let held = store.lock_migrations(a, na, LOCK_WAIT).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        store.lock_migrations(a, nb, LOCK_WAIT),
+    )
+    .await
+    .expect("another database was locked")
+    .unwrap()
+    .release()
+    .await;
     held.release().await;
     // A restore point and an applied row.
     let point = store
@@ -1180,18 +1355,16 @@ async fn postgres_store_keeps_migrations_per_tenant(pool: sqlx::PgPool) {
         .0,
         409
     );
-    for _ in 0..2 {
+    // The second failed row left the lens dropped: its error ends with the mark.
+    let pending_text = with_lens_pending(Some("SQLSTATE 42P01: x"));
+    let mut failed = Vec::new();
+    for error in ["SQLSTATE 42P01: x", pending_text.as_str()] {
+        let row = mk("0001_t", MigrationStatus::Failed, Some(error));
         store
-            .record_migration(
-                &ca,
-                rec(
-                    mk("0001_t", MigrationStatus::Failed, Some("SQLSTATE 42P01: x")),
-                    None,
-                ),
-                &approvals,
-            )
+            .record_migration(&ca, rec(row.clone(), None), &approvals)
             .await
             .unwrap();
+        failed.push(row);
     }
     // A take of an approval that is not there writes nothing (one transaction).
     let take = Take {
@@ -1281,6 +1454,29 @@ async fn postgres_store_keeps_migrations_per_tenant(pool: sqlx::PgPool) {
             .unwrap()
             .contains(&(a, na, applied.id))
     );
+    // A failed row's mark: found, and cleared back to its sanitized error; the failed row
+    // without the mark is never found.
+    let pending = store.lens_pending().await.unwrap();
+    assert!(pending.contains(&(a, na, failed[1].id)));
+    assert!(!pending.contains(&(a, na, failed[0].id)));
+    assert!(!store.clear_lens_pending(a, na, failed[0].id).await.unwrap());
+    assert!(store.clear_lens_pending(a, na, failed[1].id).await.unwrap());
+    let errors: Vec<Option<String>> = store
+        .list_migrations(a, na, &PageRequest::default())
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .filter(|m| m.status == MigrationStatus::Failed)
+        .map(|m| m.error)
+        .collect();
+    assert_eq!(
+        errors,
+        vec![
+            Some("SQLSTATE 42P01: x".to_string()),
+            Some("SQLSTATE 42P01: x".to_string())
+        ]
+    );
     // The restore point row: the reason and the actor.
     let mut tx = crate::journal::postgres::begin_tenant(&pool, a)
         .await
@@ -1292,6 +1488,48 @@ async fn postgres_store_keeps_migrations_per_tenant(pool: sqlx::PgPool) {
             .await
             .unwrap();
     assert_eq!((reason.as_str(), actor), (RESTORE_POINT_REASON, user_a));
+}
+
+/// Review D-2, 1: the Postgres migration lock lives on a pool of its own. With the store's main
+/// pool at ONE connection, a held lock and a waiting locker leave that connection free, and the
+/// waiter gives up after its wait with the retryable 503.
+#[sqlx::test(migrations = "../../migrations")]
+async fn postgres_lock_waiters_take_no_main_pool_connection(pool: sqlx::PgPool) {
+    use crate::databases::PgDatabaseStore;
+    let small = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(1))
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let store = PgDatabaseStore::new(small.clone());
+    let (tenant, node) = (TenantId::new(), NodeId::new());
+    let held = store
+        .lock_migrations(tenant, node, LOCK_WAIT)
+        .await
+        .unwrap();
+    let s2 = store.clone();
+    let waiter = tokio::spawn(async move {
+        s2.lock_migrations(tenant, node, Duration::from_millis(800))
+            .await
+            .map(|_| ())
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The main pool's only connection is free while the lock is held and waited for.
+    let conn = small
+        .acquire()
+        .await
+        .expect("the main pool was used up by the lock");
+    drop(conn);
+    let (status, c, _) = code(waiter.await.unwrap());
+    assert_eq!((status, c.as_str()), (503, "database_not_ready"));
+    held.release().await;
+    store
+        .lock_migrations(tenant, node, Duration::from_secs(2))
+        .await
+        .unwrap()
+        .release()
+        .await;
 }
 
 // ---------------------------------------------------------------------------- the data cluster

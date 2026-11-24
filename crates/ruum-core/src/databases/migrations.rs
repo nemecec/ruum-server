@@ -49,7 +49,9 @@
 //! Then [`DatabaseService::run_migration`], the part that the app publish also calls:
 //!
 //! 6. The migration lock of the database (DB-2, [`super::DatabaseStore::lock_migrations`]),
-//!    held until the end. A branch of the same database takes the same lock from before its
+//!    held until the end. A caller waits for it at most [`LOCK_WAIT`], then gets the retryable
+//!    `503 database_not_ready` ([`lock_busy`]); on Postgres a waiter holds no connection, and
+//!    a holder holds one of a small pool of its own, never one of the store's main pool. A branch of the same database takes the same lock from before its
 //!    engine copy until its rows are written, so a branch never records a migration as applied
 //!    whose schema change is not in its copy. Under the lock: a name runs once (the same name
 //!    with the same checksum answers the stored result; another checksum is `409 conflict`;
@@ -61,16 +63,18 @@
 //!    generation; the status goes back only if nobody reported another one in between).
 //! 8. A restore point first (not for a dry run): the engine's
 //!    `DatabaseEngine::create_restore_point`, then the `database_restore_points` row (reason
-//!    `before_migration`, actor, `on_behalf_of`).
+//!    `before_migration`, actor, `on_behalf_of`). Then the take of the approval, in a store
+//!    transaction of its own, before the engine runs anything: the approval is spent by this
+//!    run whatever follows (a failed `up`, a failed write of the row), so one approval gives at
+//!    most one run of `up`. The contract gives an approval for one run and says nothing of a
+//!    second; a person approves again.
 //! 9. `DatabaseEngine::apply_migration` with the strict catalog sync of card Q-2 over card K-1's
 //!    column sync: the engine drops the lens views, runs `up` as the owner in one transaction,
 //!    syncs the catalog (new columns arrive unconfirmed; renamed, retyped, rebuilt, swapped and
 //!    re-added columns return to unconfirmed, decision 0004-28) and rebuilds the lens views,
 //!    also after a failed `up` (decision 0004-34 f).
-//! 10. One store transaction ([`super::DatabaseStore::record_migration`]): the take of the
-//!     approval (it is spent also by a failed migration: the contract gives an approval for one
-//!     run and says nothing of a second; a person approves again), the migration row and the
-//!     journal entry (`database.migration_applied` with counts and IDs, or
+//! 10. One store transaction ([`super::DatabaseStore::record_migration`]): the migration row and
+//!     the journal entry (`database.migration_applied` with counts and IDs, or
 //!     `database.migration_failed` with the SQLSTATE; never an engine message). A dry run
 //!     writes its row (`dry_run`, or `failed`) and no journal entry: the database did not
 //!     change.
@@ -82,29 +86,37 @@
 //!     Entries for columns that do not exist after the migration are ignored. A failed or dry
 //!     run confirms nothing. The confirmation is card K-1's write (a manifest version, the
 //!     column rows, `database.columns_confirmed`, the lens rebuild), so it runs after the
-//!     migration row is committed, still under the migration lock; if it fails, the columns
-//!     stay unconfirmed (`personal`), which fails safe, and the server logs it.
+//!     migration row is committed, still under the migration lock and before the database
+//!     shows the status from before the run (queries wait while it is `updating`). It is tried
+//!     twice; if it fails, the columns stay unconfirmed (`personal`), which fails safe, and the
+//!     server logs an error (backlog D2-4).
 //!
 //! A failed `up` (a failing statement, a deferred constraint at `COMMIT`, `CREATE SCHEMA` or
 //! `CREATE EXTENSION`, a timeout) leaves the schema, the rows, the column rows and the lens as
 //! before; the answer is `422 migration_failed` (`504 statement_timeout` for a timeout) with the
 //! SQLSTATE, the engine's text only for a person with `manage`, the fixed text otherwise.
 //!
-//! **The catalog sync failed** (`EngineError::CatalogSync`): `up` is committed, the lens is not
-//! rebuilt. The run tries `sync_lens` once more; if that fails too, the migration is recorded
-//! as applied with the fixed text [`LENS_PENDING`] in `error`, the database stays `updating`
-//! (reason `lens_rebuild`), and the lens kinds fail closed (the engine keeps the views
-//! dropped). [`DatabaseService::sweep_lens_rebuilds`] (every [`LENS_SWEEP_EVERY`] on the server,
-//! [`run_lens_sweeper`]) runs `sync_lens` again for such rows, clears the text and sets the
-//! database `ready`.
+//! **The catalog sync failed** (`EngineError::CatalogSync`): `up` is committed (a dry run is
+//! rolled back), the lens is not rebuilt. The run tries `sync_lens` once more; if that fails
+//! too, the migration is recorded with the fixed text [`LENS_PENDING`] in `error` (its status
+//! stays `applied`, or `dry_run`), the database stays `updating` (reason `lens_rebuild`), and
+//! the lens kinds fail closed (the engine keeps the views dropped). This holds for a dry run
+//! too: the engine dropped the views for it, so `updating` is the truth until they are back
+//! (review D-2, 5). After a failed `up` the engine rebuilds the lens as well, but it reports
+//! only the failure of `up`, so the run calls `sync_lens` once more there too; if that fails,
+//! the failed row's sanitized error ends with `; ` and [`LENS_PENDING`]
+//! ([`with_lens_pending`]). [`DatabaseService::sweep_lens_rebuilds`] (every
+//! [`LENS_SWEEP_EVERY`] on the server, [`run_lens_sweeper`]) runs `sync_lens` again for such
+//! rows, takes the mark out of the text ([`without_lens_pending`]) and sets the database
+//! `ready`.
 //!
 //! # The app publish (hand-over to card W-3a)
 //!
 //! [`DatabaseService::run_migration`] is steps 6 to 11 for a caller that is checked already:
 //! "the platform, with the deployer's right" (decision 0006-3). [`MigrationRun`] names the
 //! context recorded as the actor, the database row, the migration, whether the author's classes
-//! count as confirmed, and an optional [`ApprovalUse`]: the approval it takes in the
-//! transaction of the migration row. The app publish and the preview deploy call it without the
+//! count as confirmed, and an optional [`ApprovalUse`]: the approval it takes right before the
+//! engine runs `up` (step 8). The app publish and the preview deploy call it without the
 //! REST layer; card D-2 does not call it from `apps/`.
 //!
 //! A decision made elsewhere (card W-3b: one decision covers the migration approvals of a
@@ -147,10 +159,32 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-/// The `error` of an applied migration whose lens was not rebuilt yet (see the module docs).
+/// The `error` of a migration whose run left the lens dropped (see the module docs): the whole
+/// text of an applied or dry run, the end of a failed run's text after `; ` ([`with_lens_pending`]).
 /// A fixed text: no engine text, no value.
 pub const LENS_PENDING: &str =
-    "applied; the masking views of the database are being rebuilt, and masked reads wait";
+    "the masking views of the database are being rebuilt, and masked reads wait";
+
+/// The stored error of a run that left the lens dropped: [`LENS_PENDING`] after the run's own
+/// error, if it has one.
+pub fn with_lens_pending(error: Option<&str>) -> String {
+    match error {
+        Some(e) => format!("{e}; {LENS_PENDING}"),
+        None => LENS_PENDING.to_string(),
+    }
+}
+
+/// The stored error once the lens is rebuilt: `None` (not marked), `Some(None)` (the mark was
+/// the whole text) or `Some(Some(error))` (the run's own error before the mark).
+pub fn without_lens_pending(error: Option<&str>) -> Option<Option<String>> {
+    let e = error?;
+    if e == LENS_PENDING {
+        return Some(None);
+    }
+    e.strip_suffix(LENS_PENDING)
+        .and_then(|rest| rest.strip_suffix("; "))
+        .map(|rest| Some(rest.to_string()))
+}
 /// The reason of the restore point before a migration (`restore_point_reason` of 0004).
 pub const RESTORE_POINT_REASON: &str = "before_migration";
 /// The `reason` of the `updating` status while a migration runs.
@@ -163,6 +197,17 @@ pub const MAX_UP_CHARS: usize = 1_000_000;
 pub const MAX_DATA_CLASSES: usize = 2000;
 /// How often the server rebuilds the lenses that a migration left dropped.
 pub const LENS_SWEEP_EVERY: Duration = Duration::from_secs(30);
+/// How long a migration waits for the migration lock of its database (another migration, a
+/// branch copy, a lens rebuild of the sweeper) before `503 database_not_ready`.
+pub const LOCK_WAIT: Duration = Duration::from_secs(10);
+/// How long a branch waits for the migration lock of its source (it runs in the background).
+pub const BRANCH_LOCK_WAIT: Duration = Duration::from_secs(15 * 60);
+/// How long the lens sweeper waits for a migration lock; a busy database is tried next round.
+pub const SWEEP_LOCK_WAIT: Duration = Duration::from_secs(2);
+/// At most this many migration locks are held at the same time in one process (each holds one
+/// connection of the Postgres store's lock pool, never one of its main pool); more wait, up to
+/// their wait, then get [`lock_busy`].
+pub const LOCK_CONNECTIONS: u32 = 8;
 
 // ---------------------------------------------------------------------------- the model
 
@@ -287,7 +332,7 @@ pub enum Applied {
     Approval(DatabaseApproval),
 }
 
-/// An approval that a run takes in the transaction of its migration row.
+/// An approval that a run takes right before the engine runs `up` (step 8 of the module docs).
 #[derive(Clone, Debug)]
 pub struct ApprovalUse {
     pub id: Uuid,
@@ -321,7 +366,9 @@ pub struct MigrationRecord {
     pub row: MigrationRow,
     /// The journal entry (none for a dry run).
     pub event: Option<(EventType, Value)>,
-    /// The approval to take first, with the time of its check.
+    /// An approval to take first, with the time of its check, in the same transaction.
+    /// [`DatabaseService::run_migration`] takes its approval before the engine run and passes
+    /// none here.
     pub take: Option<(Uuid, Take, OffsetDateTime)>,
 }
 
@@ -373,6 +420,20 @@ pub fn dry_run_refused() -> Error {
              dry run runs as the schema owner and takes the migration's locks",
         )
         .with_hint("dry_run_on_draft_branch"),
+    )
+}
+
+/// `503 database_not_ready` (retryable): the migration lock of the database stayed busy for the
+/// whole wait. Nothing ran.
+pub fn lock_busy() -> Error {
+    Error::Api(
+        ApiError::new(
+            ErrorCode::DatabaseNotReady,
+            "another migration, a branch copy or a lens rebuild of this database is running; \
+             nothing ran",
+        )
+        .with_hint("retry")
+        .with_retry_after(query::RETRY_AFTER_SECONDS),
     )
 }
 
@@ -782,7 +843,7 @@ impl DatabaseService {
             .ok_or_else(|| engine_not_available(run.db.engine))?;
         let lock = d
             .store
-            .lock_migrations(run.db.tenant_id, run.db.node_id)
+            .lock_migrations(run.db.tenant_id, run.db.node_id, LOCK_WAIT)
             .await?;
         let result = self.run_locked(&run, &*engine).await;
         lock.release().await;
@@ -839,7 +900,8 @@ impl DatabaseService {
         } else {
             self.mark_updating(tenant, node, REASON_MIGRATION).await
         };
-        let ran = self.run_engine(run, engine).await;
+        let take = run.approval.as_ref().map(|u| (u.id, u.take.clone(), at));
+        let ran = self.run_engine(run, engine, take).await;
         let (ran, restore_point_id, before, after) = match ran {
             Ok(v) => v,
             Err(e) => {
@@ -891,18 +953,20 @@ impl DatabaseService {
             data["migration_id"] = json!(row.id);
             (e, data)
         });
+        // The approval was taken before the engine run (see `run_engine`).
         let record = MigrationRecord {
             row,
             event,
-            take: run.approval.as_ref().map(|u| (u.id, u.take.clone(), at)),
+            take: None,
         };
         let recorded = d.store.record_migration(ctx, record, &*d.approvals).await;
         let (row, entry) = match recorded {
             Ok(v) => v,
             Err(e) => {
                 if ran.status == MigrationStatus::Applied {
-                    // The schema changed, but its row is missing: say so loudly. The name can
-                    // run again only if `up` is idempotent; a person looks at it.
+                    // The schema changed, but its row is missing: say so loudly. The approval
+                    // is spent already, so an agent cannot run `up` again with it; a person
+                    // looks at it (backlog D2-5).
                     tracing::error!(
                         %tenant,
                         %node,
@@ -914,14 +978,17 @@ impl DatabaseService {
                 return Err(e);
             }
         };
+        // The classes before the database serves again (Kimi review D-2, 3): queries wait
+        // while it is `updating`, so no reader sees a decided column with its unconfirmed class
+        // in between.
+        if ran.status == MigrationStatus::Applied {
+            let mine: HashSet<ColumnRef> = new_cols.iter().chain(&reset_cols).cloned().collect();
+            self.migration_classes(run, &mine, decided, decider).await;
+        }
         if ran.lens_pending {
             self.mark_updating(tenant, node, REASON_LENS_REBUILD).await;
         } else {
             self.unmark(tenant, node, marked).await;
-        }
-        if ran.status == MigrationStatus::Applied {
-            let mine: HashSet<ColumnRef> = new_cols.iter().chain(&reset_cols).cloned().collect();
-            self.migration_classes(run, &mine, decided, decider).await;
         }
         if let Some(p) = ran.problem {
             return Err(p);
@@ -953,12 +1020,18 @@ impl DatabaseService {
         })
     }
 
-    /// The restore point and the engine run (steps 8 and 9). Returns what ran, the restore
-    /// point and the column rows before and after the run.
+    /// The restore point, the take of the approval and the engine run (steps 8 and 9). Returns
+    /// what ran, the restore point and the column rows before and after the run.
+    ///
+    /// The approval is taken (marked `used`) after the restore point and before the engine
+    /// runs `up`, in a store transaction of its own (Kimi review D-2, 1): one approval gives at
+    /// most one run of `up`, also when the server stops, or the store fails, between the
+    /// engine's commit and the migration row. A take that fails runs nothing.
     async fn run_engine(
         &self,
         run: &MigrationRun<'_>,
         engine: &dyn DatabaseEngine,
+        take: Option<(Uuid, Take, OffsetDateTime)>,
     ) -> Result<(Ran, Option<Uuid>, Vec<ColumnRow>, Vec<ColumnRow>)> {
         let d = self.deps();
         let (ctx, db) = (run.ctx, &run.db);
@@ -986,6 +1059,9 @@ impl DatabaseService {
         let before = d.columns.list(tenant, node).await?;
         let key = d.queries.keys.engine_key(tenant, db.key_node_id).await?;
         let sync = crate::privacy::postgres::strict_sync(self, tenant, node, db.engine).await?;
+        if let Some((id, take, at)) = &take {
+            d.approvals.take(tenant, node, *id, take, *at).await?;
+        }
         let request = MigrationRequest {
             up: run.up.clone(),
             timeout: Duration::from_millis(d.settings.statement_timeout_ms),
@@ -1034,7 +1110,7 @@ impl DatabaseService {
                         "the lens was not rebuilt after a migration; the sweeper tries again"
                     );
                     ran.lens_pending = true;
-                    ran.error = Some(LENS_PENDING.to_string());
+                    ran.error = Some(with_lens_pending(None));
                 }
             }
             Err(EngineError::MigrationFailed(inner)) => {
@@ -1047,6 +1123,19 @@ impl DatabaseService {
                     *inner,
                     run.engine_text,
                 )));
+                // The engine rebuilds the lens after a failed `up` too, but it reports only the
+                // failure of `up` (Kimi review D-2, 4): rebuild once more, so a lens that the
+                // engine left dropped is rebuilt now or marked for the sweeper.
+                if let Err(e) = engine.sync_lens(&db.database_ref(), &key, &sync).await {
+                    tracing::warn!(
+                        %tenant,
+                        %node,
+                        error = %e,
+                        "the lens was not rebuilt after a failed migration; the sweeper tries again"
+                    );
+                    ran.lens_pending = true;
+                    ran.error = Some(with_lens_pending(ran.error.as_deref()));
+                }
             }
             // Nothing ran (the engine paused the database, or failed before `up`).
             Err(EngineError::NotReady) => return Err(query::not_ready_error().into()),
@@ -1142,8 +1231,17 @@ impl DatabaseService {
                 })
                 .collect(),
         };
-        if let Err(e) = self.confirm_columns(ctx, "", node, req, None).await {
-            tracing::warn!(
+        // One retry: a failure leaves the columns unconfirmed (`personal`, fail safe), and the
+        // person confirms them again (backlog D2-4).
+        let mut last = None;
+        for _ in 0..2 {
+            match self.confirm_columns(ctx, "", node, req.clone(), None).await {
+                Ok(_) => return,
+                Err(e) => last = Some(e),
+            }
+        }
+        if let Some(e) = last {
+            tracing::error!(
                 tenant = %ctx.tenant,
                 %node,
                 error = %crate::providers::store::error_text(&e),
@@ -1282,7 +1380,10 @@ impl DatabaseService {
             .get(row.engine)
             .cloned()
             .ok_or_else(|| engine_not_available(row.engine))?;
-        let lock = d.store.lock_migrations(tenant, node).await?;
+        let lock = d
+            .store
+            .lock_migrations(tenant, node, SWEEP_LOCK_WAIT)
+            .await?;
         let done = async {
             let key = d.queries.keys.engine_key(tenant, row.key_node_id).await?;
             let sync =

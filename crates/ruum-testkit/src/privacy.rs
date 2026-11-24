@@ -3764,7 +3764,13 @@ mod cases {
         // (3) A DO block: in a migration it runs; in a query it is refused or gives the
         // branch's pseudonym.
         if c.engine == Engine::Postgres {
-            let up = format!("do $$ begin {}; end $$;", insert_shared(303, &shared.email));
+            // `people.email` is unique: row 302 hands the email on to 303, so the case still
+            // compares the same value, and 302 stays for `poracle_copy_keeps_key` (review D-2, 2).
+            let up = format!(
+                "do $$ begin update people set email = 'moved-' || email where id = 302; {}; \
+                 end $$;",
+                insert_shared(303, &shared.email)
+            );
             let res = c.migrate(A, &b, &up, json!({})).await?;
             want(
                 &res,
