@@ -125,6 +125,14 @@ pub struct KubeConfig {
     /// the API server needs the feature gate `PodLogsQuerySplitStreams`). Off: both come
     /// together and are reported as standard output.
     pub split_log_streams: bool,
+    /// The most instances this process keeps the logs of (running and ended); a start beyond it
+    /// forgets an ended one first (of the tenant that keeps the most) or is `unavailable`.
+    pub max_instances: usize,
+    /// The most ended instances whose logs this process keeps, and their log bytes in all; past
+    /// either, the oldest ended instance of the tenant with the largest share is forgotten
+    /// (as the Docker driver, backlog S-61).
+    pub max_ended_instances: usize,
+    pub max_ended_log_bytes: usize,
 }
 
 impl KubeConfig {
@@ -158,6 +166,9 @@ impl KubeConfig {
             ended_retention: Duration::from_secs(15 * 60),
             reregister_every: Duration::from_secs(60),
             split_log_streams: false,
+            max_instances: 4096,
+            max_ended_instances: 1024,
+            max_ended_log_bytes: 256 * 1024 * 1024,
         }
     }
 
@@ -181,6 +192,9 @@ impl KubeConfig {
                 "the log ring and the line cap must be above zero and within the redactor's",
             );
         }
+        if self.max_instances == 0 {
+            return bad("the instance cap must be above zero");
+        }
         if self.health_command.is_empty() || self.sweep_every.is_zero() {
             return bad("the health command and the sweep interval must be set");
         }
@@ -200,6 +214,8 @@ impl KubeConfig {
 struct Local {
     id: InstanceId,
     identity: WorkloadIdentity,
+    /// When this process made it (a start in progress has a record only after this).
+    made: Instant,
     redactors: Mutex<Option<Arc<Mutex<Redactors>>>>,
     st: Mutex<LocalSt>,
 }
@@ -239,8 +255,10 @@ struct Inner {
     usage: Arc<dyn RuntimeUsageSink>,
     statics: Mutex<HashMap<InstanceId, StaticInst>>,
     locals: Mutex<HashMap<InstanceId, Arc<Local>>>,
-    /// The address of each running instance this process saw (for the gateway).
-    addrs: Mutex<HashMap<InstanceId, (String, u16)>>,
+    /// The address of each running instance this process saw (for the gateway), with the run
+    /// it belongs to: an observation of another run or state forgets it, so the gateway never
+    /// gets the address of an earlier run (which can be another pod by now).
+    addrs: Mutex<HashMap<InstanceId, (u32, String, u16)>>,
     last_register: Mutex<HashMap<String, Instant>>,
 }
 
@@ -322,7 +340,13 @@ impl KubeDriver {
             .lock()
             .expect("addrs lock")
             .get(&instance)
-            .cloned()
+            .map(|(_, ip, port)| (ip.clone(), *port))
+    }
+
+    /// How many instances this process keeps the logs of (the tests).
+    #[doc(hidden)]
+    pub fn kept_instances(&self) -> usize {
+        self.inner.locals.lock().expect("locals lock").len()
     }
 
     /// One sweep now (the tests; the task runs it every `sweep_every`).
@@ -608,23 +632,37 @@ impl Inner {
         }
     }
 
+    /// Keeps the gateway's address of an instance only when it belongs to `run` (`None`: forgets
+    /// it).
+    fn keep_addr(&self, id: InstanceId, run: Option<u32>) {
+        let mut addrs = self.addrs.lock().expect("addrs lock");
+        if addrs.get(&id).is_some_and(|(r, _, _)| Some(*r) != run) {
+            addrs.remove(&id);
+        }
+    }
+
     /// The status of an instance from its record and its pod, making the state changes the pod
     /// shows (exit, idle, registration). Every process may run it; the record's
     /// resourceVersion lets only one make each change.
     async fn observe(&self, mut cm: Value) -> Result<InstanceStatus, RuntimeError> {
         for _ in 0..4 {
-            let Some((mut rec, rv)) = pod::read_record(&cm) else {
+            let Some((mut rec, mut rv)) = pod::read_record(&cm) else {
                 return Err(RuntimeError::Internal {
                     reason: "an instance record does not read".to_owned(),
                 });
             };
             let id = rec.instance;
-            if !matches!(rec.state, InstanceState::Starting | InstanceState::Running) {
+            let live = matches!(rec.state, InstanceState::Starting | InstanceState::Running);
+            self.keep_addr(id, live.then_some(rec.run));
+            if !live {
                 return Ok(self.status_of(&rec, Health::Unknown));
             }
             let pod_n = pod_name(id, rec.run);
             let pod = self.api.get(Kind::Pod, &pod_n).await?;
             let view = pod.as_ref().map(pod::view);
+            if !matches!(view, Some(PodView::Running { .. })) {
+                self.keep_addr(id, None);
+            }
             let now = pod::now_ms();
             let changed = match view {
                 // A run that is still being made (the record is written before its pod, by this
@@ -656,7 +694,9 @@ impl Inner {
                     self.drain(id, FOLLOWER_DRAIN).await;
                     self.end_run(rec, &rv, InstanceState::Exited(exit)).await?
                 }
-                Some(PodView::Pending { broken: false }) => {
+                // Not running yet, or being deleted (by another process's state change, or by
+                // hand: once it is gone the run ends as killed).
+                Some(PodView::Pending { broken: false }) | Some(PodView::Terminating) => {
                     return Ok(self.status_of(&rec, Health::Unknown));
                 }
                 Some(PodView::Running { ip, ready, started }) => {
@@ -675,34 +715,55 @@ impl Inner {
                         let Some(ip) = ip else {
                             return Ok(self.status_of(&rec, Health::Unknown));
                         };
+                        if rec.routes.contains(&Route::EgressProxy)
+                            && (rec.registered.as_deref() != Some(pod_n.as_str())
+                                || rec.state == InstanceState::Starting)
+                        {
+                            // Registered before the instance counts as running; until then it is
+                            // starting (the proxy refuses it anyway: fails closed). The record
+                            // names the registration first, so a process that ends the run
+                            // meanwhile always unregisters it (an unregistration is idempotent).
+                            if rec.registered.as_deref() != Some(pod_n.as_str()) {
+                                if let Some(old) = rec.registered.clone()
+                                    && !self.unregister(&old).await
+                                {
+                                    return Ok(self.status_of(&rec, Health::Unknown));
+                                }
+                                rec.registered = Some(pod_n.clone());
+                                if !self.put(&rec, &rv).await? {
+                                    cm = self.reload(id).await?;
+                                    continue;
+                                }
+                            }
+                            if let Err(e) = self.register(&rec, &pod_n, &ip).await {
+                                tracing::warn!(target: "ruum::runtime", code = e.code(), "registering a sandbox at the egress proxy failed");
+                                return Ok(self.status_of(&rec, Health::Unknown));
+                            }
+                            // The run may have ended while the proxy was asked: then the
+                            // registration goes again.
+                            match self.confirm(&rec, &pod_n).await? {
+                                Some((now_rec, now_rv)) => {
+                                    rec = now_rec;
+                                    rv = now_rv;
+                                }
+                                None => {
+                                    cm = self.reload(id).await?;
+                                    continue;
+                                }
+                            }
+                        }
+                        if rec.state == InstanceState::Starting {
+                            rec.state = InstanceState::Running;
+                            if !self.put(&rec, &rv).await? {
+                                cm = self.reload(id).await?;
+                                continue;
+                            }
+                        }
                         if let KindRec::Service { port, .. } = rec.kind {
                             self.addrs
                                 .lock()
                                 .expect("addrs lock")
-                                .insert(id, (ip.clone(), port));
-                        }
-                        if rec.routes.contains(&Route::EgressProxy)
-                            && rec.registered.as_deref() != Some(pod_n.as_str())
-                        {
-                            // Registered before the instance counts as running; until then it is
-                            // starting (the proxy refuses it anyway: fails closed).
-                            if let Err(e) = self.register(&rec, &pod_n, &ip).await {
-                                tracing::warn!(target: "ruum::runtime", code = e.code(), "registering a sandbox at the egress proxy failed");
-                                rec.state = InstanceState::Starting;
-                                return Ok(self.status_of(&rec, Health::Unknown));
-                            }
-                            rec.registered = Some(pod_n.clone());
-                            rec.state = InstanceState::Running;
-                            if !self.put(&rec, &rv).await? {
-                                cm = self.reload(id).await?;
-                                continue;
-                            }
-                        } else if rec.state == InstanceState::Starting {
-                            rec.state = InstanceState::Running;
-                            if !self.put(&rec, &rv).await? {
-                                cm = self.reload(id).await?;
-                                continue;
-                            }
+                                .insert(id, (rec.run, ip.clone(), port));
                         }
                         let health = self.health(&rec, ready, started);
                         return Ok(self.status_of(&rec, health));
@@ -717,6 +778,42 @@ impl Inner {
         Err(RuntimeError::Unavailable {
             reason: "the instance record changes too often".to_owned(),
         })
+    }
+
+    /// After a registration of `pod` (the run of `rec`): the record read again. `Some` when it
+    /// still names that registration for a live run of the same run number; otherwise the run
+    /// ended meanwhile (its process may have unregistered before this registration), so this
+    /// unregisters it, and when that fails puts the name back on the ended record for the sweep.
+    async fn confirm(
+        &self,
+        rec: &Record,
+        pod: &str,
+    ) -> Result<Option<(Record, String)>, RuntimeError> {
+        let now = match self.record(rec.identity.tenant, rec.instance).await {
+            Ok(r) => Some(r),
+            Err(RuntimeError::NotFound { .. }) => None,
+            Err(e) => {
+                // Unknown: take the registration back, the next observation registers again.
+                self.unregister(pod).await;
+                return Err(e);
+            }
+        };
+        if let Some((r, rv)) = &now
+            && matches!(r.state, InstanceState::Starting | InstanceState::Running)
+            && r.run == rec.run
+            && r.registered.as_deref() == Some(pod)
+        {
+            return Ok(Some((r.clone(), rv.clone())));
+        }
+        if !self.unregister(pod).await
+            && let Some((mut r, rv)) = now
+            && r.registered.is_none()
+            && !matches!(r.state, InstanceState::Starting | InstanceState::Running)
+        {
+            r.registered = Some(pod.to_owned());
+            let _ = self.put(&r, &rv).await;
+        }
+        Ok(None)
     }
 
     /// Waits at most `bound` until the log followers of this process for the instance ended.
@@ -820,7 +917,7 @@ impl Inner {
                 });
             }
         };
-        if let Err(what) = pod::verify(&self.cfg, rec, &stored) {
+        if let Err(what) = pod::verify(&self.cfg, rec, &body, &stored) {
             let _ = self.api.delete(Kind::Pod, &name, Some(0)).await;
             return Err(RuntimeError::Internal {
                 reason: format!("the API server did not keep the sandbox: {what}"),
@@ -882,12 +979,14 @@ impl Inner {
             }
         };
         let mut live_pods: HashMap<String, bool> = HashMap::new();
+        let mut seen: std::collections::HashSet<InstanceId> = std::collections::HashSet::new();
         let now = pod::now_ms();
         for cm in records {
             let Some((rec, _)) = pod::read_record(&cm) else {
                 continue;
             };
             let id = rec.instance;
+            seen.insert(id);
             match rec.state {
                 InstanceState::Starting | InstanceState::Running => {
                     live_pods.insert(pod_name(id, rec.run), true);
@@ -916,6 +1015,15 @@ impl Inner {
                     }
                 }
                 _ => {
+                    // Another process may have ended it: its logs here start their retention.
+                    if matches!(rec.state, InstanceState::Stopped | InstanceState::Exited(_))
+                        && let Some(l) = self.local(id)
+                    {
+                        let mut st = l.st.lock().expect("local lock");
+                        if st.ended_at.is_none() {
+                            st.ended_at = Some(Instant::now());
+                        }
+                    }
                     // A registration or a pod that a failed step left.
                     if let Some(reg) = rec.registered.clone() {
                         live_pods.insert(reg.clone(), true);
@@ -947,20 +1055,120 @@ impl Inner {
                 let Some(name) = p.pointer("/metadata/name").and_then(Value::as_str) else {
                     continue;
                 };
-                if !live_pods.contains_key(name) && self.orphan(name).await {
+                // The unregistration first (idempotent; the pod of an earlier run may still be
+                // registered when its record moved on): a failure keeps the pod, so its address
+                // is not reused while the proxy may still name this app for it.
+                if !live_pods.contains_key(name)
+                    && self.orphan(name).await
+                    && self.unregister(name).await
+                {
                     let grace = self.cfg.stop_timeout.as_secs();
                     let _ = self.api.delete(Kind::Pod, name, Some(grace)).await;
                 }
             }
         }
-        // Logs of ended instances after the retention.
+        // The logs of instances whose record is gone (another process removed it after the
+        // retention). The record is read again: a start since the list made it after the list.
+        let unseen: Vec<Arc<Local>> = self
+            .locals
+            .lock()
+            .expect("locals lock")
+            .values()
+            .filter(|l| !seen.contains(&l.id) && l.made.elapsed() >= START_GRACE)
+            .cloned()
+            .collect();
+        for l in unseen {
+            if let Ok(None) = self.api.get(Kind::ConfigMap, &object_name(l.id)).await {
+                self.drop_local(l.id);
+            }
+        }
+        // Logs of ended instances after the retention, and within the caps.
+        let _ = self.trim_locals(None);
+    }
+
+    /// Forgets the logs of ended instances past the retention; then, while more than
+    /// `max_ended_instances` are kept or their logs take more than `max_ended_log_bytes`, the
+    /// oldest ended instance of the tenant with the largest share (bytes when the byte cap is
+    /// over, else instances). With `room` (a tenant that starts an instance) and
+    /// `max_instances` kept: the oldest ended instance of the tenant that keeps the most (the
+    /// new one counted for the starter), else one of the starter's own, else `unavailable`. So
+    /// one tenant's load evicts its own ended instances first (as the Docker driver, S-61, S-67).
+    fn trim_locals(&self, room: Option<TenantId>) -> Result<(), RuntimeError> {
+        let mut map = self.locals.lock().expect("locals lock");
         let retention = self.cfg.ended_retention;
-        self.locals.lock().expect("locals lock").retain(|_, l| {
+        map.retain(|_, l| {
             l.st.lock()
                 .expect("local lock")
                 .ended_at
                 .is_none_or(|t| t.elapsed() < retention)
         });
+        loop {
+            let mut ended: HashMap<TenantId, (usize, Vec<(Instant, InstanceId)>)> = HashMap::new();
+            let mut totals: HashMap<TenantId, usize> = HashMap::new();
+            if let Some(t) = room {
+                totals.insert(t, 0);
+            }
+            for (id, l) in map.iter() {
+                *totals.entry(l.identity.tenant).or_default() += 1;
+                let st = l.st.lock().expect("local lock");
+                if let Some(at) = st.ended_at {
+                    let e = ended.entry(l.identity.tenant).or_default();
+                    e.0 += st.ring.memory();
+                    e.1.push((at, *id));
+                }
+            }
+            let count: usize = ended.values().map(|e| e.1.len()).sum();
+            let bytes: usize = ended.values().map(|e| e.0).sum();
+            let oldest = |e: &(usize, Vec<(Instant, InstanceId)>)| {
+                e.1.iter().map(|(at, _)| std::cmp::Reverse(*at)).max()
+            };
+            let by_bytes = bytes > self.cfg.max_ended_log_bytes;
+            let by_count = count > self.cfg.max_ended_instances;
+            let victim = if by_bytes || by_count {
+                ended
+                    .iter()
+                    .max_by_key(|(_, e)| (if by_bytes { e.0 } else { e.1.len() }, oldest(e)))
+                    .map(|(t, _)| *t)
+            } else if let Some(starter) = room
+                && map.len() >= self.cfg.max_instances
+            {
+                let top = totals
+                    .iter()
+                    .max_by_key(|(t, n)| {
+                        (
+                            **n + usize::from(**t == starter),
+                            ended.contains_key(*t),
+                            ended.get(*t).and_then(oldest),
+                        )
+                    })
+                    .map(|(t, _)| *t);
+                match top {
+                    Some(t) if ended.contains_key(&t) => Some(t),
+                    _ if ended.contains_key(&starter) => Some(starter),
+                    _ => {
+                        return Err(RuntimeError::Unavailable {
+                            reason: format!(
+                                "the driver keeps its maximum of {} instances",
+                                self.cfg.max_instances
+                            ),
+                        });
+                    }
+                }
+            } else {
+                return Ok(());
+            };
+            let Some(id) = victim
+                .and_then(|t| ended.get(&t))
+                .and_then(|e| e.1.iter().min_by_key(|(at, _)| *at).map(|(_, id)| *id))
+            else {
+                return Ok(());
+            };
+            if let Some(l) = map.remove(&id) {
+                for t in l.st.lock().expect("local lock").followers.drain(..) {
+                    t.abort();
+                }
+            }
+        }
     }
 
     /// Whether a pod that the sweep's first list did not name is really left over. The record is
@@ -1007,6 +1215,7 @@ impl Inner {
         if !due {
             return;
         }
+        // A pod being deleted (`Terminating`) is not registered again.
         let ip = match self.api.get(Kind::Pod, &pod).await {
             Ok(Some(p)) => match pod::view(&p) {
                 PodView::Running { ip: Some(ip), .. } => ip,
@@ -1016,6 +1225,12 @@ impl Inner {
         };
         if let Err(e) = self.register(rec, &pod, &ip).await {
             tracing::warn!(target: "ruum::runtime", code = e.code(), "registering a sandbox at the egress proxy again failed");
+            return;
+        }
+        // The list of this sweep may be old: a stop since then may have unregistered the pod
+        // before this registration. Then it goes again.
+        if let Err(e) = self.confirm(rec, &pod).await {
+            tracing::debug!(target: "ruum::runtime", code = e.code(), "a registration could not be confirmed; it was taken back");
         }
     }
 
@@ -1153,6 +1368,8 @@ impl RuntimeDriver for KubeDriver {
             }
         };
         let image = inner.image(&spec.identity, &digest).await?;
+        // Room for its logs in this process, before anything is made.
+        inner.trim_locals(Some(spec.identity.tenant))?;
         let rec = Record::new(&spec, id, image);
         let name = object_name(id);
         // The record first: a crash after it leaves a record that the sweep ends and removes
@@ -1203,6 +1420,7 @@ impl RuntimeDriver for KubeDriver {
         let local = Arc::new(Local {
             id,
             identity: spec.identity,
+            made: Instant::now(),
             redactors: Mutex::new(None),
             st: Mutex::new(LocalSt {
                 ring: Ring::new(inner.cfg.log_lines, MAX_LOG_BYTES, inner.cfg.max_line_bytes),
@@ -1364,10 +1582,23 @@ impl RuntimeDriver for KubeDriver {
             match rec.state {
                 InstanceState::Running | InstanceState::Starting => {
                     self.touch(tenant, instance).await?;
-                    return Ok(inner.status_of(&rec, Health::Unknown));
+                    // Observed, not the bare record: another process may have woken a new run,
+                    // and the gateway's address must be this run's.
+                    return self.status(tenant, instance).await;
                 }
                 InstanceState::ScaledToZero => {}
                 s => return Err(state_err("wake", &s)),
+            }
+            // The previous run's registration goes first: a new run would forget it, and its
+            // pod would be deleted while the proxy still names this app for its address.
+            if let Some(reg) = rec.registered.clone() {
+                if !inner.unregister(&reg).await {
+                    return Err(RuntimeError::Unavailable {
+                        reason: "the previous run's egress registration is not removed yet"
+                            .to_owned(),
+                    });
+                }
+                rec.registered = None;
             }
             let now = pod::now_ms();
             rec.state = InstanceState::Starting;
@@ -1472,8 +1703,17 @@ impl RuntimeDriver for KubeDriver {
         ) {
             return Err(state_err("rotate the token of", &rec.state));
         }
-        // Redact the new value before the process can read it.
-        if let Some(l) = inner.local(instance) {
+        // Redact the new value before the process can read it. Only the process that follows the
+        // log can (it holds the values): another one refuses, so a new token never reaches a
+        // log that does not redact it (fails closed; the renewal tries again).
+        let Some(l) = inner.local(instance) else {
+            return Err(RuntimeError::Unavailable {
+                reason:
+                    "the token of this instance is rotated by the server process that started it"
+                        .to_owned(),
+            });
+        };
+        {
             let all = {
                 let mut st = l.st.lock().expect("local lock");
                 st.tokens.push_back(token.expose().to_owned());

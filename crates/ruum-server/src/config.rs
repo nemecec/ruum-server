@@ -170,15 +170,15 @@ impl WorkloadTokenSettings {
 /// default: nothing runs) or `kubernetes` (pods in gVisor; the Docker driver of the laptop is
 /// wired by card I-4). The Kubernetes settings:
 ///
-/// - `RUUM_KUBE_API_URL` (default `https://kubernetes.default.svc`), `RUUM_KUBE_TOKEN_FILE`
-///   and `RUUM_KUBE_CA_FILE` (the projected token and the cluster CA);
+/// - `RUUM_KUBE_API_URL` (default `https://kubernetes.default.svc`; `https://` only),
+///   `RUUM_KUBE_TOKEN_FILE` and `RUUM_KUBE_CA_FILE` (the projected token and the cluster CA);
 /// - `RUUM_KUBE_NAMESPACE` (default `ruum-apps`) and `RUUM_KUBE_RUNTIME_CLASS` (default
 ///   `gvisor`);
 /// - `RUUM_REGISTRY`: the registry the nodes pull app images from (`host:port`); without it
 ///   every app image is `image_not_found` (fails closed);
 /// - `RUUM_KUBE_EGRESS_PROXY`: the egress proxy's Service as `host:port` (the sandboxes' only
-///   way out); `RUUM_KUBE_EGRESS_CONTROL` and `RUUM_KUBE_EGRESS_CONTROL_TOKEN_FILE`: its control
-///   listener, where the driver registers each pod's address (backlog I6-2; without them no pod
+///   way out); `RUUM_KUBE_EGRESS_CONTROL` (a Unix socket, `unix:/path`) and
+///   `RUUM_KUBE_EGRESS_CONTROL_TOKEN_FILE`: its control listener, where the driver registers each pod's address (backlog I6-2; without them no pod
 ///   is registered and the proxy refuses every sandbox, which fails closed);
 /// - `RUUM_KUBE_SPLIT_LOG_STREAMS` (`on` or `off`, default `off`): read standard output and
 ///   standard error apart (the API server's feature gate `PodLogsQuerySplitStreams`).
@@ -232,6 +232,14 @@ impl RuntimeSettings {
             }
         };
         let egress_control = get("RUUM_KUBE_EGRESS_CONTROL");
+        // The control token never crosses a network in clear: a Unix socket only, until the
+        // listener has authenticated TLS (backlog I6-2).
+        if let Some(c) = &egress_control {
+            anyhow::ensure!(
+                c.starts_with("unix:/"),
+                "RUUM_KUBE_EGRESS_CONTROL must be a Unix socket (unix:/path)"
+            );
+        }
         let egress_control_token_file =
             get("RUUM_KUBE_EGRESS_CONTROL_TOKEN_FILE").map(PathBuf::from);
         anyhow::ensure!(
@@ -245,9 +253,15 @@ impl RuntimeSettings {
                 anyhow::bail!("RUUM_KUBE_SPLIT_LOG_STREAMS must be on or off, not {other:?}")
             }
         };
+        // The service account token goes to the API server over TLS only.
+        let api_url =
+            get("RUUM_KUBE_API_URL").unwrap_or_else(|| "https://kubernetes.default.svc".into());
+        anyhow::ensure!(
+            api_url.starts_with("https://"),
+            "RUUM_KUBE_API_URL must be an https:// address"
+        );
         Ok(Self::Kubernetes(Box::new(KubeSettings {
-            api_url: get("RUUM_KUBE_API_URL")
-                .unwrap_or_else(|| "https://kubernetes.default.svc".into()),
+            api_url,
             token_file: get("RUUM_KUBE_TOKEN_FILE").map(PathBuf::from),
             ca_file: get("RUUM_KUBE_CA_FILE").map(PathBuf::from),
             namespace: get("RUUM_KUBE_NAMESPACE").unwrap_or_else(|| "ruum-apps".into()),
@@ -341,6 +355,12 @@ mod tests {
             &[("RUUM_KUBE_EGRESS_PROXY", "no-port")][..],
             &[("RUUM_KUBE_EGRESS_CONTROL", "unix:/run/x.sock")][..],
             &[("RUUM_KUBE_SPLIT_LOG_STREAMS", "yes")][..],
+            // Credentials never in clear (Kimi review of I6-1, finding 9).
+            &[("RUUM_KUBE_API_URL", "http://kubernetes.default.svc")][..],
+            &[
+                ("RUUM_KUBE_EGRESS_CONTROL", "http://ruum-egress:3129"),
+                ("RUUM_KUBE_EGRESS_CONTROL_TOKEN_FILE", "/run/t"),
+            ][..],
         ] {
             let mut all = vec![("RUUM_RUNTIME_DRIVER", "kubernetes")];
             all.extend_from_slice(bad);

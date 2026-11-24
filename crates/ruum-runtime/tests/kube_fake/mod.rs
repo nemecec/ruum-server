@@ -7,8 +7,11 @@
 //!   (`deploy/staging/charts/platform/templates/runtime-rbac.yaml`) and every other verb,
 //!   resource or namespace is `403`. So a driver change that needs a new right fails here until
 //!   the Role has it.
-//! - **Admission**: the namespace's rule of backlog S-83 (`runtimeClassName: gvisor`) and no
-//!   service account token; quantities are written back in the API server's canonical form
+//! - **Admission**: the namespace's rules of backlog S-83 as `k8s/manifests/apps-admission.yaml`
+//!   states them (`runtimeClassName: gvisor`, no service account token by automount or projected
+//!   volume, no host network, no init or ephemeral containers, only `emptyDir` volumes and the
+//!   pod's own Secret, no `envFrom`, environment values only from the pod's own Secret, the
+//!   default service account); quantities are written back in the API server's canonical form
 //!   (`64Mi`), as a real API server does.
 //! - **The kubelet**: each pod runs the conformance program of its arguments
 //!   (`ruum_core::runtime::program`): output into the log, environment values from the pod
@@ -80,6 +83,14 @@ pub enum Tamper {
     None,
     AddCapability,
     DropRuntimeClass,
+    /// An environment value from another instance's Secret.
+    InjectSecretEnv,
+    /// Another `/etc/hosts` line.
+    ChangeHostAlias,
+    /// Another service account.
+    ServiceAccount,
+    /// A host port on the container.
+    HostPort,
 }
 
 pub struct Fake {
@@ -90,6 +101,11 @@ pub struct Fake {
     registry: Mutex<HashSet<(String, String)>>,
     pub tamper: Mutex<Tamper>,
     next_ip: AtomicU32,
+    /// The next ConfigMap list answers empty (a start that the sweep's first list missed).
+    pub hide_records_once: AtomicBool,
+    /// The next log request answers "waiting to start" after 300 ms, whatever the pod does (a
+    /// short job that ended between the log request and the pod look).
+    pub log_not_ready_once: AtomicBool,
 }
 
 /// The Role of the driver, read from the chart: `(resource, verbs)`.
@@ -199,6 +215,8 @@ impl Fake {
             registry: Mutex::new(HashSet::new()),
             tamper: Mutex::new(Tamper::None),
             next_ip: AtomicU32::new(2),
+            hide_records_once: AtomicBool::new(false),
+            log_not_ready_once: AtomicBool::new(false),
         });
         let app = Router::new()
             .route(
@@ -336,6 +354,59 @@ impl Fake {
     }
 }
 
+/// The rules of `deploy/staging/k8s/manifests/apps-admission.yaml` (backlog S-83), in the same
+/// order and with the same meaning.
+pub fn admit(pod: &Value) -> Result<(), &'static str> {
+    let spec = &pod["spec"];
+    let arr = |v: &Value| v.as_array().cloned().unwrap_or_default();
+    if spec["runtimeClassName"] != json!("gvisor") {
+        return Err("pods in ruum-apps run in gVisor only");
+    }
+    if spec["automountServiceAccountToken"] != json!(false) {
+        return Err("no service account token");
+    }
+    if spec["hostNetwork"] == json!(true) {
+        return Err("never the node's network");
+    }
+    if !arr(&spec["initContainers"]).is_empty() || !arr(&spec["ephemeralContainers"]).is_empty() {
+        return Err("no init or ephemeral containers");
+    }
+    if !(spec.get("serviceAccountName").is_none() || spec["serviceAccountName"] == json!("default"))
+    {
+        return Err("the default service account only");
+    }
+    let own = pod
+        .pointer("/metadata/labels/ruum.instance")
+        .and_then(Value::as_str)
+        .map(|i| format!("ruum-i-{}", i.replace('-', "")))
+        .unwrap_or_default();
+    let own_secret = |name: &Value| !own.is_empty() && name.as_str() == Some(own.as_str());
+    for v in arr(&spec["volumes"]) {
+        let empty_dir = v.get("emptyDir").is_some();
+        let secret = v
+            .get("secret")
+            .is_some_and(|s| own_secret(&s["secretName"]));
+        if !(empty_dir || secret) {
+            return Err("volumes: only emptyDir and the instance's own Secret");
+        }
+    }
+    for c in arr(&spec["containers"]) {
+        if !arr(&c["envFrom"]).is_empty() {
+            return Err("no envFrom");
+        }
+        for e in arr(&c["env"]) {
+            if let Some(from) = e.get("valueFrom")
+                && !from
+                    .get("secretKeyRef")
+                    .is_some_and(|r| own_secret(&r["name"]))
+            {
+                return Err("environment values only from the instance's own Secret");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn plural_ok(kind: &str) -> bool {
     matches!(kind, "pods" | "configmaps" | "secrets")
 }
@@ -374,9 +445,10 @@ async fn collection_get(
             .map(|(_, v)| v.clone())
             .collect(),
     };
+    let hide = kind == "configmaps" && f.hide_records_once.swap(false, Ordering::SeqCst);
     let items: Vec<Value> = items
         .into_iter()
-        .filter(|i| matches_selector(i, sel))
+        .filter(|i| !hide && matches_selector(i, sel))
         .collect();
     axum::Json(json!({ "kind": "List", "items": items })).into_response()
 }
@@ -429,15 +501,9 @@ async fn collection_post(
             (StatusCode::CREATED, axum::Json(obj)).into_response()
         }
         _ => {
-            // Admission: the namespace's rule (backlog S-83) and no token.
-            if obj.pointer("/spec/runtimeClassName") != Some(&json!("gvisor")) {
-                return status(
-                    StatusCode::FORBIDDEN,
-                    "admission: pods in ruum-apps run in gVisor only",
-                );
-            }
-            if obj.pointer("/spec/automountServiceAccountToken") != Some(&json!(false)) {
-                return status(StatusCode::FORBIDDEN, "admission: no service account token");
+            // Admission: the namespace's rules (backlog S-83).
+            if let Err(why) = admit(&obj) {
+                return status(StatusCode::FORBIDDEN, &format!("admission: {why}"));
             }
             // The API server's canonical quantities.
             for kind in ["limits", "requests"] {
@@ -471,6 +537,25 @@ async fn collection_post(
                 }
                 Tamper::DropRuntimeClass => {
                     obj["spec"]["runtimeClassName"] = json!("runc");
+                }
+                Tamper::InjectSecretEnv => {
+                    if let Some(env) = obj
+                        .pointer_mut("/spec/containers/0/env")
+                        .and_then(Value::as_array_mut)
+                    {
+                        env.push(json!({ "name": "STOLEN", "valueFrom": { "secretKeyRef": {
+                            "name": "ruum-i-00000000000000000000000000000000", "key": "token" } } }));
+                    }
+                }
+                Tamper::ChangeHostAlias => {
+                    obj["spec"]["hostAliases"] =
+                        json!([{ "ip": "203.0.113.9", "hostnames": ["ruum-egress"] }]);
+                }
+                Tamper::ServiceAccount => {
+                    obj["spec"]["serviceAccountName"] = json!("ruum-server");
+                }
+                Tamper::HostPort => {
+                    obj["spec"]["containers"][0]["ports"][0]["hostPort"] = json!(8080);
                 }
             }
             obj["status"] = json!({ "phase": "Pending" });
@@ -647,6 +732,13 @@ async fn pod_log(
             None => return status(StatusCode::NOT_FOUND, "NotFound"),
         }
     };
+    if f.log_not_ready_once.swap(false, Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        return status(
+            StatusCode::BAD_REQUEST,
+            "container \"app\" in pod is waiting to start: ContainerCreating",
+        );
+    }
     if !started {
         return status(
             StatusCode::BAD_REQUEST,

@@ -110,6 +110,10 @@ pub(crate) struct Record {
     /// address is not given to another pod while the proxy still names this app for it.
     #[serde(default)]
     pub registered: Option<String>,
+    /// Fields this release does not know (design 12.7, decision 42): a record that a newer
+    /// release wrote keeps them when this release writes it back during a rolling update.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 pub(crate) fn now_ms() -> i64 {
@@ -171,6 +175,7 @@ impl Record {
             last_touch_ms: now,
             ended_ms: None,
             registered: None,
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -441,16 +446,53 @@ fn cpu_millis(q: &str) -> Option<u128> {
     }
 }
 
-/// Reads the pod back as the API server stored it and checks every sandbox setting: a pod that
-/// an admission step changed is refused (the driver deletes it). `Err` names the first setting
-/// that differs.
-pub(crate) fn verify(cfg: &KubeConfig, rec: &Record, pod: &Value) -> Result<(), String> {
+/// Reads the pod back as the API server stored it (`pod`) and checks every sandbox setting
+/// against the pod the driver sent (`sent`): a pod that an admission step changed is refused
+/// (the driver deletes it). Allowed differences are only the API server's defaults (canonical
+/// quantities, the default service account, defaulted probe and port fields). `Err` names the
+/// first setting that differs.
+pub(crate) fn verify(
+    cfg: &KubeConfig,
+    rec: &Record,
+    sent: &Value,
+    pod: &Value,
+) -> Result<(), String> {
     let spec = pod.get("spec").ok_or("no spec")?;
     let s = |p: &str| spec.pointer(p);
     let is = |p: &str, want: &Value| s(p) == Some(want);
     let not_true = |p: &str| s(p).and_then(Value::as_bool) != Some(true);
+    // The same as sent: absent when the driver sent none.
+    let same = |p: &str| spec.pointer(p) == sent.pointer(&format!("/spec{p}"));
     if !is("/runtimeClassName", &json!(cfg.runtime_class)) {
         return Err("runtimeClassName".into());
+    }
+    for p in [
+        "/dnsPolicy",
+        "/dnsConfig",
+        "/hostAliases",
+        "/activeDeadlineSeconds",
+        "/nodeSelector",
+        "/nodeName",
+        "/enableServiceLinks",
+        "/terminationGracePeriodSeconds",
+    ] {
+        if !same(p) {
+            return Err(p[1..].to_owned());
+        }
+    }
+    for p in ["/serviceAccountName", "/serviceAccount"] {
+        if s(p).is_some_and(|v| v != &json!("default")) {
+            return Err(p[1..].to_owned());
+        }
+    }
+    if let Some(want) = sent.pointer("/metadata/labels").and_then(Value::as_object) {
+        let got = pod.pointer("/metadata/labels").and_then(Value::as_object);
+        if want
+            .iter()
+            .any(|(k, v)| got.and_then(|g| g.get(k)) != Some(v))
+        {
+            return Err("labels".into());
+        }
     }
     if !is("/automountServiceAccountToken", &json!(false)) {
         return Err("automountServiceAccountToken".into());
@@ -495,6 +537,62 @@ pub(crate) fn verify(cfg: &KubeConfig, rec: &Record, pod: &Value) -> Result<(), 
     if !c_is("/image", &json!(rec.image)) {
         return Err("image".into());
     }
+    // The container as sent: environment (no other Secret, no injected value), arguments, no
+    // command or envFrom, the probe's command, the user and seccomp profile.
+    let c_same = |p: &str| c.pointer(p) == sent.pointer(&format!("/spec/containers/0{p}"));
+    for p in [
+        "/env",
+        "/envFrom",
+        "/args",
+        "/command",
+        "/readinessProbe/exec",
+        "/livenessProbe",
+        "/startupProbe",
+        "/lifecycle",
+        "/securityContext/runAsUser",
+        "/securityContext/runAsGroup",
+        "/securityContext/runAsNonRoot",
+        "/securityContext/seccompProfile",
+        "/securityContext/appArmorProfile",
+        "/securityContext/seLinuxOptions",
+    ] {
+        if !c_same(p) {
+            return Err(format!("the container's {}", &p[1..]));
+        }
+    }
+    // Booleans that the API server omits when false.
+    for p in ["/stdin", "/stdinOnce", "/tty"] {
+        if c.pointer(p).and_then(Value::as_bool) == Some(true) {
+            return Err(format!("the container's {}", &p[1..]));
+        }
+    }
+    let ports: Vec<(Option<&Value>, bool)> = c
+        .get("ports")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|p| {
+                    (
+                        p.get("containerPort"),
+                        p.get("hostPort")
+                            .and_then(Value::as_i64)
+                            .is_some_and(|h| h != 0)
+                            || p.get("hostIP").is_some(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let want_ports: Vec<Option<&Value>> = sent
+        .pointer("/spec/containers/0/ports")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().map(|p| p.get("containerPort")).collect())
+        .unwrap_or_default();
+    if ports.iter().any(|(_, host)| *host)
+        || ports.iter().map(|(p, _)| *p).collect::<Vec<_>>() != want_ports
+    {
+        return Err("the container's ports".into());
+    }
     if !c_is("/securityContext/allowPrivilegeEscalation", &json!(false))
         || !c_is("/securityContext/readOnlyRootFilesystem", &json!(true))
         || c.pointer("/securityContext/privileged")
@@ -538,12 +636,20 @@ pub(crate) fn verify(cfg: &KubeConfig, rec: &Record, pod: &Value) -> Result<(), 
                     .and_then(quantity);
                 if v.pointer("/emptyDir/medium") != Some(&json!("Memory"))
                     || size != Some(u128::from(rec.limits.disk_bytes))
+                    || v.as_object().is_some_and(|o| o.len() != 2)
                 {
                     return Err("the tmp volume".into());
                 }
             }
             Some("token") => {
-                if v.pointer("/secret/secretName") != Some(&json!(object_name(rec.instance))) {
+                let want = sent
+                    .pointer("/spec/volumes")
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.iter().find(|w| w.get("name") == v.get("name")));
+                if v.pointer("/secret/secretName") != Some(&json!(object_name(rec.instance)))
+                    || v.pointer("/secret/items") != want.and_then(|w| w.pointer("/secret/items"))
+                    || v.as_object().is_some_and(|o| o.len() != 2)
+                {
                     return Err("the token volume".into());
                 }
             }
@@ -587,6 +693,10 @@ pub(crate) enum PodView {
         started: Option<OffsetDateTime>,
     },
     Ended(ExitStatus),
+    /// Being deleted (`metadata.deletionTimestamp`): it may still run through its grace time,
+    /// but it is never running for the driver (no address for the gateway, no egress
+    /// registration).
+    Terminating,
 }
 
 pub(crate) fn view(pod: &Value) -> PodView {
@@ -618,6 +728,9 @@ pub(crate) fn view(pod: &Value) -> PodView {
         "Succeeded" => return PodView::Ended(ExitStatus::completed(0)),
         "Failed" => return PodView::Ended(ExitStatus::of(ExitReason::Killed)),
         _ => {}
+    }
+    if pod.pointer("/metadata/deletionTimestamp").is_some() {
+        return PodView::Terminating;
     }
     if let Some(r) = cs.and_then(|c| c.pointer("/state/running")) {
         let started = r.get("startedAt").and_then(Value::as_str).and_then(|s| {
@@ -662,6 +775,40 @@ mod tests {
         assert_eq!(quantity(""), None);
         assert_eq!(cpu_millis("250m"), Some(250));
         assert_eq!(cpu_millis("1"), Some(1000));
+    }
+
+    /// A record that a newer release wrote keeps its unknown fields when this release writes it
+    /// back (design 12.7, decision 42: expand, then contract).
+    #[test]
+    fn a_record_keeps_fields_of_a_newer_release() {
+        let id = InstanceId::new();
+        let text = format!(
+            r#"{{"v":1,"instance":"{}","identity":{{"tenant":"{}","app":"{}","deployment":"{}","environment":"live"}},
+            "kind":{{"kind":"job","timeout_ms":1000}},"routes":[],"limits":{{"cpu_millis":250,"memory_bytes":1,"disk_bytes":1}},
+            "image":"r/x@sha256:00","command":[],"env":[],"started_at_ms":1,"state":{{"state":"starting"}},"run":1,
+            "run_started_ms":1,"last_touch_ms":1,"lease":{{"holder":"b","until_ms":9}}}}"#,
+            id.0,
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7()
+        );
+        let mut rec: Record = serde_json::from_str(&text).unwrap();
+        assert_eq!(rec.extra["lease"]["holder"], "b");
+        rec.run = 2;
+        let back: Value = serde_json::to_value(&rec).unwrap();
+        assert_eq!(back["lease"], json!({ "holder": "b", "until_ms": 9 }));
+        assert_eq!(back["run"], 2);
+    }
+
+    #[test]
+    fn a_pod_being_deleted_is_not_running() {
+        let pod = json!({
+            "metadata": { "deletionTimestamp": "2026-11-24T10:00:00Z" },
+            "status": { "phase": "Running", "podIP": "10.0.0.9", "containerStatuses": [
+                { "name": CONTAINER, "ready": true, "state": { "running": { "startedAt": "2026-11-24T09:00:00Z" } } }
+            ] },
+        });
+        assert_eq!(view(&pod), PodView::Terminating);
     }
 
     #[test]

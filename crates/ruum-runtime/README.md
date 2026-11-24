@@ -163,6 +163,11 @@ Per instance `<n>` = `ruum-i-<instance id without dashes>`:
 | Secret `<n>` | The workload token (key `token`) and the secret environment values (keys `env.<NAME>`), written with `stringData`. The driver never reads it back. Kept while the instance can run (also scaled to zero), deleted when it ends. |
 | Pod `<n>-<run>` | One per run; a cold start makes the next run. Labels as the Docker driver's plus `ruum.deployment`, `ruum.instance`, `ruum.run`. |
 
+The record is shared by every server process, also by two releases during a rolling update
+(design 12.7, decision 42). A release keeps the fields it does not know when it writes a record
+back (`Record::extra`). A new field, state or kind is expand, then contract: the older release must
+read it, or leave the record alone, never rewrite it into something it does not mean.
+
 ### The pod
 
 `runtimeClassName` (the setting; `gvisor` on staging), `automountServiceAccountToken: false`,
@@ -181,9 +186,16 @@ driver does), the spec's command as `args`. Volumes: `tmp` (`emptyDir`, `medium:
 `http://127.0.0.1:<port><path>`): inside the sandbox, never from the node's network (decision
 0006 G point 1). A job gets `activeDeadlineSeconds` (its timeout, rounded up to a second), and the
 driver ends it too when the API server did not 5 s later. After create, the driver checks the
-stored pod (`pod::verify`): the runtime class, the token, the namespaces, the security contexts,
-one container, the limits (in the API server's canonical quantities), exactly the two volumes
-and mounts; a difference deletes the pod and fails the start.
+stored pod against the pod it sent (`pod::verify`): the runtime class, the token, the service
+account (`default` or none), the namespaces, DNS, `hostAliases`, the deadline, the node selection,
+the labels, the security contexts, one container with the same environment, arguments, probe
+command and ports (no host port), no `envFrom`, the limits (in the API server's canonical
+quantities), exactly the two volumes (the token volume with the same items) and mounts. A
+difference deletes the pod and fails the start. The namespace's admission policy
+(`k8s/manifests/apps-admission.yaml`, backlog S-83) holds the security part for every pod,
+whoever makes it: gVisor, no service account token (automounted or projected), the default
+service account, no init or ephemeral containers, only `emptyDir` volumes and the pod's own
+Secret `ruum-i-<ruum.instance>`, environment values only from that Secret, no `envFrom`.
 
 ### States
 
@@ -202,11 +214,25 @@ exited pod after 60 s, so its log is read), registers running pods at the egress
 `reregister_every` (a proxy restart forgets them), and deletes ended records and their Secrets
 after `ended_retention`.
 
+The record names a registration (`registered`) before the driver makes it, so a process that
+ends the run meanwhile always unregisters it (an unregistration is idempotent). After each
+registration (the first one and the sweep's again), the registering process reads the record
+again: when the run ended meanwhile, it unregisters, and when that fails it puts the name back on
+the ended record for the sweep. A pod being deleted (`deletionTimestamp`) is never running for
+the driver: no address for the gateway, no registration. The gateway's address is kept per run:
+an observation of another run or state forgets it, and `wake` of a live instance answers from an
+observation, not from the bare record.
+
 The egress unregistration comes before the pod's deletion. When it fails (three tries), the pod
 stays and the record keeps `registered`, so the address is not given to another pod while the
-proxy still names this app for it; the sweep tries again. An exited pod has already freed its
-address when the driver sees the exit: until the next sweep, a new pod on that address gets the
-proxy's `subnet_overlap` and stays `starting` (fails closed).
+proxy still names this app for it; the sweep tries again. A wake waits until the previous run's
+registration is gone (`runtime_unavailable` until then), and the sweep unregisters a left-over
+pod before it deletes it. **This does not fail closed for a pod that ended by itself** (an exit,
+an eviction, a lost node): its address is free as soon as the pod is, and until the sweep
+unregisters it (up to `sweep_every`, longer while the proxy cannot be reached), a new pod that
+gets the address runs as the old app at the egress proxy, whatever tenant it belongs to (the new
+pod's own registration gets `subnet_overlap` and it stays `starting`, but its process runs).
+Backlog I6-17 keeps `RUUM_KUBE_EGRESS_CONTROL` off until this window is closed.
 
 ### Logs
 
@@ -214,7 +240,8 @@ The process that started (or woke) an instance follows the pod log (`follow=true
 `app`) into a ring per instance, through the redactor of `ruum-core`, with the values it knows
 (the spec's secrets, previous values and tokens; a rotation adds the new token before it patches
 the Secret). Another process (another replica, or this one after a restart) cannot redact, so its
-`logs` is `runtime_unavailable`. With `split_log_streams` the two streams are read apart
+`logs` and its `rotate_token` are `runtime_unavailable` (a rotation there would put a token in the
+pod that the following process does not redact; the token renewal tries again). With `split_log_streams` the two streams are read apart
 (`stream=Stdout|Stderr`, which needs the API server's feature gate `PodLogsQuerySplitStreams`);
 otherwise both come as one, reported as standard output. A state change to exited waits up to 3 s
 for the followers to read the end. A broken stream of a running pod reconnects from that moment
@@ -249,11 +276,11 @@ proxy's control listener (`EgressRegistry`, as the Docker driver).
 | Variable | What |
 |---|---|
 | `RUUM_RUNTIME_DRIVER` | `kubernetes` (the server's default is `memory`). |
-| `RUUM_KUBE_API_URL`, `RUUM_KUBE_TOKEN_FILE`, `RUUM_KUBE_CA_FILE` | The API server, a projected token (read for every call), its CA. |
+| `RUUM_KUBE_API_URL`, `RUUM_KUBE_TOKEN_FILE`, `RUUM_KUBE_CA_FILE` | The API server (`https://` only), a projected token (read for every call), its CA. |
 | `RUUM_KUBE_NAMESPACE`, `RUUM_KUBE_RUNTIME_CLASS` | `ruum-apps`, `gvisor` by default. |
 | `RUUM_REGISTRY` | The registry the nodes pull from; unset: every app image is `image_not_found`. |
 | `RUUM_KUBE_EGRESS_PROXY` | The egress proxy's Service, `host:port` (the route `egress_proxy`, alias `ruum-egress`). |
-| `RUUM_KUBE_EGRESS_CONTROL`, `RUUM_KUBE_EGRESS_CONTROL_TOKEN_FILE` | The proxy's control listener (backlog I6-2); unset: no registration, the proxy refuses every sandbox. |
+| `RUUM_KUBE_EGRESS_CONTROL`, `RUUM_KUBE_EGRESS_CONTROL_TOKEN_FILE` | The proxy's control listener, a Unix socket only (`unix:/path`; backlog I6-2, I6-17); unset: no registration, the proxy refuses every sandbox. |
 | `RUUM_KUBE_SPLIT_LOG_STREAMS` | `on` or `off` (default). |
 
 ### Tests
@@ -269,11 +296,18 @@ network policies or the kubelet's behaviour: on staging `ops/gvisor-check.sh`,
 
 ### Known limits of the Kubernetes driver
 
-- No pids limit per pod (Kubernetes sets it per node, `podPidsLimit` of the kubelet).
+- No pids limit per pod (Kubernetes sets it per node, `podPidsLimit` of the kubelet; staging has
+  none yet: backlog I6-19).
+- Each process keeps the logs of at most `max_instances` instances (4096), and of at most
+  `max_ended_instances` ended ones (1024) with `max_ended_log_bytes` (256 MiB) of logs; past a cap
+  the oldest ended instance of the tenant with the largest share goes first (as the Docker
+  driver). Logs of an instance that another process ended go after the retention too.
+- Usage is recorded by the process whose state change won, after the change; a crash or a lost
+  answer between the two loses that run's usage (backlog I6-18).
 - The kubelet updates the token file within about a minute of a rotation (a projected Secret);
   the token issuer renews well before expiry (`apps::workload_tokens`).
-- A pod's output also goes to the node's CRI log files (rotated by the kubelet); the Docker
-  driver keeps output off the engine's disk with the log driver `none`.
+- A pod's output also goes to the node's CRI log files (rotated by the kubelet), unredacted; the
+  Docker driver keeps output off the engine's disk with the log driver `none` (backlog I6-20).
 - With two server replicas, each one's sandbox directory keeps its own map of deployment to
   instance, so a deployment can get one instance per replica.
 - A crash between the Secret and the record of a start cannot happen (the record comes first);
