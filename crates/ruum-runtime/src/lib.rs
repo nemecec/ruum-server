@@ -43,11 +43,18 @@
 //! # Docker API surface (for I-4's socket proxy)
 //!
 //! The crate README lists every call the driver makes and the labels it sets.
+//!
+//! # The Kubernetes driver (backlog I6-1)
+//!
+//! [`KubeDriver`] ([`kube`]) is the same trait on Kubernetes: one gVisor pod per run in the
+//! namespace of the sandboxes (`ruum-apps` on staging), with the same spec, limits and log
+//! redaction. The README ("Kubernetes driver") lists its API calls and its Role.
 
 pub mod builder;
 mod config;
 mod driver;
 mod egress;
+pub mod kube;
 mod logs;
 
 pub use config::{DEFAULT_HEALTH_COMMAND, DockerConfig, RuntimeKind, SharedContainer};
@@ -58,3 +65,4 @@ pub use driver::{
 pub use egress::{EgressNetwork, EgressRegistry, HttpEgressRegistry, NoEgress};
 
 pub use builder::{BuilderConfig, DockerBuilder, RegistryCredential};
+pub use kube::{KubeConfig, KubeDriver, SharedService};

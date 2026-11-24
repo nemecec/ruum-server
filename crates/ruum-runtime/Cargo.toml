@@ -1,6 +1,6 @@
 [package]
 name = "ruum-runtime"
-description = "The Docker runtime driver (card R-2a) and the node22 builder (card R-2b): app workloads and builds in sandboxed containers, plain runc or gVisor (runsc)."
+description = "The Docker runtime driver (card R-2a), the Kubernetes runtime driver (backlog I6-1) and the node22 builder (card R-2b): app workloads and builds in sandboxed containers or gVisor pods."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -30,6 +30,8 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# The fake Kubernetes API server of the Kubernetes driver's tests (I6-1).
+axum.workspace = true
 rand.workspace = true
 base64.workspace = true
 # The recording stand-in registry of the builder's push tests (R-2b).
