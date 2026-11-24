@@ -947,7 +947,7 @@ impl Inner {
                 let Some(name) = p.pointer("/metadata/name").and_then(Value::as_str) else {
                     continue;
                 };
-                if !live_pods.contains_key(name) {
+                if !live_pods.contains_key(name) && self.orphan(name).await {
                     let grace = self.cfg.stop_timeout.as_secs();
                     let _ = self.api.delete(Kind::Pod, name, Some(grace)).await;
                 }
@@ -961,6 +961,37 @@ impl Inner {
                 .ended_at
                 .is_none_or(|t| t.elapsed() < retention)
         });
+    }
+
+    /// Whether a pod that the sweep's first list did not name is really left over. The record is
+    /// read again: a start or a wake since that list made both after it. A pod is left over when
+    /// its record is gone, or names another run or a state without a pod (an exited pod stays
+    /// `EXITED_POD_KEEP`). An error keeps the pod (the next sweep looks again).
+    async fn orphan(&self, pod: &str) -> bool {
+        let Some((object, run)) = pod.rsplit_once('-') else {
+            return false;
+        };
+        let Ok(run) = run.parse::<u32>() else {
+            return false;
+        };
+        let rec = match self.api.get(Kind::ConfigMap, object).await {
+            Ok(Some(cm)) => match pod::read_record(&cm) {
+                Some((rec, _)) => rec,
+                None => return false,
+            },
+            Ok(None) => return true,
+            Err(_) => return false,
+        };
+        if rec.run != run || rec.registered.as_deref() == Some(pod) {
+            return rec.run != run && rec.registered.as_deref() != Some(pod);
+        }
+        match rec.state {
+            InstanceState::Starting | InstanceState::Running => false,
+            InstanceState::Exited(_) => rec
+                .ended_ms
+                .is_none_or(|t| pod::now_ms() - t >= ms(EXITED_POD_KEEP)),
+            _ => true,
+        }
     }
 
     async fn reregister(&self, rec: &Record) {
@@ -1022,6 +1053,7 @@ async fn follow_log(
 ) {
     let id = local.id;
     let mut reconnect = false;
+    let mut ended_once = false;
     loop {
         match inner.api.follow_log(&pod, query, reconnect).await {
             Ok(LogAnswer::Stream(r)) => {
@@ -1052,6 +1084,9 @@ async fn follow_log(
                 Ok(Some(p)) if !matches!(pod::view(&p), PodView::Ended(_)) => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
+                // The container ran and ended between the log request and this look (a short
+                // job): its log is still there, so ask once more before giving up.
+                Ok(Some(_)) if !ended_once => ended_once = true,
                 Ok(_) => break,
                 Err(_) => tokio::time::sleep(Duration::from_secs(1)).await,
             },
