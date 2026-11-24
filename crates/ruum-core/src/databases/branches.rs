@@ -245,6 +245,10 @@ pub(super) async fn make_branch(
         DataCopy::Full => src.key_node_id,
     };
     let key = deps.keys.engine_key(tenant, key_node_id).await?;
+    // DB-2 (card D-2): the source's migration lock from before the engine copy until the
+    // branch's rows (with the copies of the applied migration rows) are written, so no
+    // migration of the source runs in between. Released when this function returns.
+    let _migrations = deps.store.lock_migrations(tenant, source).await?;
     let mut masked_from = None;
     let copy = match data {
         DataCopy::SchemaOnly => CopyData::SchemaOnly,

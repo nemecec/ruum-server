@@ -3983,7 +3983,6 @@ paths:
       tags: [databases]
       operationId: listDatabaseMigrations
       x-ruum-area: databases
-      x-ruum-status: planned
       summary: The migrations of a database
       description: |
         Applied, failed and rolled back migrations, newest first. Needs `view`. For agents and
@@ -4007,7 +4006,6 @@ paths:
       tags: [databases]
       operationId: applyDatabaseMigration
       x-ruum-area: databases
-      x-ruum-status: planned
       summary: Apply a schema migration
       description: |
         Schema changes are migrations (decision 19). The platform records a restore point, runs

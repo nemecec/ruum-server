@@ -252,9 +252,9 @@ async fn initialize_and_list_every_tool_of_the_contract() {
     // the two branch tools of card D-3a, the five web app tools of card W-1, the two of card
     // W-2s (deploy_app_preview, publish_app_deployment), the four app role tools of card B-2
     // and the five telemetry read tools of card O-2 (confirmAppTelemetryFields and
-    // computeAppPseudonym are users only: no tool), and the three template tools of card L-1
-    // (list_templates, get_template, create_template).
-    assert_eq!(names.len(), 85);
+    // computeAppPseudonym are users only: no tool), the three template tools of card L-1
+    // (list_templates, get_template, create_template) and the two migration tools of card D-2.
+    assert_eq!(names.len(), 87);
     for t in [
         "create_database",
         "get_database",
@@ -268,6 +268,8 @@ async fn initialize_and_list_every_tool_of_the_contract() {
         "list_database_queries",
         "list_database_branches",
         "create_database_branch",
+        "list_database_migrations",
+        "apply_database_migration",
         "create_app",
         "get_app",
         "update_app_settings",

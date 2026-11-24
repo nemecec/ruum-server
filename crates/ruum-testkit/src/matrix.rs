@@ -77,8 +77,6 @@ pub fn is_batch(method: &str, uri: &str) -> bool {
 /// operation removes its mark in the contract and its name here (a test keeps the two equal).
 pub const PLANNED_OPERATIONS: &[&str] = &[
     // Step 2 (databases, docs/STEP2.md).
-    "listDatabaseMigrations",
-    "applyDatabaseMigration",
     "listDatabaseRestorePoints",
     "createDatabaseRestorePoint",
     "restoreDatabase",

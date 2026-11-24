@@ -68,6 +68,48 @@ pub const PENDING: &[(&str, &str)] = &[
         "trash_and_purge_take_the_branches_along",
         "needs branches: D-3",
     ),
+    // Card D-2 removed the planned marks of the migration operations; these cases also need
+    // the work of other cards.
+    (
+        "order_of_checks_for_a_destructive_statement",
+        "needs an agent's destructive statement through queryDatabase (card A-2w, the statement path of A-2; it answers 501 until then)",
+    ),
+    (
+        "an_approval_never_replaces_write_live",
+        "needs an agent's destructive statement through queryDatabase (card A-2w, the statement path of A-2; it answers 501 until then)",
+    ),
+    (
+        "who_decides_an_approval",
+        "needs an agent's destructive statement through queryDatabase (card A-2w, the statement path of A-2; it answers 501 until then)",
+    ),
+    (
+        "waiting_for_you_across_the_tenant",
+        "needs an agent's destructive statement through queryDatabase (card A-2w, the statement path of A-2; it answers 501 until then)",
+    ),
+    (
+        "a_full_branch_is_no_draft_branch",
+        "needs masked and full branches (card D-3b, the second part of D-3)",
+    ),
+    (
+        "agents_dry_run_only_on_draft_branches",
+        "needs masked and full branches (card D-3b, the second part of D-3)",
+    ),
+    (
+        "a_branch_of_a_branch_is_a_conflict",
+        "needs masked and full branches (card D-3b, the second part of D-3)",
+    ),
+    (
+        "copy_of_a_database_never_raises_the_copiers_rights",
+        "needs masked copies of a database (card D-3b with the SQLite lens of Q-3): the memory engine refuses a masked copy, so the copy stays provisioning",
+    ),
+    (
+        "guests_branch_a_database_only_with_the_policy",
+        "needs masked and full branches (card D-3b, the second part of D-3); its setup also gets 409 from addGrant (see guests_copy_a_database_only_with_the_policy)",
+    ),
+    (
+        "guests_copy_a_database_only_with_the_policy",
+        "its setup gives guest_view a second grant on Projects, which addGrant answers 409 (the grantee has a grant there): the case looks wrong (card T-1 to decide, panel/impl-d2.md); the agent's copy is also a masked copy (card D-3b)",
+    ),
 ];
 
 /// Why a case stopped.
