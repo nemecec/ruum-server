@@ -585,13 +585,93 @@ PSL entry of decision 0006 E-1 (`*.ruumapps.net`) is not enough for staging: it 
 `apps.staging.ruumapps.net` one site. Do not put anything on staging apps that needs the
 separation.
 
-**Not on staging yet** (backlog I6-1 to I6-6): a runtime driver that starts sandboxes on
-Kubernetes (the Docker driver needs a Docker engine; Talos has none), so node22 apps answer the
-gateway's 502 after the sign-in and the node22 smoke check prints BLOCKED; the registration of
-sandboxes at the egress proxy (its identity is a registered subnet; Kubernetes pods share the
-node's pod range, so the driver must register each pod address, and its control socket is
-inside the proxy's pod); the builder, the database pooler, the telemetry listeners, the key set
-of user tokens for apps (P-97); scale to zero (Knative or KEDA, STEP3 "Infrastructure work" 11).
+**Not on staging yet** (backlog I6-2 to I6-6): node22 deploys (the deploy pipeline refuses
+`runtime: node22` with `runtime_not_ready`), so node22 apps answer the gateway's 502 after the
+sign-in and the node22 smoke check prints BLOCKED; a builder and a registry on staging (the
+Docker builder needs a Docker engine; Talos has none); the registration of sandboxes at the
+egress proxy (its identity is a registered address, and its control socket is inside the
+proxy's pod: backlog I6-2, a panel question); the database pooler, the telemetry listeners, the
+key set of user tokens for apps (P-97).
+
+### The runtime driver (backlog I6-1)
+
+ruum-server starts app sandboxes as pods with `RUUM_RUNTIME_DRIVER=kubernetes`
+(`crates/ruum-runtime` `src/kube`, the same trait, spec and limits as the Docker driver of the
+laptop; its README "Kubernetes driver" lists every API call). `charts/ruum` sets it with the app
+runtime (both app images) unless `runtime.kubernetes=false`.
+
+- **The pod of a run** (`ruum-i-<instance>-<run>` in `ruum-apps`): `runtimeClassName: gvisor`,
+  no service account token, no host namespace, user 10001, read-only root, `drop: [ALL]`, no
+  privilege escalation, `RuntimeDefault` seccomp, CPU and memory limits (requests = limits), a
+  memory-backed `/tmp` of the disk limit, no DNS (`/etc/hosts` lines for the routes),
+  `restartPolicy: Never`, `activeDeadlineSeconds` for a job. The proxy variables point at the
+  egress proxy's Service, the only way out (network policies). Readiness is an exec probe inside
+  the sandbox, never from the node. The driver reads the stored pod back and deletes it when any
+  setting differs.
+- **The record and the Secret**: a ConfigMap `ruum-i-<instance>` holds the instance's state
+  (every server replica answers for every instance, also after a restart); a Secret of the same
+  name holds the workload token (mounted as the token file) and the secret environment values.
+  The driver writes the Secret and never reads it.
+- **Its rights** (`charts/platform` `runtime-rbac.yaml`): the ServiceAccount `ruum/ruum-server`
+  with a Role in `ruum-apps` only: pods (create, get, list, delete), `pods/log` (get), ConfigMaps
+  (create, get, list, update, delete), Secrets (create, patch, delete: no get, list or watch).
+  No exec, attach or port-forward, no token request, no RBAC change. The server pod mounts the
+  account's token only as a projected volume (one hour) for the API server. `ops/rbac-check.sh
+  live` checks each right and each refusal.
+- **gVisor is enforced** (backlog S-83): `k8s/manifests/apps-admission.yaml`, a
+  ValidatingAdmissionPolicy, refuses every pod in `ruum-apps` without `runtimeClassName: gvisor`
+  or with a service account token, whoever makes it. `ops/gvisor-check.sh` runs its control pod
+  (without gVisor) in `ops` and proves the rule with server-side dry runs and a positive control.
+- **The gateway** reaches a running pod at its address and the service port: the core's sandbox
+  directory takes them from the driver. Nothing starts a deployment's instance from a visit yet
+  (no node22 deploys): the directory answers `not_running`.
+- **Not yet**: no registry (`runtime.registry` empty: every app image is `image_not_found`), no
+  egress registration (I6-2: the proxy refuses every sandbox, fails closed), logs are read only
+  by the replica that started the instance (only it knows the values to redact), and stdout and
+  stderr come as one stream unless the API server has the feature gate
+  `PodLogsQuerySplitStreams` (`runtime.splitLogStreams`). Container logs also land in the node's
+  CRI log files (kubelet rotation), which the Docker driver avoids with the log driver `none`.
+
+#### The orchestrator: the driver on staging
+
+After the I-6 steps above (the I-6 apply of 2026-11-24 stopped before its platform step), with
+`main` at or after this change. Each step stops on the first error; the live release keeps
+serving.
+
+1. `RUUM_STAGING_APPLY=yes deploy/staging/secrets-push.sh platform`. New in this step: the
+   admission policy `ruum-apps-gvisor` (right after the runtime class), the ServiceAccount
+   `ruum/ruum-server` with the Role and RoleBinding `ruum-apps/ruum-runtime` (the platform chart),
+   the new lines of `ops/rbac-check.sh live` (the step stops when the driver has a right too many
+   or one too few) and the full `ops/gvisor-check.sh` (the control pod in `ops`, then
+   "ruum-apps refuses a pod without the runtime class gvisor", "ruum-apps refuses a pod with a
+   service account token" and "a restricted gVisor pod passes the admission rule"). The platform
+   step must come before the deploy: the new server pods name the ServiceAccount, and without it
+   the rollout stops (the old pods keep serving).
+2. `deploy/staging/deploy.sh <sha of main>`. ruum-server gets `RUUM_RUNTIME_DRIVER=kubernetes`,
+   the account and the projected token.
+3. Check:
+   - `deploy/staging/tool.sh kubectl -n ruum logs deploy/ruum-server | grep -E 'runtime driver|the sweep'`:
+     one line `runtime driver: Kubernetes (backlog I6-1)` per pod, the two expected warnings (no
+     egress control listener, no registry), and no `the sweep cannot list the instance records`
+     (that line means the Role or the token is wrong).
+   - `deploy/staging/tool.sh kubectl -n ruum-apps get pods,configmaps -l ruum.managed=ruum-runtime`:
+     nothing (no node22 deploys yet).
+   - `deploy/staging/status.sh --checks`: as before; the node22 line stays `BLOCKED` with the
+     reason (runtime_not_ready, no builder, no registry).
+
+Going back: `deploy.sh --rollback` gives the previous server (no driver). The ServiceAccount,
+the Role and the admission policy stay; they are harmless (nothing else makes pods in
+`ruum-apps`, and gVisor-only is what that namespace is for).
+
+**What the node22 smoke check still needs**, in order: node22 deployments in the deploy pipeline
+(the build, image and start stages, and the spec maker of the sandbox directory); a builder that
+runs on Kubernetes (build jobs as gVisor pods) and a registry the nodes pull from
+(`runtime.registry`, with the containerd mirror of the Talos machine config); the egress control
+path (I6-2) for apps that call out. Then the person deploys one node22 app and puts its host into
+`secrets.env` as `STG_SMOKE_NODE22_HOST`, and `RUUM_STAGING_SMOKE_NODE22_READY=1
+deploy/staging/status.sh --checks` must show for that host: its own certificate, no HSTS, no
+Server header, and the gateway's sign-in chain to `https://staging.ruum.space/v1/auth/login` (or
+200 for a public app). The page itself is the person's browser check.
 
 ### The person, once
 

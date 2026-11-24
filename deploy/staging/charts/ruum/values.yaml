@@ -97,6 +97,19 @@ gateway:
   wsGlobal: 1024
   wsPerTenant: 256
 
+# The runtime driver of the sandboxes (backlog I6-1, crates/ruum-runtime src/kube): ruum-server
+# makes one pod of the runtime class gvisor per run in ruum-apps, with its ServiceAccount
+# ruum/ruum-server and the Role of charts/platform runtime-rbac.yaml (the platform step applies
+# both, before the first deploy that sets this). Only with the app runtime (both images set).
+runtime:
+  kubernetes: true
+  # The registry the nodes pull app images from (host:port, RUUM_REGISTRY). Empty: none yet, so
+  # every app image is image_not_found (fails closed). Staging has no registry and no builder yet.
+  registry: ""
+  # RUUM_KUBE_SPLIT_LOG_STREAMS: read stdout and stderr apart (the API server's feature gate
+  # PodLogsQuerySplitStreams). Off: one stream, reported as stdout.
+  splitLogStreams: false
+
 # The egress proxy (card R-2e, crates/ruum-egress): the only way from a sandbox to the internet.
 # Only pods of ruum-apps reach it (charts/platform networkpolicies.yaml).
 egress:

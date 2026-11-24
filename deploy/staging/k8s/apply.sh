@@ -117,6 +117,9 @@ log "the gVisor extension on every node, then the runtime class gvisor (card I-6
 bash "$STG/ops/gvisor-check.sh" --class-only >&2 ||
   die "not every node runs the Talos extension gvisor: run deploy/staging/tool.sh bash deploy/staging/ops/upgrade-talos.sh first (README \"The app runtime\")"
 k apply -f "$HERE/manifests/runtimeclass.yaml" >/dev/null
+# Every pod of ruum-apps in gVisor, without a token (backlog S-83), before anything can make one.
+log "the admission rule of ruum-apps: gVisor only (backlog S-83)"
+k apply -f "$HERE/manifests/apps-admission.yaml" >/dev/null
 
 log "secrets, one per consumer"
 # CNPG: the backup writer key only (object read/write, no delete; review 1 B-3).
@@ -233,8 +236,8 @@ log "deploy controller (namespace ruum-deploy, backlog O-34)"
 k -n ruum-deploy rollout status deployment/deploy-controller --timeout=5m >/dev/null ||
   die "the deploy controller did not start (deploy/staging/tool.sh kubectl -n ruum-deploy describe pods)"
 log "the deployer may only write release requests (ops/rbac-check.sh live)"
-bash "$STG/ops/rbac-check.sh" live || die "the deployer, observer or deploy controller has other rights than it should (above)"
-log "gVisor: a pod of the runtime class gvisor on every node, with a control pod (ops/gvisor-check.sh)"
+bash "$STG/ops/rbac-check.sh" live || die "the deployer, observer, deploy controller or runtime driver has other rights than it should (above)"
+log "gVisor: a pod of the runtime class gvisor on every node, a control pod in ops, the admission rule (ops/gvisor-check.sh)"
 bash "$STG/ops/gvisor-check.sh" >&2 || die "the gVisor check failed (above)"
 log "deployer kubeconfig (namespaced, review 2 O-1)"
 bash "$STG/ops/deployer-kubeconfig.sh"

@@ -9,6 +9,9 @@
 # The observer (O-51) reads only troubleshooting resources and pod logs in ruum, edge and
 # ruum-deploy. Its direct and group bindings pass the same checks, with a strict allow-list.
 #
+# The runtime driver (I6-1, the ServiceAccount ruum/ruum-server) makes the pods, records and
+# Secrets of app sandboxes in ruum-apps and nothing else; it never reads a Secret (live check).
+#
 #   rbac-check.sh static FILE...   the rendered manifests (helm template; CI, tests/run.sh)
 #   rbac-check.sh live             the live cluster, with the admin kubeconfig (k8s/apply.sh runs
 #                                  it after every platform step): kubectl auth can-i --as
@@ -30,6 +33,9 @@ CONTROLLER_NS=ruum-deploy
 CONTROLLER=deploy-controller
 OBSERVER_NS=ruum
 OBSERVER=observer
+RUNTIME_NS=ruum
+RUNTIME=ruum-server
+APPS_NS=ruum-apps
 
 fail=0
 problem() { echo "rbac-check: $*" >&2; fail=1; }
@@ -301,7 +307,31 @@ live() {
     want no "$c" "$ns" list secrets
   done
   want no "$c" auth create pods
-  local o="system:serviceaccount:$OBSERVER_NS:$OBSERVER" resource verb
+  # The runtime driver (backlog I6-1, charts/platform runtime-rbac.yaml): the pods, records and
+  # Secrets of sandboxes in ruum-apps, nothing else. It never reads a Secret, uses no pod
+  # subresource but the log, gets no token and changes no RBAC.
+  local r="system:serviceaccount:$RUNTIME_NS:$RUNTIME" verb sub
+  for verb in create get list delete; do want yes "$r" "$APPS_NS" "$verb" pods; done
+  want yes "$r" "$APPS_NS" get pods log
+  for verb in create get list update delete; do want yes "$r" "$APPS_NS" "$verb" configmaps; done
+  for verb in create patch delete; do want yes "$r" "$APPS_NS" "$verb" secrets; done
+  for verb in get list watch; do want no "$r" "$APPS_NS" "$verb" secrets; done
+  for sub in exec attach portforward; do want no "$r" "$APPS_NS" create pods "$sub"; done
+  want no "$r" "$APPS_NS" patch pods ephemeralcontainers
+  want no "$r" "$APPS_NS" update pods
+  want no "$r" "$APPS_NS" patch pods
+  want no "$r" "$APPS_NS" create serviceaccounts token
+  want no "$r" "$APPS_NS" create rolebindings.rbac.authorization.k8s.io
+  want no "$r" "$APPS_NS" create roles.rbac.authorization.k8s.io
+  for ns in ruum data auth authz edge ruum-deploy ops kube-system; do
+    want no "$r" "$ns" create pods
+    want no "$r" "$ns" get secrets
+    want no "$r" "$ns" list secrets
+    want no "$r" "$ns" create configmaps
+  done
+  want no "$r" - create pods
+  want no "$r" - list secrets
+  local o="system:serviceaccount:$OBSERVER_NS:$OBSERVER" resource
   for ns in ruum edge ruum-deploy; do
     for resource in pods events events.events.k8s.io deployments.apps daemonsets.apps replicasets.apps jobs.batch; do
       for verb in get list watch; do
@@ -356,7 +386,7 @@ live() {
     done
     audit_rights "$identity" - "$allowed"
   done
-  [[ $fail == 0 ]] && echo "rbac-check: the live deployer may only write release requests; the controller has the deploy rights and no Secret; the observer is read-only"
+  [[ $fail == 0 ]] && echo "rbac-check: the live deployer may only write release requests; the controller has the deploy rights and no Secret; the observer is read-only; the runtime driver has its sandbox rights in ruum-apps only and reads no Secret"
   return "$fail"
 }
 

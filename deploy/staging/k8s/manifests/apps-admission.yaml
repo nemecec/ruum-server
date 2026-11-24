@@ -1,0 +1,44 @@
+# Admission rules of the app sandboxes (backlog S-83, Kimi run 14 I-6 finding 4; backlog I6-1).
+# Restricted Pod Security does not require a runtime class, so without this a pod in ruum-apps
+# that lacks runtimeClassName would run app code on the node's kernel. Every pod created or
+# changed in ruum-apps must run in gVisor and carry no service account token, whoever creates it
+# (the runtime driver, an operator, a bug). ops/gvisor-check.sh checks it live (a server-side dry
+# run of a pod without the class must be refused); its control pod without gVisor runs in ops.
+# k8s/apply.sh applies this file after the runtime class.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: ruum-apps-gvisor
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: ruum-apps
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  validations:
+    - expression: "has(object.spec.runtimeClassName) && object.spec.runtimeClassName == 'gvisor'"
+      message: "pods in ruum-apps run in gVisor only (runtimeClassName: gvisor; backlog S-83)"
+      reason: Forbidden
+    - expression: "has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false"
+      message: "pods in ruum-apps carry no service account token (automountServiceAccountToken: false)"
+      reason: Forbidden
+    - expression: "!has(object.spec.hostNetwork) || object.spec.hostNetwork == false"
+      message: "pods in ruum-apps never use the node's network"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: ruum-apps-gvisor
+spec:
+  policyName: ruum-apps-gvisor
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: ruum-apps

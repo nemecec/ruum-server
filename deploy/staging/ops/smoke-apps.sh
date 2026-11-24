@@ -14,9 +14,11 @@
 #    without a session goes to the gateway's sign-in (/.ruum/v1/auth/start) and from there to the
 #    platform's /v1/auth/login; a public app answers 200 at once. Not set: SKIP.
 # 4. A node22 app (RUUM_STAGING_SMOKE_NODE22, or STG_SMOKE_NODE22_HOST): the same checks. Only with
-#    RUUM_STAGING_SMOKE_NODE22_READY=1: until a runtime driver starts sandboxes on Kubernetes
-#    (backlog I6-1), the core has no sandbox directory and every node22 request ends in the
-#    gateway's 502 after sign-in, so the check prints BLOCKED instead.
+#    RUUM_STAGING_SMOKE_NODE22_READY=1. The Kubernetes runtime driver and the sandbox directory
+#    exist (backlog I6-1), but no node22 app can be live on staging yet: the deploy pipeline
+#    refuses runtime node22 (runtime_not_ready), staging has no builder and no registry, and
+#    nothing makes the spec of a deployment's instance. Until those land the check prints
+#    BLOCKED (deploy/staging/README.md "The runtime driver").
 # Content behind the sign-in (the page itself) is the person's browser check (README "The app
 # runtime"): agents cannot sign in.
 set -uo pipefail
@@ -100,7 +102,7 @@ fi
 # 4. A node22 app.
 node="${RUUM_STAGING_SMOKE_NODE22:-$(secret STG_SMOKE_NODE22_HOST)}"
 if [[ "${RUUM_STAGING_SMOKE_NODE22_READY:-}" != 1 ]]; then
-  echo "BLOCKED node22 app: no runtime driver starts sandboxes on Kubernetes yet (backlog I6-1); the gateway answers 502 after the sign-in"
+  echo "BLOCKED node22 app: the runtime driver is there (I6-1), but node22 deploys are refused (runtime_not_ready) and staging has no builder or registry yet; the gateway answers 502 after the sign-in"
 elif [[ -n "$node" && "$node" == *".$APPS" ]]; then
   app_checks node22 "$node"
 else
