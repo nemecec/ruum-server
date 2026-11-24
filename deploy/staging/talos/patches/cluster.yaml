@@ -41,6 +41,12 @@ kind: SysctlConfig
 params:
   # Caddy's on-demand TLS and many tenant hosts; also useful for NATS.
   net.core.somaxconn: "4096"
+  # gVisor (card I-6): runsc starts its gofer and sandbox in new user namespaces. Talos sets this
+  # to 0, and then every pod of the runtime class gvisor fails with "fork/exec /proc/self/exe: no
+  # space left on device". Pods cannot use it themselves: the kubelet runs with seccompDefault, and
+  # RuntimeDefault refuses unshare/clone of a user namespace without CAP_SYS_ADMIN. Only the
+  # privileged system pods (flannel, kube-proxy) are unconfined, and they already hold every right.
+  user.max_user_namespaces: "11255"
 ---
 # Pod Security "restricted" for every namespace except kube-system (the generated default
 # enforces only "baseline").
