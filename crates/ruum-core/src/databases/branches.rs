@@ -244,31 +244,29 @@ pub(super) async fn make_branch(
         DataCopy::Full => src.key_node_id,
     };
     let key = deps.keys.engine_key(tenant, key_node_id).await?;
+    let mut masked_from = None;
     let copy = match data {
         DataCopy::SchemaOnly => CopyData::SchemaOnly,
         DataCopy::Full => CopyData::Full,
         DataCopy::Masked => {
-            // The classes of the source as its lens sees them: the stricter of the column
-            // store and the manifest (the branch's first manifest is the source's head
-            // manifest). The engine refuses the copy when the source's columns change after
-            // this catalog was read (`planned_from`).
+            // The classes of the source as its lens sees them now. The engine refuses the copy
+            // when the source's columns change after this catalog was read (`planned_from`);
+            // a change of the classes is checked after the copy (below).
             let catalog = engine
                 .catalog(&src.database_ref())
                 .await
                 .map_err(engine_error)?;
-            let manifest = deps
-                .store
-                .manifest(tenant, version)
-                .await?
-                .ok_or_else(|| Error::Internal("the manifest of a branch is missing".into()))?;
-            let classes =
-                super::query::class_map_from(&*deps.columns, tenant, source, src.engine, &manifest)
-                    .await?;
-            CopyData::Masked(super::provider::mask_plan(
-                &catalog,
+            let plan = super::provider::current_mask_plan(
+                deps,
+                tenant,
+                source,
+                src.engine,
                 engine.kind(),
-                &classes,
-            ))
+                &catalog,
+            )
+            .await?;
+            masked_from = Some((catalog, plan.columns.clone()));
+            CopyData::Masked(plan)
         }
     };
     let created = engine
@@ -287,6 +285,21 @@ pub(super) async fn make_branch(
         .await
         .map_err(engine_error)?;
     let rest = async {
+        // A class of the source that became stricter between the plan and the engine's copy
+        // would leave its values in clear (Kimi review of D-3b, finding 2): the classes are
+        // read again now, after the copy, and the branch fails when the plan would differ.
+        if let Some((catalog, columns)) = &masked_from {
+            super::provider::require_same_mask_plan(
+                deps,
+                tenant,
+                source,
+                src.engine,
+                engine.kind(),
+                catalog,
+                columns,
+            )
+            .await?;
+        }
         // The lens of the branch, from its manifest (the source's confirmed classes).
         let manifest = deps
             .store
