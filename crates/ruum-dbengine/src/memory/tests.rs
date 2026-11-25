@@ -278,22 +278,196 @@ async fn an_export_loads_back_into_an_equal_database() {
     ));
 }
 
+/// Card D-3b: a masked copy of the memory engine holds pseudonyms (under the source key) for
+/// `personal` columns and `NULL` for `secret` ones; the tenant's triggers do not fire and come
+/// back; a foreign key between two masked columns still matches; the source keeps its values.
 #[tokio::test]
-async fn a_masked_copy_waits_for_the_sqlite_lens() {
+async fn a_masked_copy_masks_the_rows() {
     let engine = MemoryEngine::new();
     let f = Fixture::new(&engine).await;
+    f.migrate(
+        "CREATE TABLE users (id integer PRIMARY KEY, name text NOT NULL, email text UNIQUE, \
+           token text, age integer);\n\
+         CREATE TABLE orders (id integer PRIMARY KEY, email text REFERENCES users (email));\n\
+         CREATE TABLE audit (n integer);\n\
+         CREATE TRIGGER users_audit AFTER UPDATE ON users BEGIN INSERT INTO audit VALUES (1); END;",
+    )
+    .await
+    .unwrap();
+    f.run(
+        RoleKind::Owner,
+        StatementMode::Write,
+        "INSERT INTO users VALUES (1, 'Ann', 'ann@example.com', 's3cret', 41), \
+           (2, 'Bob', NULL, '', NULL)",
+        vec![],
+    )
+    .await
+    .unwrap();
+    f.run(
+        RoleKind::Owner,
+        StatementMode::Write,
+        "INSERT INTO orders VALUES (1, 'ann@example.com')",
+        vec![],
+    )
+    .await
+    .unwrap();
+    let col = |t: &str, c: &str| ColumnRef {
+        schema: "main".into(),
+        table: t.into(),
+        column: c.into(),
+    };
+    let plan = MaskPlan {
+        columns: vec![
+            (col("users", "email"), MaskAs::Pseudonym),
+            (col("users", "age"), MaskAs::Pseudonym),
+            (col("users", "token"), MaskAs::Null),
+            (col("orders", "email"), MaskAs::Pseudonym),
+            // A column the copy does not have is skipped.
+            (col("gone", "x"), MaskAs::Null),
+        ],
+        planned_from: None,
+    };
+    let (key, _) = conformance::test_key();
+    let copy = engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &conformance::new_database(f.db().tenant_id),
+            &CopyData::Masked(plan),
+            &key,
+        )
+        .await
+        .unwrap();
+    assert!(copy.left_out.is_empty());
+    let read = |db: DatabaseRef, sql: &'static str| {
+        let engine = &engine;
+        let key = key.clone();
+        async move {
+            engine
+                .execute(
+                    &RoleRef::new(db, RoleKind::Owner).unwrap(),
+                    &key,
+                    &StatementRequest {
+                        sql: sql.into(),
+                        params: vec![],
+                        mode: StatementMode::Read,
+                        timeout: Duration::from_secs(5),
+                        max_rows: 10,
+                        max_bytes: None,
+                    },
+                )
+                .await
+                .unwrap()
+                .rows
+        }
+    };
+    let rows = read(
+        copy.database.clone(),
+        "SELECT name, email, token, age FROM users ORDER BY id",
+    )
+    .await;
+    let ann_email = mask::pseudonym(&f.key_bytes, b"ann@example.com");
+    let ann_age = mask::pseudonym(&f.key_bytes, b"41");
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Text("Ann".into()),
+                Value::Text(ann_email.clone()),
+                Value::Null,
+                Value::Text(ann_age),
+            ],
+            // NULL stays NULL; the empty string of a secret column is kept.
+            vec![
+                Value::Text("Bob".into()),
+                Value::Null,
+                Value::Text(String::new()),
+                Value::Null,
+            ],
+        ]
+    );
+    assert_eq!(
+        read(copy.database.clone(), "SELECT email FROM orders").await,
+        vec![vec![Value::Text(ann_email)]],
+        "both sides of the foreign key hold the pseudonym of the same value"
+    );
+    assert_eq!(
+        read(copy.database.clone(), "SELECT count(*) FROM audit").await,
+        vec![vec![Value::Int(0)]],
+        "the trigger did not fire during the masking"
+    );
+    assert_eq!(
+        read(
+            copy.database.clone(),
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'trigger' AND name = 'users_audit'"
+        )
+        .await,
+        vec![vec![Value::Int(1)]],
+        "the trigger is back"
+    );
+    assert_eq!(
+        read(
+            f.db().clone(),
+            "SELECT email, token FROM users WHERE id = 1"
+        )
+        .await,
+        vec![vec![
+            Value::Text("ann@example.com".into()),
+            Value::Text("s3cret".into())
+        ]],
+        "the source keeps its values"
+    );
+}
+
+/// A masked copy whose plan was made from other columns than the source has now is refused
+/// (`NotReady`, the platform tries again), and leaves no database.
+#[tokio::test]
+async fn a_masked_copy_of_a_changed_source_is_refused() {
+    let engine = MemoryEngine::new();
+    let f = Fixture::new(&engine).await;
+    f.seed_users().await;
+    let planned = |cols: &[&str]| {
+        Some(
+            cols.iter()
+                .map(|c| PlannedColumn {
+                    column: ColumnRef {
+                        schema: "main".into(),
+                        table: "users".into(),
+                        column: (*c).into(),
+                    },
+                    identity: None,
+                })
+                .collect(),
+        )
+    };
     let (key, _) = conformance::test_key();
     let err = engine
         .copy_database(
             f.db(),
             &f.key,
             &conformance::new_database(f.db().tenant_id),
-            &CopyData::Masked(MaskPlan::default()),
+            &CopyData::Masked(MaskPlan {
+                columns: vec![],
+                planned_from: planned(&["id", "name"]),
+            }),
             &key,
         )
         .await
         .unwrap_err();
-    assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+    assert!(matches!(err, EngineError::NotReady), "{err:?}");
+    let ok = engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &conformance::new_database(f.db().tenant_id),
+            &CopyData::Masked(MaskPlan {
+                columns: vec![],
+                planned_from: planned(&["id", "name", "email"]),
+            }),
+            &key,
+        )
+        .await;
+    assert!(ok.is_ok(), "{ok:?}");
 }
 
 #[tokio::test]

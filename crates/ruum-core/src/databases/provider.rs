@@ -25,9 +25,10 @@
 //!   none; `personal` becomes a pseudonym, `secret` becomes `NULL`. A `Source::Copy` or
 //!   `Source::Template` of `createTypedNode` is still refused with `422`, so no data goes
 //!   anywhere except through the hook and a branch.
-//! - Branches (card D-3a): `createTypedNode` with `Source::Branch` and `schema_only` data
-//!   answers `202` at once and makes the branch in a task ([`super::branches`]); `masked` and
-//!   `full` branches are refused with `422` until card D-3b. A `Source::Empty` create of a node
+//! - Branches (cards D-3a and D-3b): `createTypedNode` with `Source::Branch` (`masked`,
+//!   `schema_only` or `full` data; the platform checked who may ask for which) answers `202` at
+//!   once and makes the branch in a task ([`super::branches`]). A ready masked branch whose
+//!   masking left out constraints names them in `status.message`. A `Source::Empty` create of a node
 //!   whose manifest names a `template` (a branch whose create the reconciler sends again after
 //!   a restart, without its source) is refused with `422`, so the branch ends `failed` and
 //!   never becomes an empty live database.
@@ -385,9 +386,16 @@ impl Inner {
     ) {
         let tenant = req.tenant_id;
         let target = req.node_id;
-        let outcome =
-            super::branches::make_branch(&self.deps, tenant, source, target, req.version_id, data)
-                .await;
+        let outcome = super::branches::make_branch(
+            &self.deps,
+            tenant,
+            source,
+            target,
+            req.version_id,
+            data,
+            req.by,
+        )
+        .await;
         let generation = match self.next_generation(tenant, target).await {
             Ok(g) => g,
             Err(e) => {
@@ -396,18 +404,19 @@ impl Inner {
             }
         };
         let status = match outcome {
-            Ok(key) => {
-                let status = status(
+            Ok(made) => {
+                let mut status = status(
                     target,
                     ProviderState::Ready,
                     generation,
                     Some(req.version_id),
                 );
+                status.message = super::branches::left_out_message(&made.left_out);
                 self.lock().insert(
                     (tenant, target),
                     Live {
                         status: status.clone(),
-                        key: Some(key),
+                        key: Some(made.key),
                     },
                 );
                 status
@@ -478,7 +487,9 @@ impl Inner {
                     &manifest,
                 )
                 .await?;
-                CopyData::Masked(mask_plan(&catalog, src.engine, &classes))
+                // The engine's own schema (the memory engine of the tests serves Postgres
+                // manifests with SQLite's `main`), so the plan names the columns the copy has.
+                CopyData::Masked(mask_plan(&catalog, engine.kind(), &classes))
             }
         };
         let created = engine
@@ -737,8 +748,8 @@ impl Provider for DatabaseProvider {
         if req.type_name != NODE_TYPE {
             return Err(bad_request(format!("unknown type {}", req.type_name)));
         }
-        // Only an empty database and a `schema_only` branch (card D-3a): refuse the rest, so no
-        // data (real or masked) goes anywhere.
+        // Only an empty database and a branch (cards D-3a, D-3b): refuse the rest, so no data
+        // goes anywhere except through the hook and a branch.
         let branch_of = match &req.source {
             Source::Empty => {
                 if req.manifest.get("template").is_some() {
@@ -746,11 +757,7 @@ impl Provider for DatabaseProvider {
                 }
                 None
             }
-            Source::Branch {
-                node_id,
-                data: DataCopy::SchemaOnly,
-            } => Some(*node_id),
-            Source::Branch { .. } => return Err(super::branches::data_not_available()),
+            Source::Branch { node_id, data } => Some((*node_id, *data)),
             _ => return Err(copies_not_available()),
         };
         let spec = EngineSpec::of(&req.manifest)?;
@@ -775,13 +782,8 @@ impl Provider for DatabaseProvider {
         let s = status(node, ProviderState::Provisioning, generation, None);
         self.inner.set(tenant, &s);
         match branch_of {
-            Some(source) => {
-                tokio::spawn(self.inner.clone().branch(
-                    delivery,
-                    req,
-                    source,
-                    DataCopy::SchemaOnly,
-                ));
+            Some((source, data)) => {
+                tokio::spawn(self.inner.clone().branch(delivery, req, source, data));
             }
             None => {
                 tokio::spawn(self.inner.clone().provision(delivery, req, spec));
@@ -1122,9 +1124,9 @@ mod tests {
     }
 
     /// Decision 0004-7: a manager's copy holds the real data, keeps the source's key_node_id
-    /// and becomes ready through the `copied` hook; a guest editor's copy is masked, and the
-    /// memory engine (no lens) refuses a masked copy, so the copy fails with a fixed text and
-    /// no database (fail closed).
+    /// and becomes ready through the `copied` hook; a guest editor's copy is masked: the memory
+    /// engine masks the stored rows (card D-3b), so the copy holds the pseudonym of the email
+    /// under the source's key, never the email.
     #[tokio::test]
     async fn copies_follow_the_callers_rights() {
         let w = world().await;
@@ -1191,18 +1193,18 @@ mod tests {
                 .value;
         deliver(&w.s).await;
         let db = settled(&w.s, &a, masked.id).await;
-        assert_eq!(db.status.state, ProviderState::Failed);
-        assert_eq!(db.status.reason.as_deref(), Some(REASON_COPY_FAILED));
-        assert_eq!(db.status.message.as_deref(), Some(MESSAGE_COPY_FAILED));
-        assert!(
-            w.handles
-                .databases
-                .get(w.team.id, masked.id)
-                .await
-                .unwrap()
-                .is_none(),
-            "a masked copy on an engine without a lens holds no data"
+        assert_eq!(db.status.state, ProviderState::Ready, "{:?}", db.status);
+        let source_key = w.s.tenant_keys.database_key(w.team.id, None).await.unwrap();
+        let expected = crate::privacy::HmacPseudonymizer::new(source_key)
+            .pseudonym_of_canonical("alice@example.com")
+            .id()
+            .to_string();
+        assert_eq!(
+            emails(&w, masked.id).await,
+            vec![expected],
+            "a masked copy holds the pseudonym, never the email"
         );
+        assert_eq!(emails(&w, src).await, vec!["alice@example.com"]);
     }
 
     /// The same `copied` delivery twice makes one database.

@@ -64,6 +64,10 @@ pub enum EventType {
     DatabaseGrantCreated,
     DatabaseGrantRevoked,
     DatabaseApprovalDecided,
+    /// A branch of a database was made (card D-3b). On the source database; the branch node
+    /// has its own `node.created`, so this entry changes no one's view of a node and needs no
+    /// feed rule of its own.
+    DatabaseBranchCreated,
     AppSettingsChanged,
     AppDeployed,
     AppDeploymentFailed,
@@ -109,6 +113,7 @@ impl EventType {
         EventType::DatabaseGrantCreated,
         EventType::DatabaseGrantRevoked,
         EventType::DatabaseApprovalDecided,
+        EventType::DatabaseBranchCreated,
         EventType::AppSettingsChanged,
         EventType::AppDeployed,
         EventType::AppDeploymentFailed,
@@ -146,6 +151,7 @@ impl EventType {
             DatabaseGrantCreated => "database.grant_created",
             DatabaseGrantRevoked => "database.grant_revoked",
             DatabaseApprovalDecided => "database.approval_decided",
+            DatabaseBranchCreated => "database.branch_created",
             AppSettingsChanged => "app.settings_changed",
             AppDeployed => "app.deployed",
             AppDeploymentFailed => "app.deployment_failed",
@@ -582,6 +588,9 @@ mod tests {
                     // Only a person decides an approval (`decideDatabaseApproval` is users
                     // only), so `undoAgent` never meets this entry among an agent's changes.
                     || *e == EventType::DatabaseApprovalDecided
+                    // The branch node's own `node.created` entry is the one an undo reverts
+                    // (it trashes the branch); this entry on the source has nothing to revert.
+                    || *e == EventType::DatabaseBranchCreated
                     // Only a person confirms classes (`confirmColumnClasses` is users only), so
                     // `undoAgent` never meets this entry among an agent's changes.
                     || *e == EventType::DatabaseColumnsConfirmed

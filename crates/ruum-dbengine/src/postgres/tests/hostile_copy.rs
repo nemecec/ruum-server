@@ -314,7 +314,23 @@ async fn a_masked_copy_builds_foreign_keys_again_or_leaves_them_out() {
         "orders_user_fk",
         "the key on two masked columns is built again; the other one is left out"
     );
+    assert_eq!(
+        psql(
+            &mut host,
+            "select string_agg(conname, ',' order by conname) from pg_constraint \
+              where contype in ('p', 'u') and conrelid = 'public.users'::regclass",
+        )
+        .await
+        .unwrap(),
+        "users_email_key,users_pkey",
+        "the unique key on the masked column is built again"
+    );
     close(host).await;
+    assert_eq!(
+        copy.left_out,
+        vec!["orders.orders_note_fk".to_string()],
+        "the left-out key is named (decision 0004-17)"
+    );
     let mut owner_session = session(&engine, &copy.database, RoleKind::Owner).await;
     assert_eq!(
         psql(
@@ -326,6 +342,104 @@ async fn a_masked_copy_builds_foreign_keys_again_or_leaves_them_out() {
         .await
         .unwrap(),
         "true|p_|bob@example.com"
+    );
+    close(owner_session).await;
+}
+
+/// Card D-3b (decision 0004-17): a key that the masking breaks is left out and named, and the
+/// copy succeeds. A primary key on a secret column (its values become NULL) and a `UNIQUE NULLS
+/// NOT DISTINCT` on a secret column (two NULLs collide) cannot be built again; the other keys
+/// of the same tables are built again, and no value is in clear.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_masked_copy_leaves_out_the_keys_it_breaks_and_names_them() {
+    let Some(engine) = engine().await else { return };
+    let f = Fixture::new(&engine).await;
+    f.migrate(
+        "CREATE TABLE codes (code text PRIMARY KEY, label text UNIQUE);
+         CREATE TABLE tokens (id integer PRIMARY KEY,
+           token text CONSTRAINT tokens_token_key UNIQUE NULLS NOT DISTINCT,
+           email text CONSTRAINT tokens_email_key UNIQUE);",
+    )
+    .await
+    .unwrap();
+    for insert in [
+        "INSERT INTO codes VALUES ('alpha-1', 'first'), ('beta-2', 'second')",
+        "INSERT INTO tokens VALUES (1, 'tok-a', 'a@example.com'), (2, 'tok-b', 'b@example.com')",
+    ] {
+        f.run(RoleKind::Owner, StatementMode::Write, insert, vec![])
+            .await
+            .unwrap();
+    }
+    let col = |t: &str, c: &str| ColumnRef {
+        schema: "public".into(),
+        table: t.into(),
+        column: c.into(),
+    };
+    let plan = MaskPlan {
+        columns: vec![
+            (col("codes", "code"), MaskAs::Null),
+            (col("codes", "label"), MaskAs::Pseudonym),
+            (col("tokens", "token"), MaskAs::Null),
+            (col("tokens", "email"), MaskAs::Pseudonym),
+        ],
+        planned_from: None,
+    };
+    let (key, _) = conformance::test_key();
+    let copy = engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &conformance::new_database(f.db().tenant_id),
+            &CopyData::Masked(plan),
+            &key,
+        )
+        .await
+        .expect("the masked copy succeeds");
+    assert_eq!(
+        copy.left_out,
+        vec![
+            "codes.codes_pkey".to_string(),
+            "tokens.tokens_token_key".to_string()
+        ]
+    );
+    let mut host = dbhost(&engine, &copy.database).await;
+    assert_eq!(
+        psql(
+            &mut host,
+            "select string_agg(r.relname || '.' || c.conname, ',' \
+                               order by r.relname || '.' || c.conname) \
+               from pg_constraint c join pg_class r on r.oid = c.conrelid \
+              where c.contype in ('p', 'u') \
+                and c.conrelid in ('public.codes'::regclass, 'public.tokens'::regclass)",
+        )
+        .await
+        .unwrap(),
+        "codes.codes_label_key,tokens.tokens_email_key,tokens.tokens_pkey",
+        "the keys the masking did not break are built again"
+    );
+    close(host).await;
+    let mut owner_session = session(&engine, &copy.database, RoleKind::Owner).await;
+    assert_eq!(
+        psql(
+            &mut owner_session,
+            "select count(*) filter (where code is null)::text || '|' || \
+                    count(*) filter (where left(label, 2) = 'p_')::text \
+               from codes",
+        )
+        .await
+        .unwrap(),
+        "2|2"
+    );
+    assert_eq!(
+        psql(
+            &mut owner_session,
+            "select count(*) filter (where token is null)::text || '|' || \
+                    count(*) filter (where left(email, 2) = 'p_')::text \
+               from tokens",
+        )
+        .await
+        .unwrap(),
+        "2|2"
     );
     close(owner_session).await;
 }

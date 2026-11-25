@@ -420,12 +420,14 @@ pub trait DatabaseStore: Send + Sync {
     /// transaction (the memory store: under one lock). So no catalog sync ever sees the
     /// `databases` row of a branch without its column rows (review D-3a 1): a sync either finds
     /// no row (and does nothing) or finds every row. `conflict` when the node has a row or
-    /// column rows; then nothing is written.
+    /// column rows; then nothing is written. The same transaction writes the journal entry
+    /// `database.branch_created` on the source ([`BranchCreated`], card D-3b).
     async fn insert_branch(
         &self,
         row: &DatabaseRow,
         roles: &[EngineRole],
         columns: &[classes::ColumnRow],
+        created: &BranchCreated,
     ) -> Result<()>;
 
     /// Deletes the `databases` row and its roles; returns the row.
@@ -447,6 +449,45 @@ pub trait DatabaseStore: Send + Sync {
         &self,
         grants: Arc<dyn access::grants::GrantStore>,
     ) -> Arc<dyn access::approvals::ApprovalStore>;
+}
+
+/// The journal entry `database.branch_created` that [`DatabaseStore::insert_branch`] writes
+/// with the rows of a branch (card D-3b; `contracts/events/database.branch_created.schema.json`).
+/// The entry is on the source database (`row.branch_of`), with the source's revision, by the
+/// principal pair that asked for the branch; its data are the branch's node ID, its data copy,
+/// its `branch_at` and the number of constraints the masking left out (names only in the
+/// branch's status, never here).
+#[derive(Clone, Copy, Debug)]
+pub struct BranchCreated {
+    pub by: crate::actor::Actor,
+    pub constraints_left_out: usize,
+}
+
+impl BranchCreated {
+    fn context(&self, tenant: TenantId) -> Context {
+        Context {
+            tenant,
+            actor: self.by,
+            scope: None,
+            idempotency_key: None,
+        }
+    }
+
+    fn entry(&self, row: &DatabaseRow, revision: i64, branch_at: OffsetDateTime) -> NewEntry {
+        NewEntry {
+            node_id: row.branch_of,
+            revision: Some(revision),
+            event: EventType::DatabaseBranchCreated,
+            data: serde_json::json!({
+                "branch_id": row.node_id,
+                "data": row.branch_data.map(data_copy_name),
+                "branch_at": branch_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+                "constraints_left_out": self.constraints_left_out,
+            }),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------- the memory
@@ -704,12 +745,19 @@ impl DatabaseStore for MemoryDatabaseStore {
         row: &DatabaseRow,
         roles: &[EngineRole],
         columns: &[classes::ColumnRow],
+        created: &BranchCreated,
     ) -> Result<()> {
-        if row.branch_of.is_none() {
+        let Some(source) = row.branch_of else {
             return Err(Error::Internal(
                 "insert_branch of a row without branch_of".into(),
             ));
-        }
+        };
+        let revision = self
+            .nodes
+            .peek(source)
+            .filter(|n| n.tenant_id == row.tenant_id)
+            .map(|n| n.revision)
+            .ok_or_else(|| Error::not_found("database"))?;
         // Both locks, in the order database store, then column store (no path takes them the
         // other way round): a sync reads the row through `get` and then writes the columns, so
         // it sees either no row or the row with its columns.
@@ -725,6 +773,10 @@ impl DatabaseStore for MemoryDatabaseStore {
         inner.rows.insert(key, (row.clone(), roles.to_vec()));
         inner.nodes.entry(key).or_insert(row.engine);
         inner.branches.insert(key);
+        self.journal.append(
+            &created.context(row.tenant_id),
+            created.entry(row, revision, crate::now()),
+        )?;
         Ok(())
     }
 
@@ -1225,6 +1277,7 @@ impl DatabaseStore for PgDatabaseStore {
         row: &DatabaseRow,
         roles: &[EngineRole],
         columns: &[classes::ColumnRow],
+        created: &BranchCreated,
     ) -> Result<()> {
         let Some(source) = row.branch_of else {
             return Err(Error::Internal(
@@ -1237,6 +1290,28 @@ impl DatabaseStore for PgDatabaseStore {
         for c in columns {
             classes::postgres::insert_row(&mut tx, row.tenant_id, row.node_id, c).await?;
         }
+        // The journal entry `database.branch_created` on the source (card D-3b), in the same
+        // transaction: with the source's revision and the branch's `branch_at` as written.
+        let revision: i64 =
+            sqlx::query_scalar("select revision from nodes where tenant_id = $1 and id = $2")
+                .bind(row.tenant_id)
+                .bind(source)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| Error::not_found("database"))?;
+        let branch_at: OffsetDateTime = sqlx::query_scalar(
+            "select branch_at from databases where tenant_id = $1 and node_id = $2",
+        )
+        .bind(row.tenant_id)
+        .bind(row.node_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        crate::journal::postgres::append(
+            &mut tx,
+            &created.context(row.tenant_id),
+            created.entry(row, revision, branch_at),
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2539,16 +2614,11 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        for source in [
-            Source::Copy {
-                node_id: id,
-                data: Some(DataCopy::Full),
-            },
-            Source::Branch {
-                node_id: id,
-                data: DataCopy::Full,
-            },
-        ] {
+        // A copy goes through the `copied` hook only, never `createTypedNode`.
+        for source in [Source::Copy {
+            node_id: id,
+            data: Some(DataCopy::Full),
+        }] {
             let r = provider
                 .create_typed_node(
                     crate::providers::DeliveryId::new(),
@@ -2566,6 +2636,55 @@ mod tests {
                 .await;
             assert_eq!(code(r).0, 422);
         }
+        // A branch of the purged database starts (the platform checked the caller) and fails
+        // without a source: no database (card D-3b).
+        let branch = NodeId::new();
+        let r = provider
+            .create_typed_node(
+                crate::providers::DeliveryId::new(),
+                CreateTypedNodeRequest {
+                    tenant_id: w.team.id,
+                    node_id: branch,
+                    parent_id: Some(id),
+                    type_name: NODE_TYPE.into(),
+                    version_id: VersionId::new(),
+                    manifest: sqlite(),
+                    source: Source::Branch {
+                        node_id: id,
+                        data: DataCopy::Full,
+                    },
+                    by: Actor::user(w.alice).into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!r.is_done());
+        for _ in 0..100 {
+            if provider
+                .get_typed_node_status(w.team.id, branch)
+                .await
+                .is_ok_and(|s| s.state != ProviderState::Provisioning)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            provider
+                .get_typed_node_status(w.team.id, branch)
+                .await
+                .unwrap()
+                .state,
+            ProviderState::Failed
+        );
+        assert!(
+            w.handles
+                .databases
+                .get(w.team.id, branch)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3178,8 +3297,34 @@ mod tests {
         b.branch_of = Some(source);
         b.branch_data = Some(crate::providers::DataCopy::SchemaOnly);
         b.key_node_id = Some(branch);
-        store.insert_branch(&b, &[], &columns).await.unwrap();
+        let created = BranchCreated {
+            by: crate::actor::Actor::user(user),
+            constraints_left_out: 0,
+        };
+        store
+            .insert_branch(&b, &[], &columns, &created)
+            .await
+            .unwrap();
         assert!(pg_branch_at(&pool, t, branch).await.is_some());
+        // Card D-3b: the journal entry on the source, in the same transaction.
+        let mut tx = crate::journal::postgres::begin_tenant(&pool, t)
+            .await
+            .unwrap();
+        let entries: Vec<Value> = sqlx::query_scalar(
+            "select data from journal where tenant_id = $1 and node_id = $2 \
+             and type = 'database.branch_created'",
+        )
+        .bind(t)
+        .bind(source)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["branch_id"], serde_json::json!(branch));
+        assert_eq!(entries[0]["data"], "schema_only");
+        assert_eq!(entries[0]["constraints_left_out"], 0);
+        assert!(entries[0]["branch_at"].is_string());
         assert!(pg_branch_at(&pool, t, source).await.is_none());
         let copied = pg_migrations(&pool, t, branch).await;
         assert_eq!(copied.len(), 1, "only the applied row: {copied:?}");
@@ -3200,7 +3345,10 @@ mod tests {
         );
         assert_eq!(stored[0].identity, live[0].identity);
         // A second insert is 409, and nothing more is written.
-        assert_eq!(code(store.insert_branch(&b, &[], &columns).await).0, 409);
+        assert_eq!(
+            code(store.insert_branch(&b, &[], &columns, &created).await).0,
+            409
+        );
         assert_eq!(pg_migrations(&pool, t, branch).await.len(), 1);
         assert_eq!(cols.list(t, branch).await.unwrap().len(), 1);
         let u = store.usage(t).await.unwrap();

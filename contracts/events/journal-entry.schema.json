@@ -1481,7 +1481,6 @@
         "typed_node.status_changed",
         "database.migration_applied",
         "database.migration_failed",
-        "database.branch_created",
         "database.restore_started",
         "database.restored",
         "database.restore_failed",

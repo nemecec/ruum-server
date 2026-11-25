@@ -683,8 +683,9 @@ fn operation_rule(op: &str) -> Option<Rule> {
             Role::Manage,
         ),
         "createDatabaseBranch" => guests_need_policy(node(
-            "schema_only branch (masked: the same rule): Needs edit; guests and agents of \
-             guests need guests_create_resources (default false: 403)",
+            "masked branch (the default; schema_only: the same rule; full: users with manage \
+             only): Needs edit; guests and agents of guests need guests_create_resources \
+             (default false: 403)",
             Database,
             Role::Edit,
         )),

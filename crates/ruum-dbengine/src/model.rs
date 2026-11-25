@@ -60,6 +60,12 @@ pub struct EngineRole {
 pub struct CreatedDatabase {
     pub database: DatabaseRef,
     pub roles: Vec<EngineRole>,
+    /// A masked copy only (decision 0004-17): the keys, `UNIQUE` constraints, exclusion
+    /// constraints, unique indexes and foreign keys on masked columns that could not be built
+    /// again after the masking (a pseudonym collision, or a definition that does not fit the
+    /// masked type), as `table.name`. Names only, never a value. Empty for every other copy and
+    /// for a new database.
+    pub left_out: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------------- app roles

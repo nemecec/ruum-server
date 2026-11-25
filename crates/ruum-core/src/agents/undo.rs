@@ -430,6 +430,8 @@ pub async fn invert(s: &Services, ctx: &Context, e: &JournalEntry) -> Result<Opt
         AppBindingGranted | AppBindingRevoked => return Ok(None),
         // `undo_action` gives `None`: only a person decides an approval.
         DatabaseApprovalDecided => return Ok(None),
+        // `undo_action` gives `None`: the branch's `node.created` entry trashes the branch.
+        DatabaseBranchCreated => return Ok(None),
         // `undo_action` gives `None`: a type of a newer release (backlog P-57).
         Unknown(_) => return Ok(None),
     };

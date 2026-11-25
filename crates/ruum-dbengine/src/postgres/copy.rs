@@ -386,7 +386,7 @@ async fn hand_over(
     new_roles: &[EngineRole],
     data: Data<'_>,
     key: &PseudonymKey,
-) -> Result<(), EngineError> {
+) -> Result<Vec<String>, EngineError> {
     let role = |roles: &[EngineRole], kind: RoleKind| {
         roles
             .iter()
@@ -478,6 +478,7 @@ async fn hand_over(
     result?;
     revoked?;
     // 2. The copy's owner empties or masks its tables, in a session of its own.
+    let mut left_out = Vec::new();
     if !matches!(data, Data::Keep) {
         let owner = new_roles
             .iter()
@@ -485,7 +486,7 @@ async fn hand_over(
             .cloned()
             .expect("an owner role");
         setup::grant_connect(engine, name, std::slice::from_ref(&owner)).await?;
-        change_data(engine, name, new, new_roles, &data).await?;
+        left_out = change_data(engine, name, new, new_roles, &data).await?;
     }
     // 3. ruum_dbhost makes the objects of mask again with the copy's key and builds the lens.
     // It refuses the copy when tenant code of step 2 left an object that depends on an object
@@ -504,7 +505,8 @@ async fn hand_over(
     .await;
     let _ = conn.close().await;
     result?;
-    setup::grant_connect(engine, name, new_roles).await
+    setup::grant_connect(engine, name, new_roles).await?;
+    Ok(left_out)
 }
 
 /// Refuses a copy that holds an enabled event trigger (review FU-1-2 of Kimi). The hand-over
@@ -626,14 +628,15 @@ async fn drop_copy_entry_points(conn: &mut PgConnection) -> Result<(), EngineErr
 
 /// Step 2 of a hand-over, in a session of the copy's `owner` (it owns every table and holds
 /// none of `ruum_dbhost`'s rights): parks the tenant's triggers, rules and forced row-level
-/// security, empties or masks the tables, and puts the tenant code back as it was.
+/// security, empties or masks the tables, and puts the tenant code back as it was. Returns what
+/// a masked copy left out ([`mask_columns`]).
 async fn change_data(
     engine: &PostgresEngine,
     name: &str,
     new: &NewDatabase,
     new_roles: &[EngineRole],
     data: &Data<'_>,
-) -> Result<(), EngineError> {
+) -> Result<Vec<String>, EngineError> {
     let state = DbState::new(
         name.to_string(),
         Meta {
@@ -646,15 +649,19 @@ async fn change_data(
     let result = async {
         run(&mut conn, "begin", "begin".to_string()).await?;
         let parked = park_tenant_code(&mut conn).await?;
-        match data {
-            Data::Keep => {}
-            Data::SchemaOnly => empty_tables(&mut conn).await?,
+        let left_out = match data {
+            Data::Keep => Vec::new(),
+            Data::SchemaOnly => {
+                empty_tables(&mut conn).await?;
+                Vec::new()
+            }
             Data::Masked(plan, _) => mask_columns(&mut conn, plan).await?,
-        }
+        };
         for sql in parked {
             run(&mut conn, "put the tenant code back", sql).await?;
         }
-        run(&mut conn, "commit", "commit".to_string()).await
+        run(&mut conn, "commit", "commit".to_string()).await?;
+        Ok(left_out)
     }
     .await;
     let _ = conn.close().await;
@@ -766,10 +773,13 @@ async fn empty_tables(conn: &mut PgConnection) -> Result<(), EngineError> {
 /// policy, a generated column or a trigger's `WHEN` reads, and a column that a partition or an
 /// inheritance child inherits, cannot change its type, so such a secret column fails the copy,
 /// as a personal column already did.
-async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), EngineError> {
+async fn mask_columns(
+    conn: &mut PgConnection,
+    plan: &MaskPlan,
+) -> Result<Vec<String>, EngineError> {
     check_planned_from(conn, plan).await?;
     if plan.columns.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let types = lens::pseudonym_types(conn).await?;
     // The views and materialized views of the tenant that read a masked column, also through
@@ -785,9 +795,10 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
         .await
         .map_err(|e| v.refusal(e))?;
     }
-    // Pass 1: find each masked column, and drop the foreign keys and the checks on it, before
-    // any row changes.
-    let mut fks: Vec<(String, String, String)> = Vec::new();
+    // Pass 1: find each masked column, and drop the foreign keys, the checks, the keys and the
+    // unique indexes on it, before any row changes (decision 0004-17).
+    let mut fks: Vec<(String, String, String, String)> = Vec::new();
+    let mut keys: Vec<KeyToBuild> = Vec::new();
     let mut found: Vec<FoundColumn<'_>> = Vec::new();
     for (column, how) in &plan.columns {
         if column.schema != "public" {
@@ -829,7 +840,8 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
         // Foreign keys from or to the column: drop now, build again after.
         for fk in sqlx::query(
             "select c.conname::text, c.conrelid::pg_catalog.regclass::text,
-                    pg_catalog.pg_get_constraintdef(c.oid)
+                    pg_catalog.pg_get_constraintdef(c.oid),
+                    (select r.relname::text from pg_catalog.pg_class r where r.oid = c.conrelid)
                from pg_catalog.pg_constraint c
               where c.contype = 'f'
                 and ((c.conrelid = $1::int8::pg_catalog.oid and $2::int2 = any(c.conkey))
@@ -842,7 +854,8 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
         .await
         .map_err(|e| internal("list the foreign keys", e))?
         {
-            let (name, on, def): (String, String, String) = (fk.get(0), fk.get(1), fk.get(2));
+            let (name, on, def, rel_name): (String, String, String, String) =
+                (fk.get(0), fk.get(1), fk.get(2), fk.get(3));
             run(
                 conn,
                 "drop a foreign key",
@@ -852,8 +865,8 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
                 ),
             )
             .await?;
-            if !fks.iter().any(|(n, o, _)| *n == name && *o == on) {
-                fks.push((name, on, def));
+            if !fks.iter().any(|(n, o, _, _)| *n == name && *o == on) {
+                fks.push((name, on, def, rel_name));
             }
         }
         // Checks that read the column.
@@ -876,6 +889,10 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
             )
             .await?;
         }
+        // Keys, `UNIQUE` and exclusion constraints and unique indexes that hold the column:
+        // dropped now and built again after the masking, so a pseudonym collision (or a NULL in
+        // a key on a secret column) leaves out the one key, not the whole copy.
+        drop_keys(conn, &table, rel, attnum, &column.table, &mut keys).await?;
         found.push(FoundColumn {
             column,
             how: *how,
@@ -968,20 +985,18 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
     for v in &views {
         v.make_again(conn).await?;
     }
-    for (name, on, def) in fks {
-        run(conn, "savepoint", "savepoint ruum_fk".to_string()).await?;
-        let added = run(
-            conn,
-            "build a foreign key again",
-            format!("alter table {on} add constraint {} {def}", ident(&name)),
-        )
-        .await;
-        let end = if added.is_ok() {
-            "release savepoint ruum_fk"
-        } else {
-            "rollback to savepoint ruum_fk"
-        };
-        run(conn, "end the savepoint", end.to_string()).await?;
+    // The keys first: a foreign key needs the key it references.
+    let mut left_out = Vec::new();
+    for k in keys {
+        if !build_again(conn, "build a key or a unique index again", k.sql).await? {
+            left_out.push(k.label);
+        }
+    }
+    for (name, on, def, rel_name) in fks {
+        let sql = format!("alter table {on} add constraint {} {def}", ident(&name));
+        if !build_again(conn, "build a foreign key again", sql).await? {
+            left_out.push(format!("{rel_name}.{name}"));
+        }
     }
     // The statistics of the masked tables (review FU-1 required change 2): the `ALTER COLUMN
     // TYPE` above removed the source's `most_common_vals` and `histogram_bounds` of each masked
@@ -1006,7 +1021,107 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
     if let Some(list) = list {
         run(conn, "analyze the masked tables", format!("analyze {list}")).await?;
     }
+    left_out.sort();
+    left_out.dedup();
+    Ok(left_out)
+}
+
+/// A key, a `UNIQUE` or exclusion constraint or a unique index that [`mask_columns`] dropped
+/// before the masking and builds again after it.
+struct KeyToBuild {
+    /// The index of the key (one entry per index).
+    index: i64,
+    /// `table.name`, for [`CreatedDatabase::left_out`].
+    label: String,
+    /// The statement that builds it again.
+    sql: String,
+}
+
+/// Drops the keys, `UNIQUE` and exclusion constraints and unique indexes of the table `rel`
+/// (`table`: `public.name`, quoted; `table_name`: its plain name) that hold the column `attnum`
+/// (as a key column or in an expression or predicate), and records how to build each again in
+/// `keys`. The foreign keys that reference such a key are already dropped (pass 1 drops the
+/// foreign keys from and to the column first). An index that is a partition of an index of a
+/// partitioned table goes with the parent's. The other indexes on the column stay: `ALTER
+/// COLUMN TYPE` builds them again, and only a unique one can fail on a collision.
+async fn drop_keys(
+    conn: &mut PgConnection,
+    table: &str,
+    rel: i64,
+    attnum: i16,
+    table_name: &str,
+    keys: &mut Vec<KeyToBuild>,
+) -> Result<(), EngineError> {
+    let rows = sqlx::query(
+        "select i.indexrelid::int8, x.relname::text, c.conname::text,
+                case when c.oid is not null then pg_catalog.pg_get_constraintdef(c.oid)
+                     else pg_catalog.pg_get_indexdef(i.indexrelid) end
+           from pg_catalog.pg_index i
+           join pg_catalog.pg_class x on x.oid = i.indexrelid
+           left join pg_catalog.pg_constraint c
+             on c.conindid = i.indexrelid and c.conrelid = i.indrelid and c.contype in ('p', 'u', 'x')
+          where i.indrelid = $1::int8::pg_catalog.oid
+            and (i.indisunique or i.indisprimary or i.indisexclusion or c.oid is not null)
+            and not x.relispartition
+            and ($2::int2 = any(i.indkey::int2[])
+              or exists (select 1 from pg_catalog.pg_depend d
+                          where d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                            and d.objid = i.indexrelid
+                            and d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                            and d.refobjid = i.indrelid and d.refobjsubid = $2::int2))
+          order by i.indexrelid",
+    )
+    .persistent(false)
+    .bind(rel)
+    .bind(attnum)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| internal("list the keys and unique indexes", e))?;
+    for row in rows {
+        let index: i64 = row.get(0);
+        if keys.iter().any(|k| k.index == index) {
+            continue;
+        }
+        let index_name: String = row.get(1);
+        let constraint: Option<String> = row.get(2);
+        let def: String = row.get(3);
+        let (drop, sql, name) = match constraint {
+            Some(con) => (
+                format!("alter table {table} drop constraint {}", ident(&con)),
+                format!("alter table {table} add constraint {} {def}", ident(&con)),
+                con,
+            ),
+            None => (
+                format!("drop index public.{}", ident(&index_name)),
+                def,
+                index_name,
+            ),
+        };
+        run(conn, "drop a key or a unique index", drop).await?;
+        keys.push(KeyToBuild {
+            index,
+            label: format!("{table_name}.{name}"),
+            sql,
+        });
+    }
     Ok(())
+}
+
+/// Runs `sql` under a savepoint; `false` (and the savepoint rolled back) when it fails.
+async fn build_again(
+    conn: &mut PgConnection,
+    what: &'static str,
+    sql: String,
+) -> Result<bool, EngineError> {
+    run(conn, "savepoint", "savepoint ruum_rebuild".to_string()).await?;
+    let built = run(conn, what, sql).await.is_ok();
+    let end = if built {
+        "release savepoint ruum_rebuild"
+    } else {
+        "rollback to savepoint ruum_rebuild"
+    };
+    run(conn, "end the savepoint", end.to_string()).await?;
+    Ok(built)
 }
 
 /// A masked column of the copy, found in pass 1 of [`mask_columns`].
@@ -1496,11 +1611,15 @@ pub(crate) async fn copy_database(
         CopyData::SchemaOnly => Data::SchemaOnly,
         CopyData::Masked(plan) => Data::Masked(plan, source_key),
     };
-    if let Err(e) = hand_over(engine, &name, &state.meta.roles, new, &new_roles, how, key).await {
-        setup::discard(engine, &name, &new_roles).await;
-        return Err(e);
-    }
-    finish(engine, name, new, new_roles)
+    let left_out =
+        match hand_over(engine, &name, &state.meta.roles, new, &new_roles, how, key).await {
+            Ok(left_out) => left_out,
+            Err(e) => {
+                setup::discard(engine, &name, &new_roles).await;
+                return Err(e);
+            }
+        };
+    finish(engine, name, new, new_roles, left_out)
 }
 
 fn finish(
@@ -1508,6 +1627,7 @@ fn finish(
     name: String,
     new: &NewDatabase,
     roles: Vec<EngineRole>,
+    left_out: Vec<String>,
 ) -> Result<CreatedDatabase, EngineError> {
     let meta = Meta {
         tenant_id: new.tenant_id,
@@ -1523,6 +1643,7 @@ fn finish(
             engine_name: name,
         },
         roles,
+        left_out,
     })
 }
 
@@ -1706,7 +1827,7 @@ pub(crate) async fn restore_into_new(
         setup::discard(engine, &name, &new_roles).await;
         return Err(e);
     }
-    finish(engine, name, new, new_roles)
+    finish(engine, name, new, new_roles, Vec::new())
 }
 
 /// `restore_in_place`: the database becomes a copy of the snapshot of the restore point. The
