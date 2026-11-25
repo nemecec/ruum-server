@@ -1272,7 +1272,7 @@ YAML
       init() {
         local m=()
         [[ -n "${2:-}" ]] && m=(-v "$2:${cafile:-/nonexistent}:ro")
-        docker run --rm --network "container:$apisrv" --user 65532:65532 --read-only --tmpfs "${tmpmount:-/nonexistent}" --cap-drop ALL \
+        docker run --rm ${INIT_NAME:+--name "$INIT_NAME"} --network "container:$apisrv" --user 65532:65532 --read-only --tmpfs "${tmpmount:-/nonexistent}" --cap-drop ALL \
           -e KUBERNETES_SERVICE_HOST=127.0.0.1 -e KUBERNETES_SERVICE_PORT="${PORT_OVERRIDE:-8443}" -e "SSL_CERT_FILE=${cafile:-/nonexistent}" \
           ${m[@]+"${m[@]}"} --entrypoint /bin/sh "caddy:$CADDY_VERSION-alpine" -c "$(cat "$1")"
       }
@@ -1294,10 +1294,16 @@ YAML
       # Kimi re-check of O-53: a server that accepts and never answers (busybox nc runs "sleep"
       # for each connection). wget's -T does not limit the TLS handshake, so without a hard
       # limit one try waits until the server closes. With limit=6 the script must end in time.
+      # A watchdog (30 s) removes the init container, so a script without the limit fails here
+      # instead of stalling the suite (Kimi review of the fix).
       docker exec -d "$apisrv" nc -ll -p 9444 -e sleep 600
       sleep 1
+      docker exec "$apisrv" pgrep -x nc >/dev/null || bad "the stalled stand-in (nc on 9444) did not start"
+      ( sleep 30; docker rm -f "$apisrv-stall" >/dev/null 2>&1 ) &
+      wd=$!
       t0=$SECONDS
-      out="$(PORT_OVERRIDE=9444 init "$TMP/wait-api-6.sh" "$TMP/apica.crt" 2>&1)"; rc=$?
+      out="$(INIT_NAME="$apisrv-stall" PORT_OVERRIDE=9444 init "$TMP/wait-api-6.sh" "$TMP/apica.crt" 2>&1)"; rc=$?
+      kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
       [[ $rc == 0 && "$out" == *"the API server did not answer in 6 s"*"Caddy starts anyway"* && $((SECONDS - t0)) -le 10 ]] &&
         ok "a server that never answers: the init container keeps its limit (6 s here, 120 s in the chart) and lets Caddy start" ||
         bad "the init container against a server that never answers (rc $rc, $((SECONDS - t0)) s for a limit of 6 s): $out"
@@ -2084,7 +2090,8 @@ grep -qF '"$schematic" == "$TALOS_SCHEMATIC"' "$ut" && grep -qF 'stopping before
 # Backlog O-54: upgrade-talos.sh with a fake talosctl and kubectl (one node, stg-1). Its node wait
 # fails twice as through the tunnel after a reboot ("Unable to connect to the server: EOF"), then
 # answers; the edge pod of the node answers TLS through a fake port-forward to openssl s_server.
-if command -v openssl >/dev/null && command -v jq >/dev/null && openssl x509 -help 2>&1 | grep checkhost >/dev/null; then
+# upgrade-talos.sh needs GNU timeout (coreutils, as in the tools image; Kimi review of the fix).
+if command -v openssl >/dev/null && command -v jq >/dev/null && command -v timeout >/dev/null && openssl x509 -help 2>&1 | grep checkhost >/dev/null; then
   FU="$TMP/upgrade" && mkdir -p "$FU/ops" "$FU/talos" "$FU/charts/ruum" "$FU/bin" "$FU/fake"
   cp "$ut" "$FU/ops/upgrade-talos.sh" && cp "$STG/versions.env" "$FU/versions.env" && cp "$STG/talos/schematic.yaml" "$FU/talos/"
   cp "$STG/charts/ruum/values.yaml" "$FU/charts/ruum/values.yaml"
@@ -2170,7 +2177,7 @@ while True: held.append(s.accept()[0])' "$FU_PORT" &
     echo "== upgrade-talos.sh against a stalled edge: skipped (no python3)"
   fi
 else
-  echo "== upgrade-talos.sh with fakes: skipped (no openssl with x509 -checkhost, or no jq)"
+  echo "== upgrade-talos.sh with fakes: skipped (no openssl with x509 -checkhost, no jq, or no timeout)"
 fi
 
 # Backlog O-53: the load balancer's health checks ask the edge's own paths (charts/ruum
