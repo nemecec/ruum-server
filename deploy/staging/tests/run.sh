@@ -933,9 +933,11 @@ if has helm; then
   want_rules='  - { apiGroups: [""], resources: [pods], verbs: [create, get, list, delete] }
   - { apiGroups: [""], resources: [pods/log], verbs: [get] }
   - { apiGroups: [""], resources: [configmaps], verbs: [create, get, list, update, delete] }
-  - { apiGroups: [""], resources: [secrets], verbs: [create, patch, delete] }'
+  - { apiGroups: [""], resources: [secrets], verbs: [create] }'
+  # Kimi run 15, I6-1 finding 1: create only on Secrets (patch, update and delete answer with the
+  # Secret, so each is a read).
   [[ "$(grep -E '^  - \{ apiGroups' "$TMP/runtime-rbac.yaml")" == "$want_rules" ]] &&
-    ok "the runtime driver may make pods, records and Secrets of sandboxes, and read no Secret" || bad "the runtime driver's Role differs: $(grep -E 'apiGroups' "$TMP/runtime-rbac.yaml" | tr '\n' ' ')"
+    ok "the runtime driver may make pods, records and Secrets of sandboxes, and only create Secrets (no read, patch, update or delete)" || bad "the runtime driver's Role differs: $(grep -E 'apiGroups' "$TMP/runtime-rbac.yaml" | tr '\n' ' ')"
   grep -qE 'kind: Cluster(Role|RoleBinding)' "$TMP/runtime-rbac.yaml" && bad "the runtime driver gets cluster-wide rights" || ok "the runtime driver's rights are namespaced"
   [[ "$(grep -cE '^  namespace: ruum-apps$' "$TMP/runtime-rbac.yaml")" == 2 && "$(grep -cE '^  namespace: ruum$' "$TMP/runtime-rbac.yaml")" == 1 ]] &&
     ok "its Role and RoleBinding are in ruum-apps, its ServiceAccount in ruum" || bad "runtime-rbac.yaml objects in other namespaces"
@@ -1691,6 +1693,19 @@ case "$*" in
   'get ns -o json') cat "$FAKE_NAMESPACES"; exit ;;
   'get clusterrolebindings -o json') cat "$FAKE_BINDINGS"; exit ;;
 esac
+# kubectl -n NS patch secret NAME ... --as AS (a server-side dry run): refused (Forbidden) unless
+# "AS NS patch secrets -" is in $FAKE_ALLOW.
+if [[ "${1:-} ${3:-} ${4:-}" == "-n patch secret" ]]; then
+  pns="$2" pas=""
+  shift 4
+  while [[ $# -gt 0 ]]; do
+    case "$1" in --as) pas="$2"; shift 2 ;; *) shift ;; esac
+  done
+  echo "$pas $pns patch secrets -" >>"$FAKE_QUERIES"
+  if grep -qxF "$pas $pns patch secrets -" "$FAKE_ALLOW"; then echo "secret/ruum-i-0"; exit 0; fi
+  echo "Error from server (Forbidden): secrets \"ruum-i-0\" is forbidden: User \"$pas\" cannot patch resource \"secrets\""
+  exit 1
+fi
 [[ "$1 $2" == "auth can-i" ]] || { echo "fake kubectl: unexpected $*" >&2; exit 3; }
 verb="$3" res="" sub="-" ns="-" as="" groups=" " output="table"
 if [[ "$verb" == --list ]]; then shift 3; else res="$4"; shift 4; fi
@@ -1768,7 +1783,7 @@ R=system:serviceaccount:ruum:ruum-server
 for verb in create get list delete; do echo "$R ruum-apps $verb pods -" >>"$FA/allow"; done
 echo "$R ruum-apps get pods log" >>"$FA/allow"
 for verb in create get list update delete; do echo "$R ruum-apps $verb configmaps -" >>"$FA/allow"; done
-for verb in create patch delete; do echo "$R ruum-apps $verb secrets -" >>"$FA/allow"; done
+echo "$R ruum-apps create secrets -" >>"$FA/allow"
 O=system:serviceaccount:ruum:observer
 for ns in ruum edge ruum-deploy; do
   for resource in pods events events.events.k8s.io deployments.apps daemonsets.apps replicasets.apps jobs.batch; do
@@ -1825,6 +1840,13 @@ expect 0 "the live check passes when the deployer may only write release request
 cp "$FA/allow" "$FA/allow-runtime-secrets"
 echo "$R ruum-apps get secrets -" >>"$FA/allow-runtime-secrets"
 expect 1 "the live check fails when the runtime driver may read Secrets" livecheck "$FA/allow-runtime-secrets"
+# Kimi run 15, I6-1 finding 1: a patch (or delete) right on Secrets is a read right.
+for verb in patch delete; do
+  cp "$FA/allow" "$FA/allow-runtime-$verb"
+  echo "$R ruum-apps $verb secrets -" >>"$FA/allow-runtime-$verb"
+  expect 1 "the live check fails when the runtime driver may $verb Secrets" livecheck "$FA/allow-runtime-$verb"
+done
+grep -qxF "$R ruum-apps patch secrets -" "$FA/queries" && ok "the live check tries a no-op patch of a Secret as the runtime driver" || bad "the live check does not try a no-op patch of a Secret"
 grep -v "^$R ruum-apps create pods -$" "$FA/allow" >"$FA/allow-runtime-nopods"
 expect 1 "the live check fails when the runtime driver cannot make pods" livecheck "$FA/allow-runtime-nopods"
 # Every namespace and a no-namespace review must be requested for both accounts.
@@ -2245,7 +2267,7 @@ awk '/^  name: ruum-apps$/ {on=1} on && /enforce: restricted/ {print; exit}' "$S
 # Backlog S-83: ruum-apps admits only gVisor pods without a token; the control pod is elsewhere.
 va="$STG/k8s/manifests/apps-admission.yaml"
 grep -qF "object.spec.runtimeClassName == 'gvisor'" "$va" && grep -qF 'object.spec.automountServiceAccountToken == false' "$va" &&
-  [[ "$(grep -cF 'kubernetes.io/metadata.name: ruum-apps' "$va")" == 2 ]] && grep -qF 'validationActions: [Deny]' "$va" && grep -qF 'failurePolicy: Fail' "$va" &&
+  [[ "$(grep -cF 'kubernetes.io/metadata.name: ruum-apps' "$va")" == 4 ]] && [[ "$(grep -cF 'validationActions: [Deny]' "$va")" == 2 ]] && [[ "$(grep -cF 'failurePolicy: Fail' "$va")" == 2 ]] &&
   ok "the admission policy of ruum-apps refuses a pod without gVisor or with a token (fails closed)" || bad "apps-admission.yaml"
 al="$(grep -nF 'manifests/apps-admission.yaml' "$STG/k8s/apply.sh" | cut -d: -f1)" sl="$(grep -nF 'log "secrets, one per consumer"' "$STG/k8s/apply.sh" | cut -d: -f1)"
 [[ -n "$al" && -n "$rl" && -n "$sl" && "$rl" -lt "$al" && "$al" -lt "$sl" ]] && ok "apply.sh applies the admission policy after the runtime class, before anything else" || bad "apply.sh does not apply apps-admission.yaml in its place"
@@ -2263,6 +2285,22 @@ grep -qF 'refused "with a projected service account token"' "$gc" && grep -qF "r
   ok "gvisor-check.sh proves the Secret rules live (projected token, another Secret, envFrom)" || bad "gvisor-check.sh does not check the Secret rules"
 grep -qF 'want no "$r" "$APPS_NS" "$verb" secrets' "$STG/ops/rbac-check.sh" && grep -qF 'want yes "$r" "$APPS_NS" get pods log' "$STG/ops/rbac-check.sh" &&
   ok "rbac-check.sh live checks the runtime driver's rights" || bad "rbac-check.sh does not check the runtime driver"
+grep -qF 'for verb in get list watch patch update delete deletecollection; do want no "$r" "$APPS_NS" "$verb" secrets; done' "$STG/ops/rbac-check.sh" &&
+  grep -qF 'patch_refused "$r" "$APPS_NS"' "$STG/ops/rbac-check.sh" &&
+  ok "rbac-check.sh live refuses every Secret verb but create to the runtime driver and tries a no-op patch (Kimi run 15 I6-1 finding 1)" || bad "rbac-check.sh does not refuse patch, update or delete of Secrets to the runtime driver"
+# Kimi run 15, I6-1 finding 4: every Secret in ruum-apps is an Opaque instance Secret owned by
+# its key; no service account token Secret, checked live.
+grep -qF 'resources: ["secrets"]' "$va" && grep -qF "object.type == 'Opaque'" "$va" && grep -qF "k.startsWith('kubernetes.io/service-account')" "$va" &&
+  grep -qF "object.metadata.name == variables.own" "$va" && grep -qF "object.metadata.ownerReferences[0].kind == 'ConfigMap'" "$va" &&
+  ok "the admission policy of ruum-apps admits only Opaque instance Secrets owned by their key (no service account token Secret)" || bad "apps-admission.yaml does not limit the Secrets of ruum-apps"
+grep -qF 'refused_secret "of the type kubernetes.io/service-account-token"' "$gc" && grep -qF 'refused_secret "with a service account annotation"' "$gc" &&
+  grep -qF 'an instance Secret owned by its key passes the Secret rules (the positive control)' "$gc" &&
+  ok "gvisor-check.sh proves the Secret rules live (token Secret, annotation, positive control)" || bad "gvisor-check.sh does not check the Secret rules of ruum-apps"
+# Kimi run 15, I6-1 finding 3 (S-86): the server refuses the egress control listener, and the
+# chart does not set it.
+! grep -rqF 'RUUM_KUBE_EGRESS_CONTROL' "$STG/charts/ruum/templates/" "$STG/charts/ruum/values.yaml" &&
+  grep -qF 'RUUM_KUBE_EGRESS_CONTROL is refused until backlog S-86 is fixed' "$ROOT/crates/ruum-server/src/config.rs" &&
+  ok "the egress control listener stays off (the chart does not set it, the server refuses it until S-86)" || bad "RUUM_KUBE_EGRESS_CONTROL can be set before S-86 is fixed"
 for i in ruum-gateway ruum-egress; do
   [[ "$(grep -cE "^ +- \{ image: $i, file: " "$ROOT/.github/workflows/images.yml")" == 2 ]] && ok "images.yml builds, scans and attests $i" || bad "images.yml does not publish $i"
 done

@@ -611,17 +611,26 @@ runtime (both app images) unless `runtime.kubernetes=false`.
 - **The record and the Secret**: a ConfigMap `ruum-i-<instance>` holds the instance's state
   (every server replica answers for every instance, also after a restart); a Secret of the same
   name holds the workload token (mounted as the token file) and the secret environment values.
-  The driver writes the Secret and never reads it.
+  The driver only creates the Secret; it is owned by a key ConfigMap `ruum-k-<instance>-<tag>`,
+  and the garbage collector removes it when the driver deletes the key (a token rotation, an
+  end, the record's retention).
 - **Its rights** (`charts/platform` `runtime-rbac.yaml`): the ServiceAccount `ruum/ruum-server`
   with a Role in `ruum-apps` only: pods (create, get, list, delete), `pods/log` (get), ConfigMaps
-  (create, get, list, update, delete), Secrets (create, patch, delete: no get, list or watch).
+  (create, get, list, update, delete), Secrets (create only: get, list and watch read a Secret,
+  and so do patch, update and a delete with a finalizer, which answer with the Secret; Kimi run
+  15, I6-1 finding 1).
   No exec, attach or port-forward, no token request, no RBAC change. The server pod mounts the
   account's token only as a projected volume (one hour) for the API server. `ops/rbac-check.sh
-  live` checks each right and each refusal.
+  live` checks each right and each refusal, and tries a no-op patch of a Secret as the account
+  (a server-side dry run that must be refused).
 - **gVisor is enforced** (backlog S-83): `k8s/manifests/apps-admission.yaml`, a
   ValidatingAdmissionPolicy, refuses every pod in `ruum-apps` without `runtimeClassName: gvisor`
-  or with a service account token, whoever makes it. `ops/gvisor-check.sh` runs its control pod
-  (without gVisor) in `ops` and proves the rule with server-side dry runs and a positive control.
+  or with a service account token, whoever makes it, and binds a pod's Secret by its
+  `ruum.instance` label. The pod's creator sets that label, so the rule stops mistakes and bugs,
+  not a compromised server process (backlog S-85; decision S-87 in
+  `docs/backlog/2026-11-24-run15.md`). A second policy admits only `Opaque` instance Secrets owned
+  by their key (no service account token Secret). `ops/gvisor-check.sh` runs its control pod
+  (without gVisor) in `ops` and proves both with server-side dry runs and positive controls.
 - **The gateway** reaches a running pod at its address and the service port: the core's sandbox
   directory takes them from the driver. Nothing starts a deployment's instance from a visit yet
   (no node22 deploys): the directory answers `not_running`.

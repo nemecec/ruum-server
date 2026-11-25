@@ -1,9 +1,15 @@
 # The rights of the Kubernetes runtime driver (backlog I6-1; crates/ruum-runtime src/kube): the
 # ServiceAccount of ruum-server may make the pods, records (ConfigMaps) and Secrets of app
-# sandboxes in ruum-apps, and nothing anywhere else. It never reads a Secret (no get, list or
-# watch): it writes the token and the secret values of an instance and the pod mounts them. No
-# exec, attach or port-forward, no ServiceAccount token, no RBAC change. The deploy controller's
-# rights stay apart (deployer-rbac.yaml, deploy-controller.yaml).
+# sandboxes in ruum-apps, and nothing anywhere else. On Secrets it may only create (Kimi run 15,
+# I6-1 finding 1): get, list and watch read a Secret, and so do patch and update (the answer is
+# the changed Secret, data included; a no-op patch is a read) and delete (with propagationPolicy
+# Foreground or Orphan the API server adds a finalizer and answers with the Secret). It creates
+# the token and the secret values of an instance once per key and the pod mounts them; it
+# rotates by deleting the key ConfigMap that owns the Secret (the garbage collector removes the
+# Secret) and creating the Secret again (crates/ruum-runtime src/kube pod.rs). No exec, attach or
+# port-forward, no ServiceAccount token, no RBAC change. The admission rules of ruum-apps
+# (k8s/manifests/apps-admission.yaml) limit what it may create. The deploy controller's rights
+# stay apart (deployer-rbac.yaml, deploy-controller.yaml).
 # Keep rules on one line: ops/rbac-check.sh and the driver's tests (the fake API server reads
 # this file and refuses every other verb) check each line.
 apiVersion: v1
@@ -24,7 +30,7 @@ rules:
   - { apiGroups: [""], resources: [pods], verbs: [create, get, list, delete] }
   - { apiGroups: [""], resources: [pods/log], verbs: [get] }
   - { apiGroups: [""], resources: [configmaps], verbs: [create, get, list, update, delete] }
-  - { apiGroups: [""], resources: [secrets], verbs: [create, patch, delete] }
+  - { apiGroups: [""], resources: [secrets], verbs: [create] }
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

@@ -10,7 +10,9 @@
 # ruum-deploy. Its direct and group bindings pass the same checks, with a strict allow-list.
 #
 # The runtime driver (I6-1, the ServiceAccount ruum/ruum-server) makes the pods, records and
-# Secrets of app sandboxes in ruum-apps and nothing else; it never reads a Secret (live check).
+# Secrets of app sandboxes in ruum-apps and nothing else; on Secrets it may only create (live
+# check): get, list, watch, patch, update and delete can each read a Secret (Kimi run 15, I6-1
+# finding 1), and a server-side dry run of a no-op patch must be refused.
 #
 #   rbac-check.sh static FILE...   the rendered manifests (helm template; CI, tests/run.sh)
 #   rbac-check.sh live             the live cluster, with the admin kubeconfig (k8s/apply.sh runs
@@ -222,6 +224,19 @@ can() {
   kubectl auth can-i "$verb" "$res" ${args[@]+"${args[@]}"} --as "$as" 2>&1 | tail -n 1
 }
 
+# patch_refused AS NAMESPACE: a server-side dry run of a no-op merge patch of a Secret, as AS,
+# must be refused (Forbidden). A patch answers with the changed Secret, data included, so a patch
+# right is a read right (Kimi run 15, I6-1 finding 1). The Secret need not exist: authorization
+# comes before the lookup (NotFound would mean the patch was allowed). -o name: never any data.
+patch_refused() {
+  local as="$1" ns="$2" account_ns out
+  account_ns="${as#system:serviceaccount:}"
+  account_ns="${account_ns%%:*}"
+  out="$(kubectl -n "$ns" patch secret ruum-i-00000000000000000000000000000000 --type merge -p '{}' --dry-run=server -o name \
+    --as "$as" --as-group system:serviceaccounts --as-group "system:serviceaccounts:$account_ns" --as-group system:authenticated 2>&1 | tail -n 1)"
+  [[ "$out" == *"(Forbidden)"* ]] || problem "a no-op patch of a Secret in $ns as $as was not refused: ${out:-no answer} (want Forbidden)"
+}
+
 want() { # want yes|no AS NAMESPACE VERB RESOURCE [SUBRESOURCE]
   local w="$1" got
   shift
@@ -308,14 +323,16 @@ live() {
   done
   want no "$c" auth create pods
   # The runtime driver (backlog I6-1, charts/platform runtime-rbac.yaml): the pods, records and
-  # Secrets of sandboxes in ruum-apps, nothing else. It never reads a Secret, uses no pod
-  # subresource but the log, gets no token and changes no RBAC.
+  # Secrets of sandboxes in ruum-apps, nothing else. On Secrets it only creates (every other verb
+  # can read one, Kimi run 15 I6-1 finding 1), uses no pod subresource but the log, gets no
+  # token and changes no RBAC.
   local r="system:serviceaccount:$RUNTIME_NS:$RUNTIME" verb sub
   for verb in create get list delete; do want yes "$r" "$APPS_NS" "$verb" pods; done
   want yes "$r" "$APPS_NS" get pods log
   for verb in create get list update delete; do want yes "$r" "$APPS_NS" "$verb" configmaps; done
-  for verb in create patch delete; do want yes "$r" "$APPS_NS" "$verb" secrets; done
-  for verb in get list watch; do want no "$r" "$APPS_NS" "$verb" secrets; done
+  want yes "$r" "$APPS_NS" create secrets
+  for verb in get list watch patch update delete deletecollection; do want no "$r" "$APPS_NS" "$verb" secrets; done
+  patch_refused "$r" "$APPS_NS"
   for sub in exec attach portforward; do want no "$r" "$APPS_NS" create pods "$sub"; done
   want no "$r" "$APPS_NS" patch pods ephemeralcontainers
   want no "$r" "$APPS_NS" update pods
@@ -386,7 +403,7 @@ live() {
     done
     audit_rights "$identity" - "$allowed"
   done
-  [[ $fail == 0 ]] && echo "rbac-check: the live deployer may only write release requests; the controller has the deploy rights and no Secret; the observer is read-only; the runtime driver has its sandbox rights in ruum-apps only and reads no Secret"
+  [[ $fail == 0 ]] && echo "rbac-check: the live deployer may only write release requests; the controller has the deploy rights and no Secret; the observer is read-only; the runtime driver has its sandbox rights in ruum-apps only and may only create Secrets (a no-op patch is refused)"
   return "$fail"
 }
 

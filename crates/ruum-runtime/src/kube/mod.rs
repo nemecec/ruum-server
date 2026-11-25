@@ -14,8 +14,10 @@
 //!   app gateway; the driver sets the proxy variables and `/etc/hosts` lines for the spec's
 //!   routes and registers the pod's address at the egress proxy ([`EgressRegistry`]).
 //! - **Secrets** (rule 7): the token and the secret values go into a Secret of the instance,
-//!   which the pod mounts (token file) and reads (environment values). The driver writes it and
-//!   never reads it back. Logs stream through the redactor of `ruum-core` inside the driver.
+//!   which the pod mounts (token file) and reads (environment values). The driver only creates
+//!   it (no other verb: each of them can read a Secret, [`pod`]); the Secret is owned by a key
+//!   ConfigMap, and the API server's garbage collector removes it when the driver deletes the
+//!   key. Logs stream through the redactor of `ruum-core` inside the driver.
 //! - **State in the API**: the record of each instance is a ConfigMap, so every server process
 //!   answers for every instance, and a restarted server adopts what runs ([`pod`]).
 //! - **Readiness** is an exec probe inside the sandbox (decision 0006 G point 1: never from the
@@ -30,7 +32,7 @@ use crate::logs::{Redactors, Ring};
 use api::{Api, Kind, LogAnswer, Write};
 use async_trait::async_trait;
 use futures::StreamExt;
-use pod::{HostAlias, KindRec, PodView, Record};
+use pod::{HostAlias, KindRec, LABEL_ROLE, PodView, ROLE_KEY, Record};
 use ruum_core::ids::TenantId;
 use ruum_core::runtime::redact::{MAX_KEPT_TOKENS, check_secret_set, check_secret_value};
 use ruum_core::runtime::{
@@ -65,6 +67,9 @@ const START_GRACE: Duration = Duration::from_secs(60);
 const FOLLOWER_DRAIN: Duration = Duration::from_secs(3);
 /// How long the pod of an exited run stays, so the log followers read its end.
 const EXITED_POD_KEEP: Duration = Duration::from_secs(60);
+/// The tries of a Secret create while the garbage collector removes the old Secret (a token
+/// rotation), with the wait before each next try (doubling up to 1 s): about 9 s in all.
+const SECRET_CREATE_TRIES: u32 = 12;
 
 /// A shared service of a route (the egress proxy, the internal gateway, the pooler), as the
 /// platform deploys it. The spec cannot name one.
@@ -125,12 +130,19 @@ pub struct KubeConfig {
     /// the API server needs the feature gate `PodLogsQuerySplitStreams`). Off: both come
     /// together and are reported as standard output.
     pub split_log_streams: bool,
-    /// The most instances this process keeps the logs of (running and ended); a start beyond it
-    /// forgets an ended one first (of the tenant that keeps the most) or is `unavailable`.
+    /// The most instances this process keeps the logs of (running, scaled to zero and ended); a
+    /// start beyond it forgets an ended one first (of the tenant that keeps the most) or is
+    /// `unavailable`.
     pub max_instances: usize,
+    /// The most instances of one tenant that are not ended (running or scaled to zero) this
+    /// process keeps: a start beyond it is `unavailable`, so one tenant never takes every slot
+    /// of `max_instances` (Kimi run 15, I6-1 finding 5; backlog R2A-9).
+    pub max_tenant_instances: usize,
     /// The most ended instances whose logs this process keeps, and their log bytes in all; past
     /// either, the oldest ended instance of the tenant with the largest share is forgotten
-    /// (as the Docker driver, backlog S-61).
+    /// (as the Docker driver, backlog S-61). The logs of instances scaled to zero count to the
+    /// byte cap too: past it, the oldest of them (of the tenant with the most bytes) loses its
+    /// log lines and keeps the rest (its redaction values, for a wake and a token rotation).
     pub max_ended_instances: usize,
     pub max_ended_log_bytes: usize,
 }
@@ -167,6 +179,7 @@ impl KubeConfig {
             reregister_every: Duration::from_secs(60),
             split_log_streams: false,
             max_instances: 4096,
+            max_tenant_instances: 512,
             max_ended_instances: 1024,
             max_ended_log_bytes: 256 * 1024 * 1024,
         }
@@ -192,8 +205,11 @@ impl KubeConfig {
                 "the log ring and the line cap must be above zero and within the redactor's",
             );
         }
-        if self.max_instances == 0 {
-            return bad("the instance cap must be above zero");
+        if self.max_instances == 0 || self.max_tenant_instances == 0 {
+            return bad("the instance caps must be above zero");
+        }
+        if self.max_tenant_instances > self.max_instances {
+            return bad("a tenant's instance cap is at most the instance cap");
         }
         if self.health_command.is_empty() || self.sweep_every.is_zero() {
             return bad("the health command and the sweep interval must be set");
@@ -216,6 +232,9 @@ struct Local {
     identity: WorkloadIdentity,
     /// When this process made it (a start in progress has a record only after this).
     made: Instant,
+    /// The secret environment values as Secret keys and values: a token rotation creates the
+    /// Secret again with them (the driver cannot read it).
+    secret_env: Vec<(String, String)>,
     redactors: Mutex<Option<Arc<Mutex<Redactors>>>>,
     st: Mutex<LocalSt>,
 }
@@ -229,6 +248,8 @@ struct LocalSt {
     /// The last request (`touch`) this process saw.
     touched_ms: i64,
     ended_at: Option<Instant>,
+    /// Since when the instance is scaled to zero (`None` while a run is live or after its end).
+    parked_at: Option<Instant>,
 }
 
 impl LocalSt {
@@ -567,7 +588,8 @@ impl Inner {
 
     /// Ends the current run: the record moves to `to` (only if nobody changed it), and the
     /// process that made the change does the rest: usage, the unregistration, then the pod
-    /// (and for an ended instance the Secret). `Ok(None)`: another process was first.
+    /// (and for an ended instance the keys, so the Secret goes). `Ok(None)`: another process was
+    /// first.
     async fn end_run(
         &self,
         mut rec: Record,
@@ -595,17 +617,110 @@ impl Inner {
             .await;
         if matches!(to, InstanceState::Stopped | InstanceState::Exited(_)) {
             if let Some(l) = self.local(rec.instance) {
-                l.st.lock().expect("local lock").ended_at = Some(Instant::now());
+                let mut st = l.st.lock().expect("local lock");
+                st.ended_at = Some(Instant::now());
+                st.parked_at = None;
             }
-            if let Err(e) = self
-                .api
-                .delete(Kind::Secret, &object_name(rec.instance), None)
-                .await
-            {
-                tracing::warn!(target: "ruum::runtime", code = e.code(), "deleting an instance Secret failed");
-            }
+            self.drop_keys(rec.instance, None).await;
+        } else if to == InstanceState::ScaledToZero
+            && let Some(l) = self.local(rec.instance)
+        {
+            l.st.lock().expect("local lock").parked_at = Some(Instant::now());
         }
         Ok(Some(rec))
+    }
+
+    /// The labels that select the keys of an instance.
+    fn key_selector(&self, id: InstanceId) -> Vec<(String, String)> {
+        let mut sel: Vec<(String, String)> = vec![
+            (LABEL_MANAGED.to_owned(), MANAGED.to_owned()),
+            (LABEL_ROLE.to_owned(), ROLE_KEY.to_owned()),
+            (crate::driver::LABEL_INSTANCE.to_owned(), id.0.to_string()),
+        ];
+        for (k, v) in &self.cfg.extra_labels {
+            sel.push((k.clone(), v.clone()));
+        }
+        sel
+    }
+
+    /// Deletes every key of an instance but `keep`, so the garbage collector removes the Secret
+    /// they own. `false`: a list or a delete failed (the sweep tries again for an ended instance;
+    /// a removed record takes its keys with it).
+    async fn drop_keys(&self, id: InstanceId, keep: Option<&str>) -> bool {
+        let sel = self.key_selector(id);
+        let sel: Vec<(&str, &str)> = sel.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let keys = match self.api.list(Kind::ConfigMap, &sel).await {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::warn!(target: "ruum::runtime", code = e.code(), "listing the keys of an instance failed");
+                return false;
+            }
+        };
+        let mut ok = true;
+        for k in keys {
+            let Some(name) = k.pointer("/metadata/name").and_then(Value::as_str) else {
+                continue;
+            };
+            if Some(name) == keep {
+                continue;
+            }
+            if let Err(e) = self.api.delete(Kind::ConfigMap, name, None).await {
+                tracing::warn!(target: "ruum::runtime", code = e.code(), "deleting a key of an instance failed");
+                ok = false;
+            }
+        }
+        ok
+    }
+
+    /// Makes a new key of an instance, owned by its record (`record_uid`): its name and uid.
+    async fn new_key(
+        &self,
+        identity: &WorkloadIdentity,
+        id: InstanceId,
+        record_uid: &str,
+    ) -> Result<(String, String), RuntimeError> {
+        let tag = uuid::Uuid::now_v7().simple().to_string();
+        let body = pod::key_body(&self.cfg, identity, id, &tag, record_uid);
+        let name = pod::key_name(id, &tag);
+        match self.api.create(Kind::ConfigMap, &body).await? {
+            Write::Done(v) => match v.pointer("/metadata/uid").and_then(Value::as_str) {
+                Some(uid) if !uid.is_empty() => Ok((name, uid.to_owned())),
+                _ => Err(RuntimeError::Internal {
+                    reason: format!("the API server gave the key {name} no uid"),
+                }),
+            },
+            _ => Err(RuntimeError::Internal {
+                reason: format!("the key {name} exists already"),
+            }),
+        }
+    }
+
+    /// Creates the instance Secret under the key `key` (name, uid). `tries` above 1: an old
+    /// Secret that the garbage collector has not removed yet is waited for.
+    async fn create_secret(
+        &self,
+        identity: &WorkloadIdentity,
+        id: InstanceId,
+        token: &str,
+        env: &[(String, String)],
+        key: (&str, &str),
+        tries: u32,
+    ) -> Result<(), RuntimeError> {
+        let body = pod::secret_body(&self.cfg, identity, id, token, env, key);
+        let mut wait = Duration::from_millis(50);
+        for i in 0..tries {
+            match self.api.create(Kind::Secret, &body).await? {
+                Write::Done(_) => return Ok(()),
+                _ if i + 1 < tries => {
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(Duration::from_secs(1));
+                }
+                _ => {}
+            }
+        }
+        Err(RuntimeError::Unavailable {
+            reason: format!("the instance Secret {} exists already", object_name(id)),
+        })
     }
 
     /// The unregistration, then the pod. With a failed unregistration the pod stays (so its
@@ -936,6 +1051,7 @@ impl Inner {
             return;
         }
         st.followed_run = run;
+        st.parked_at = None;
         let redactors = Arc::new(Mutex::new(Redactors::new(
             &st.values(),
             self.cfg.max_line_bytes,
@@ -980,11 +1096,30 @@ impl Inner {
         };
         let mut live_pods: HashMap<String, bool> = HashMap::new();
         let mut seen: std::collections::HashSet<InstanceId> = std::collections::HashSet::new();
+        // The keys in the list, and the instances whose keys must go (ended).
+        let mut keys: Vec<(String, String)> = Vec::new();
+        let mut keep_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
         let now = pod::now_ms();
         for cm in records {
             let Some((rec, _)) = pod::read_record(&cm) else {
+                let label = |k: &str| {
+                    cm.pointer(&format!("/metadata/labels/{k}"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                };
+                if label(LABEL_ROLE).as_deref() == Some(ROLE_KEY)
+                    && let (Some(name), Some(inst)) = (
+                        cm.pointer("/metadata/name").and_then(Value::as_str),
+                        label(crate::driver::LABEL_INSTANCE),
+                    )
+                {
+                    keys.push((name.to_owned(), inst));
+                }
                 continue;
             };
+            if !matches!(rec.state, InstanceState::Stopped | InstanceState::Exited(_)) {
+                keep_keys.insert(rec.instance.0.to_string());
+            }
             let id = rec.instance;
             seen.insert(id);
             match rec.state {
@@ -1015,13 +1150,18 @@ impl Inner {
                     }
                 }
                 _ => {
-                    // Another process may have ended it: its logs here start their retention.
-                    if matches!(rec.state, InstanceState::Stopped | InstanceState::Exited(_))
-                        && let Some(l) = self.local(id)
-                    {
+                    // Another process may have ended it: its logs here start their retention. Or
+                    // scaled it to zero: its logs here count to the byte cap.
+                    if let Some(l) = self.local(id) {
                         let mut st = l.st.lock().expect("local lock");
-                        if st.ended_at.is_none() {
-                            st.ended_at = Some(Instant::now());
+                        if matches!(rec.state, InstanceState::Stopped | InstanceState::Exited(_)) {
+                            st.parked_at = None;
+                            if st.ended_at.is_none() {
+                                st.ended_at = Some(Instant::now());
+                            }
+                        } else if rec.state == InstanceState::ScaledToZero && st.parked_at.is_none()
+                        {
+                            st.parked_at = Some(Instant::now());
                         }
                     }
                     // A registration or a pod that a failed step left.
@@ -1041,12 +1181,24 @@ impl Inner {
                         .ended_ms
                         .is_some_and(|t| now - t > ms(self.cfg.ended_retention));
                     if expired && rec.registered.is_none() {
-                        let name = object_name(id);
-                        let _ = self.api.delete(Kind::Secret, &name, None).await;
-                        let _ = self.api.delete(Kind::ConfigMap, &name, None).await;
+                        // The record takes its keys, and they the Secret (garbage collector).
+                        let _ = self
+                            .api
+                            .delete(Kind::ConfigMap, &object_name(id), None)
+                            .await;
                         self.drop_local(id);
                     }
                 }
+            }
+        }
+        // The keys of ended instances, and keys left without a record (their Secret goes with
+        // them). A start or a rotation since the list made its record before its key, so a key
+        // in the list has its record in the list unless the record is gone.
+        for (name, inst) in keys {
+            if !keep_keys.contains(&inst)
+                && let Err(e) = self.api.delete(Kind::ConfigMap, &name, None).await
+            {
+                tracing::debug!(target: "ruum::runtime", code = e.code(), "deleting a key failed");
             }
         }
         // Pods without a running record (a crash between the record and the delete).
@@ -1087,13 +1239,18 @@ impl Inner {
     }
 
     /// Forgets the logs of ended instances past the retention; then, while more than
-    /// `max_ended_instances` are kept or their logs take more than `max_ended_log_bytes`, the
-    /// oldest ended instance of the tenant with the largest share (bytes when the byte cap is
-    /// over, else instances). With `room` (a tenant that starts an instance) and
-    /// `max_instances` kept: the oldest ended instance of the tenant that keeps the most (the
-    /// new one counted for the starter), else one of the starter's own, else `unavailable`. So
-    /// one tenant's load evicts its own ended instances first (as the Docker driver, S-61, S-67).
+    /// `max_ended_instances` are kept or the logs of ended and scaled-to-zero instances take more
+    /// than `max_ended_log_bytes`, the oldest of the tenant with the largest share (bytes when
+    /// the byte cap is over, else ended instances): an ended one is forgotten, one scaled to zero
+    /// loses its log lines only (it keeps its values for a wake and a token rotation). With
+    /// `room` (a tenant that starts an instance): `unavailable` when the tenant keeps
+    /// `max_tenant_instances` that are not ended (Kimi run 15, I6-1 finding 5); with
+    /// `max_instances` kept, the oldest ended instance of the tenant that keeps the most (the new
+    /// one counted for the starter), else one of the starter's own, else `unavailable`. So one
+    /// tenant's load evicts its own ended instances first (as the Docker driver, S-61, S-67), and
+    /// no tenant takes every slot.
     fn trim_locals(&self, room: Option<TenantId>) -> Result<(), RuntimeError> {
+        type Group = (usize, Vec<(Instant, InstanceId)>);
         let mut map = self.locals.lock().expect("locals lock");
         let retention = self.cfg.ended_retention;
         map.retain(|_, l| {
@@ -1102,8 +1259,26 @@ impl Inner {
                 .ended_at
                 .is_none_or(|t| t.elapsed() < retention)
         });
+        if let Some(starter) = room {
+            let live = map
+                .values()
+                .filter(|l| {
+                    l.identity.tenant == starter
+                        && l.st.lock().expect("local lock").ended_at.is_none()
+                })
+                .count();
+            if live >= self.cfg.max_tenant_instances {
+                return Err(RuntimeError::Unavailable {
+                    reason: format!(
+                        "the tenant keeps its maximum of {} instances on this server process",
+                        self.cfg.max_tenant_instances
+                    ),
+                });
+            }
+        }
         loop {
-            let mut ended: HashMap<TenantId, (usize, Vec<(Instant, InstanceId)>)> = HashMap::new();
+            let mut ended: HashMap<TenantId, Group> = HashMap::new();
+            let mut parked: HashMap<TenantId, Group> = HashMap::new();
             let mut totals: HashMap<TenantId, usize> = HashMap::new();
             if let Some(t) = room {
                 totals.insert(t, 0);
@@ -1115,19 +1290,50 @@ impl Inner {
                     let e = ended.entry(l.identity.tenant).or_default();
                     e.0 += st.ring.memory();
                     e.1.push((at, *id));
+                } else if let Some(at) = st.parked_at
+                    && st.ring.memory() > 0
+                {
+                    let e = parked.entry(l.identity.tenant).or_default();
+                    e.0 += st.ring.memory();
+                    e.1.push((at, *id));
                 }
             }
             let count: usize = ended.values().map(|e| e.1.len()).sum();
-            let bytes: usize = ended.values().map(|e| e.0).sum();
-            let oldest = |e: &(usize, Vec<(Instant, InstanceId)>)| {
-                e.1.iter().map(|(at, _)| std::cmp::Reverse(*at)).max()
-            };
-            let by_bytes = bytes > self.cfg.max_ended_log_bytes;
-            let by_count = count > self.cfg.max_ended_instances;
-            let victim = if by_bytes || by_count {
+            let bytes: usize = ended.values().chain(parked.values()).map(|e| e.0).sum();
+            let oldest = |e: &Group| e.1.iter().map(|(at, _)| std::cmp::Reverse(*at)).max();
+            let bytes_of =
+                |t: &TenantId| ended.get(t).map_or(0, |e| e.0) + parked.get(t).map_or(0, |e| e.0);
+            if bytes > self.cfg.max_ended_log_bytes {
+                let Some(t) = ended
+                    .keys()
+                    .chain(parked.keys())
+                    .max_by_key(|t| bytes_of(t))
+                    .copied()
+                else {
+                    return Ok(());
+                };
+                let first = |g: Option<&Group>| {
+                    g.and_then(|e| e.1.iter().min_by_key(|(at, _)| *at).copied())
+                };
+                let (e, p) = (first(ended.get(&t)), first(parked.get(&t)));
+                match (e, p) {
+                    (Some((ea, eid)), Some((pa, _))) if ea <= pa => {
+                        Self::forget(&mut map, eid);
+                    }
+                    (_, Some((_, pid))) => {
+                        if let Some(l) = map.get(&pid) {
+                            l.st.lock().expect("local lock").ring.clear();
+                        }
+                    }
+                    (Some((_, eid)), None) => Self::forget(&mut map, eid),
+                    (None, None) => return Ok(()),
+                }
+                continue;
+            }
+            let victim = if count > self.cfg.max_ended_instances {
                 ended
                     .iter()
-                    .max_by_key(|(_, e)| (if by_bytes { e.0 } else { e.1.len() }, oldest(e)))
+                    .max_by_key(|(_, e)| (e.1.len(), oldest(e)))
                     .map(|(t, _)| *t)
             } else if let Some(starter) = room
                 && map.len() >= self.cfg.max_instances
@@ -1163,10 +1369,15 @@ impl Inner {
             else {
                 return Ok(());
             };
-            if let Some(l) = map.remove(&id) {
-                for t in l.st.lock().expect("local lock").followers.drain(..) {
-                    t.abort();
-                }
+            Self::forget(&mut map, id);
+        }
+    }
+
+    /// Forgets the logs of one instance (the caller holds the map).
+    fn forget(map: &mut HashMap<InstanceId, Arc<Local>>, id: InstanceId) {
+        if let Some(l) = map.remove(&id) {
+            for t in l.st.lock().expect("local lock").followers.drain(..) {
+                t.abort();
             }
         }
     }
@@ -1373,22 +1584,27 @@ impl RuntimeDriver for KubeDriver {
         let rec = Record::new(&spec, id, image);
         let name = object_name(id);
         // The record first: a crash after it leaves a record that the sweep ends and removes
-        // (with the Secret by its name), never a Secret nobody knows.
-        match inner
+        // (with its keys and their Secret, by the garbage collector), never a Secret nobody
+        // knows.
+        let record_uid = match inner
             .api
             .create(Kind::ConfigMap, &pod::record_body(&inner.cfg, &rec, None))
             .await?
         {
-            Write::Done(_) => {}
+            Write::Done(v) => v
+                .pointer("/metadata/uid")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
             _ => {
                 return Err(RuntimeError::Internal {
                     reason: format!("the instance record {name} exists already"),
                 });
             }
-        }
+        };
         let undo = |e: RuntimeError| async move {
             let _ = inner.api.delete(Kind::Pod, &pod_name(id, 1), Some(0)).await;
-            let _ = inner.api.delete(Kind::Secret, &object_name(id), None).await;
+            inner.drop_keys(id, None).await;
             let _ = inner
                 .api
                 .delete(Kind::ConfigMap, &object_name(id), None)
@@ -1396,19 +1612,30 @@ impl RuntimeDriver for KubeDriver {
             inner.locals.lock().expect("locals lock").remove(&id);
             e
         };
-        match inner
-            .api
-            .create(Kind::Secret, &pod::secret_body(&inner.cfg, &spec, id))
-            .await
-        {
-            Ok(Write::Done(_)) => {}
-            Ok(_) => {
-                return Err(undo(RuntimeError::Internal {
-                    reason: format!("the instance Secret {name} exists already"),
-                })
-                .await);
+        if record_uid.is_empty() {
+            return Err(undo(RuntimeError::Internal {
+                reason: format!("the API server gave the instance record {name} no uid"),
+            })
+            .await);
+        }
+        let secret_env = pod::secret_env(&spec);
+        let made = match inner.new_key(&spec.identity, id, &record_uid).await {
+            Ok(key) => {
+                inner
+                    .create_secret(
+                        &spec.identity,
+                        id,
+                        spec.workload_token.expose(),
+                        &secret_env,
+                        (&key.0, &key.1),
+                        1,
+                    )
+                    .await
             }
-            Err(e) => return Err(undo(e).await),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = made {
+            return Err(undo(e).await);
         }
         let token = spec.workload_token.expose().to_owned();
         let base: Vec<String> = spec
@@ -1421,6 +1648,7 @@ impl RuntimeDriver for KubeDriver {
             id,
             identity: spec.identity,
             made: Instant::now(),
+            secret_env,
             redactors: Mutex::new(None),
             st: Mutex::new(LocalSt {
                 ring: Ring::new(inner.cfg.log_lines, MAX_LOG_BYTES, inner.cfg.max_line_bytes),
@@ -1430,6 +1658,7 @@ impl RuntimeDriver for KubeDriver {
                 followers: Vec::new(),
                 touched_ms: rec.last_touch_ms,
                 ended_at: None,
+                parked_at: None,
             }),
         });
         inner
@@ -1696,13 +1925,26 @@ impl RuntimeDriver for KubeDriver {
             };
         }
         let inner = &self.inner;
-        let (rec, _) = inner.record(tenant, instance).await?;
+        let cm = inner
+            .api
+            .get(Kind::ConfigMap, &object_name(instance))
+            .await?
+            .ok_or_else(|| not_found(instance))?;
+        let rec = match pod::read_record(&cm) {
+            Some((rec, _)) if rec.identity.tenant == tenant && rec.instance == instance => rec,
+            _ => return Err(not_found(instance)),
+        };
         if !matches!(
             rec.state,
             InstanceState::Starting | InstanceState::Running | InstanceState::ScaledToZero
         ) {
             return Err(state_err("rotate the token of", &rec.state));
         }
+        let record_uid = cm
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
         // Redact the new value before the process can read it. Only the process that follows the
         // log can (it holds the values): another one refuses, so a new token never reaches a
         // log that does not redact it (fails closed; the renewal tries again).
@@ -1726,17 +1968,33 @@ impl RuntimeDriver for KubeDriver {
                 r.lock().unwrap_or_else(|p| p.into_inner()).set(&all);
             }
         }
-        let patch = serde_json::json!({ "stringData": { "token": token.expose() } });
-        match inner
-            .api
-            .merge_patch(Kind::Secret, &object_name(instance), &patch)
-            .await?
-        {
-            Write::Done(_) => Ok(()),
-            _ => Err(RuntimeError::Internal {
-                reason: "the instance Secret is gone".to_owned(),
-            }),
+        // No write verb but create on Secrets (each other one can read one, see `pod`): a new
+        // key, the old keys deleted (the garbage collector removes the old Secret), then the
+        // Secret again under the new key. Meanwhile a running pod keeps its token file (the
+        // kubelet keeps the last content) and a cold start waits for the Secret.
+        let key = inner.new_key(&rec.identity, instance, &record_uid).await?;
+        if !inner.drop_keys(instance, Some(&key.0)).await {
+            return Err(RuntimeError::Unavailable {
+                reason: "the old key of the instance Secret is not removed yet".to_owned(),
+            });
         }
+        inner
+            .create_secret(
+                &rec.identity,
+                instance,
+                token.expose(),
+                &l.secret_env,
+                (&key.0, &key.1),
+                SECRET_CREATE_TRIES,
+            )
+            .await?;
+        // A stop since the record read dropped the keys before this one: the Secret goes now.
+        if let Ok((now, _)) = inner.record(tenant, instance).await
+            && matches!(now.state, InstanceState::Stopped | InstanceState::Exited(_))
+        {
+            inner.drop_keys(instance, None).await;
+        }
+        Ok(())
     }
 }
 

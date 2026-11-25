@@ -825,3 +825,235 @@ fn the_admission_rules_refuse_tokens_and_other_secrets() {
         assert!(kube_fake::admit(&pod).is_err(), "{what} was admitted");
     }
 }
+
+/// The runtime identity reads no Secret by any verb (Kimi run 15, I6-1 finding 1): not by `get`,
+/// `list` or `watch`, not by a no-op `patch` or an `update` (their answer is the Secret) and not
+/// by a `delete` with a finalizer (`Foreground` or `Orphan`: its answer is the Secret too). The
+/// fake API server answers each of these with the Secret's data where its Role allows the verb.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_runtime_identity_reads_no_secret_by_any_verb() {
+    let w = world(false).await;
+    let d = w.driver(Arc::new(MemoryUsage::new()));
+    let id = identity();
+    let spec = w.service(id, None);
+    let token = spec.workload_token.expose().to_owned();
+    let s = d.start(spec).await.unwrap();
+    let name = ruum_runtime::kube::object_name(s.id);
+    assert!(w.fake.secret_names().contains(&name));
+    let base = format!("{}/api/v1/namespaces/{NS}/secrets", w.cfg.api_url);
+    let one = format!("{base}/{name}");
+    let http = reqwest::Client::new();
+    let calls = [
+        ("get", http.get(&one)),
+        ("list", http.get(&base)),
+        ("watch", http.get(&base).query(&[("watch", "true")])),
+        (
+            "no-op patch",
+            http.patch(&one)
+                .header("content-type", "application/merge-patch+json")
+                .body("{}"),
+        ),
+        (
+            "update",
+            http.put(&one)
+                .json(&serde_json::json!({ "metadata": { "name": name } })),
+        ),
+        (
+            "delete (foreground)",
+            http.delete(&one)
+                .json(&serde_json::json!({ "propagationPolicy": "Foreground" })),
+        ),
+        (
+            "delete (orphan)",
+            http.delete(&one)
+                .json(&serde_json::json!({ "propagationPolicy": "Orphan" })),
+        ),
+    ];
+    for (what, req) in calls {
+        let r = req.bearer_auth(TOKEN).send().await.unwrap();
+        let code = r.status().as_u16();
+        let body = r.text().await.unwrap_or_default();
+        assert!(!body.contains(&token), "{what} answered with the token");
+        assert_eq!(code, 403, "{what} is allowed: {body}");
+    }
+    assert!(w.fake.secret_names().contains(&name), "the Secret went");
+}
+
+/// A token rotation creates the Secret again under a new key once the garbage collector removed
+/// the old one (it may take a while); the old key goes, the pod reads the new token, and an
+/// ended instance keeps neither a key nor a Secret.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rotation_waits_for_the_garbage_collector() {
+    let w = world(false).await;
+    let d = w.driver(Arc::new(MemoryUsage::new()));
+    let id = identity();
+    let mut spec = w.service(id, None);
+    spec.env = vec![EnvVar::secret(
+        "API_KEY",
+        SecretValue::new(format!("v-{}", uuid::Uuid::now_v7().simple())),
+    )];
+    let s = d.start(spec).await.unwrap();
+    let keys = |w: &World| -> Vec<String> {
+        w.fake
+            .config_maps()
+            .iter()
+            .filter(|c| c.pointer("/metadata/labels/ruum.role") == Some(&serde_json::json!("key")))
+            .map(|c| c["metadata"]["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let first = keys(&w);
+    assert_eq!(first.len(), 1, "one key: {first:?}");
+    w.fake.gc_delay_ms.store(300, Ordering::SeqCst);
+    let new = format!("tok-rotated-{}", uuid::Uuid::now_v7().simple());
+    let t0 = Instant::now();
+    d.rotate_token(id.tenant, s.id, SecretValue::new(new.clone()))
+        .await
+        .unwrap();
+    assert!(
+        t0.elapsed() >= Duration::from_millis(300),
+        "no wait for the collector"
+    );
+    let now = keys(&w);
+    assert_eq!(now.len(), 1, "one key: {now:?}");
+    assert_ne!(now, first, "the old key stayed");
+    let secrets = w.fake.secrets();
+    assert_eq!(secrets.len(), 1);
+    assert_eq!(secrets[0]["data"]["token"], serde_json::json!(new));
+    assert!(
+        secrets[0]["data"]["env.API_KEY"]
+            .as_str()
+            .is_some_and(|v| v.starts_with("v-")),
+        "the secret value is not in the new Secret"
+    );
+    assert_eq!(
+        secrets[0].pointer("/metadata/ownerReferences/0/name"),
+        Some(&serde_json::json!(now[0]))
+    );
+    w.fake.gc_delay_ms.store(0, Ordering::SeqCst);
+    d.stop(id.tenant, s.id).await.unwrap();
+    assert!(keys(&w).is_empty(), "the key of an ended instance stayed");
+    assert!(
+        w.fake.secrets().is_empty(),
+        "the Secret of an ended instance stayed"
+    );
+}
+
+/// One tenant cannot take every instance slot of a process with instances scaled to zero (Kimi
+/// run 15, I6-1 finding 5; backlog R2A-9): past its share its start is `unavailable`, and another
+/// tenant still starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_tenant_cannot_take_every_slot() {
+    let mut w = world(false).await;
+    w.cfg.max_instances = 4;
+    w.cfg.max_tenant_instances = 2;
+    let d = w.driver(Arc::new(MemoryUsage::new()));
+    let a = identity();
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let s = d
+            .start(w.service(a, Some(Duration::from_millis(200))))
+            .await
+            .unwrap();
+        ids.push(s.id);
+    }
+    for i in &ids {
+        wait_state(&d, a.tenant, *i, |x| *x == InstanceState::ScaledToZero).await;
+    }
+    for _ in 0..2 {
+        let err = d
+            .start(w.service(a, Some(Duration::from_millis(200))))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "runtime_unavailable", "{err}");
+    }
+    let b = identity();
+    for _ in 0..2 {
+        d.start(w.service(b, None)).await.unwrap();
+    }
+}
+
+/// The logs of an instance scaled to zero count to the byte cap (Kimi run 15, I6-1 finding 5):
+/// past it they go, and the instance keeps its values (a token rotation still works).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scaled_to_zero_logs_count_to_the_byte_cap() {
+    let mut w = world(false).await;
+    w.cfg.max_ended_log_bytes = 1;
+    let d = w.quiet_driver();
+    let id = identity();
+    let mut spec = w.spec(id, &[Step::Print("hello from the run".into()), Step::Serve]);
+    spec.kind = WorkloadKind::Service(ServiceSpec {
+        port: 8080,
+        health: None,
+        idle_timeout: Some(Duration::from_millis(200)),
+    });
+    let s = d.start(spec).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while d.logs(id.tenant, s.id, None, 10).await.unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "no log line");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    loop {
+        d.sweep().await;
+        if d.status(id.tenant, s.id).await.unwrap().state == InstanceState::ScaledToZero {
+            break;
+        }
+        assert!(Instant::now() < deadline, "it did not scale to zero");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    d.sweep().await;
+    assert!(
+        d.logs(id.tenant, s.id, None, 10).await.unwrap().is_empty(),
+        "the logs of an instance scaled to zero stayed past the byte cap"
+    );
+    assert_eq!(d.kept_instances(), 1, "the instance was forgotten");
+    d.rotate_token(id.tenant, s.id, SecretValue::new("tok-after-the-cap-1234"))
+        .await
+        .unwrap();
+}
+
+/// The Secret rules of `apps-admission.yaml` (policy `ruum-apps-secrets`, Kimi run 15 I6-1
+/// finding 4): a service account token Secret, a service account annotation, a Secret that is not
+/// its label's instance Secret, one without its key as the one owner and one with a finalizer
+/// are refused; the driver's own Secret passes (every test above).
+#[test]
+fn the_secret_rules_refuse_token_secrets() {
+    let own = uuid::Uuid::now_v7();
+    let base = serde_json::json!({
+        "type": "Opaque",
+        "metadata": {
+            "name": format!("ruum-i-{}", own.simple()),
+            "labels": { "ruum.instance": own.to_string() },
+            "ownerReferences": [{ "apiVersion": "v1", "kind": "ConfigMap",
+                "name": format!("ruum-k-{}-1", own.simple()), "uid": "u" }],
+        },
+    });
+    assert!(kube_fake::admit_secret(&base).is_ok());
+    let mut token = base.clone();
+    token["type"] = serde_json::json!("kubernetes.io/service-account-token");
+    let mut annotated = base.clone();
+    annotated["metadata"]["annotations"] =
+        serde_json::json!({ "kubernetes.io/service-account.name": "default" });
+    let mut other = base.clone();
+    other["metadata"]["name"] =
+        serde_json::json!(format!("ruum-i-{}", uuid::Uuid::now_v7().simple()));
+    let mut unowned = base.clone();
+    unowned["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("ownerReferences");
+    let mut foreign = base.clone();
+    foreign["metadata"]["ownerReferences"][0]["name"] =
+        serde_json::json!(format!("ruum-k-{}-1", uuid::Uuid::now_v7().simple()));
+    let mut finalized = base.clone();
+    finalized["metadata"]["finalizers"] = serde_json::json!(["example.com/keep"]);
+    for (what, s) in [
+        ("service account token type", token),
+        ("service account annotation", annotated),
+        ("another instance's name", other),
+        ("no owner", unowned),
+        ("another instance's key", foreign),
+        ("a finalizer", finalized),
+    ] {
+        assert!(kube_fake::admit_secret(&s).is_err(), "{what} was admitted");
+    }
+}

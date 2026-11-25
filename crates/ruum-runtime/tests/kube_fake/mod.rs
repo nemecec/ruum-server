@@ -1,8 +1,12 @@
 //! A fake Kubernetes API server with a fake kubelet, for the Kubernetes driver's tests (I6-1).
 //!
-//! - **The API**: pods, ConfigMaps and Secrets of namespaces, pod logs (followed, one stream or
-//!   both), label selectors, resourceVersion conflicts on `PUT`, merge patches with
-//!   `stringData`. A bearer token is required.
+//! - **The API**: pods, ConfigMaps and Secrets of namespaces (each with a `uid`), pod logs
+//!   (followed, one stream or both), label selectors, resourceVersion conflicts on `PUT`, merge
+//!   patches with `stringData`. A bearer token is required. As a real API server, a Secret
+//!   `patch` answers with the changed Secret and a Secret `delete` with `propagationPolicy:
+//!   Foreground` or `Orphan` answers with the Secret (a finalizer was added), data included.
+//! - **The garbage collector**: deleting an object deletes every object whose `ownerReferences`
+//!   name its uid, and theirs (at once, or after `gc_delay_ms`).
 //! - **RBAC**: the rules of the driver's Role are read from the chart
 //!   (`deploy/staging/charts/platform/templates/runtime-rbac.yaml`) and every other verb,
 //!   resource or namespace is `403`. So a driver change that needs a new right fails here until
@@ -12,11 +16,12 @@
 //!   volume, no host network, no init or ephemeral containers, only `emptyDir` volumes and the
 //!   pod's own Secret, no `envFrom`, environment values only from the pod's own Secret, the
 //!   default service account); quantities are written back in the API server's canonical form
-//!   (`64Mi`), as a real API server does.
+//!   (`64Mi`), as a real API server does. The Secret rules of the same file ([`admit_secret`]).
 //! - **The kubelet**: each pod runs the conformance program of its arguments
 //!   (`ruum_core::runtime::program`): output into the log, environment values from the pod
 //!   (Secret keys resolved at start), the token read from the Secret at each read (a real
-//!   kubelet refreshes the file within a minute), the memory limit (`OOMKilled`), the size of the
+//!   kubelet refreshes the file within a minute, and keeps the last content while the Secret is
+//!   missing), the memory limit (`OOMKilled`), the size of the
 //!   memory-backed `/tmp` (a full disk), `activeDeadlineSeconds` (`DeadlineExceeded`) and the
 //!   readiness of `serve` and `unhealthy`.
 //! - **The registry**: `HEAD /v2/<repo>/manifests/<digest>` answers for pushed images only.
@@ -32,7 +37,7 @@ use axum::routing::get;
 use ruum_core::runtime::program::{DISK_FULL, Step, token_sha};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -106,6 +111,9 @@ pub struct Fake {
     /// The next log request answers "waiting to start" after 300 ms, whatever the pod does (a
     /// short job that ended between the log request and the pod look).
     pub log_not_ready_once: AtomicBool,
+    /// How long the garbage collector waits before it deletes the dependents of a deleted
+    /// object (0: at once).
+    pub gc_delay_ms: AtomicU64,
 }
 
 /// The Role of the driver, read from the chart: `(resource, verbs)`.
@@ -217,6 +225,7 @@ impl Fake {
             next_ip: AtomicU32::new(2),
             hide_records_once: AtomicBool::new(false),
             log_not_ready_once: AtomicBool::new(false),
+            gc_delay_ms: AtomicU64::new(0),
         });
         let app = Router::new()
             .route(
@@ -344,6 +353,93 @@ impl Fake {
         o.pods.insert(key.clone(), p);
     }
 
+    /// The garbage collector: deletes every object owned by one of `uids`, then their
+    /// dependents.
+    fn collect(&self, mut uids: Vec<String>) {
+        let owned = |obj: &Value, uids: &[String]| {
+            obj.pointer("/metadata/ownerReferences")
+                .and_then(Value::as_array)
+                .is_some_and(|refs| {
+                    refs.iter().any(|r| {
+                        r["uid"]
+                            .as_str()
+                            .is_some_and(|u| uids.iter().any(|x| x == u))
+                    })
+                })
+        };
+        let uid = |obj: &Value| {
+            obj.pointer("/metadata/uid")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        while !uids.is_empty() {
+            let mut next = Vec::new();
+            let pods: Vec<(String, String)> = {
+                let mut o = self.objs.lock().unwrap();
+                let cms: Vec<_> = o
+                    .cms
+                    .iter()
+                    .filter(|(_, v)| owned(v, &uids))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for k in cms {
+                    if let Some(v) = o.cms.remove(&k) {
+                        next.push(uid(&v));
+                    }
+                }
+                let secrets: Vec<_> = o
+                    .secrets
+                    .iter()
+                    .filter(|(_, v)| owned(v, &uids))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for k in secrets {
+                    if let Some(v) = o.secrets.remove(&k) {
+                        next.push(uid(&v));
+                    }
+                }
+                o.pods
+                    .iter()
+                    .filter(|(_, p)| owned(&p.obj, &uids))
+                    .map(|(k, p)| {
+                        next.push(uid(&p.obj));
+                        k.clone()
+                    })
+                    .collect()
+            };
+            for (ns, name) in pods {
+                self.remove_pod(&ns, &name);
+            }
+            uids = next;
+        }
+    }
+
+    /// Runs the garbage collector for a deleted object (at once or after `gc_delay_ms`).
+    fn deleted(self: &Arc<Self>, uid: String) {
+        let delay = self.gc_delay_ms.load(Ordering::SeqCst);
+        if delay == 0 {
+            self.collect(vec![uid]);
+        } else {
+            let f = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                f.collect(vec![uid]);
+            });
+        }
+    }
+
+    /// The Secrets of the namespace (names and data), as the tests see them.
+    pub fn secrets(&self) -> Vec<Value> {
+        self.objs
+            .lock()
+            .unwrap()
+            .secrets
+            .values()
+            .cloned()
+            .collect()
+    }
+
     fn secret_value(&self, ns: &str, secret: &str, key: &str) -> Option<String> {
         let o = self.objs.lock().unwrap();
         o.secrets
@@ -403,6 +499,58 @@ pub fn admit(pod: &Value) -> Result<(), &'static str> {
                 return Err("environment values only from the instance's own Secret");
             }
         }
+    }
+    Ok(())
+}
+
+/// The Secret rules of `deploy/staging/k8s/manifests/apps-admission.yaml` (policy
+/// `ruum-apps-secrets`, Kimi run 15 I6-1 finding 4), in the same order and with the same
+/// meaning, for a create.
+pub fn admit_secret(secret: &Value) -> Result<(), &'static str> {
+    let meta = &secret["metadata"];
+    if secret
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("Opaque")
+        != "Opaque"
+    {
+        return Err("Secrets in ruum-apps are of type Opaque only");
+    }
+    if meta["annotations"].as_object().is_some_and(|a| {
+        a.keys()
+            .any(|k| k.starts_with("kubernetes.io/service-account"))
+    }) {
+        return Err("no service account annotation");
+    }
+    let own = meta
+        .pointer("/labels/ruum.instance")
+        .and_then(Value::as_str)
+        .map(|i| format!("ruum-i-{}", i.replace('-', "")))
+        .unwrap_or_default();
+    let name = meta["name"].as_str().unwrap_or_default();
+    let hex = name.strip_prefix("ruum-i-").unwrap_or_default();
+    if own.is_empty()
+        || name != own
+        || hex.len() != 32
+        || !hex.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+    {
+        return Err("an instance Secret, ruum-i-<its ruum.instance label without dashes>");
+    }
+    let finalizers = meta["finalizers"].as_array().map_or(0, Vec::len);
+    let refs = meta["ownerReferences"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let key = format!("{}-", own.replace("ruum-i-", "ruum-k-"));
+    if finalizers != 0
+        || refs.len() != 1
+        || refs[0]["apiVersion"] != json!("v1")
+        || refs[0]["kind"] != json!("ConfigMap")
+        || !refs[0]["name"]
+            .as_str()
+            .is_some_and(|n| n.starts_with(&key))
+    {
+        return Err("owned by one key ConfigMap of its instance, no finalizer");
     }
     Ok(())
 }
@@ -476,6 +624,7 @@ async fn collection_post(
         return status(StatusCode::UNPROCESSABLE_ENTITY, "no name");
     };
     obj["metadata"]["namespace"] = json!(ns);
+    obj["metadata"]["uid"] = json!(uuid::Uuid::now_v7().to_string());
     let key = (ns.clone(), name.clone());
     match kind.as_str() {
         "configmaps" => {
@@ -488,6 +637,9 @@ async fn collection_post(
             (StatusCode::CREATED, axum::Json(obj)).into_response()
         }
         "secrets" => {
+            if let Err(why) = admit_secret(&obj) {
+                return status(StatusCode::FORBIDDEN, &format!("admission: {why}"));
+            }
             let mut o = f.objs.lock().unwrap();
             if o.secrets.contains_key(&key) {
                 return status(StatusCode::CONFLICT, "AlreadyExists");
@@ -686,25 +838,50 @@ async fn object_delete(
     State(f): State<Arc<Fake>>,
     Path((ns, kind, name)): Path<(String, String, String)>,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
     if let Err(r) = f.allow(&headers, &ns, "delete", &kind) {
         return r;
     }
+    let policy = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|b| b["propagationPolicy"].as_str().map(str::to_owned))
+        .unwrap_or_default();
     let key = (ns.clone(), name.clone());
+    let uid = |v: &Value| {
+        v.pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    // A real API server adds the finalizer of a foreground or orphan deletion and answers with
+    // the object as it is now: for a Secret, its data.
+    if kind == "secrets" && matches!(policy.as_str(), "Foreground" | "Orphan") {
+        let s = f.objs.lock().unwrap().secrets.remove(&key);
+        return match s {
+            Some(s) => {
+                f.deleted(uid(&s));
+                axum::Json(s).into_response()
+            }
+            None => status(StatusCode::NOT_FOUND, "NotFound"),
+        };
+    }
     let found = match kind.as_str() {
         "pods" => {
-            let had = f.objs.lock().unwrap().pods.contains_key(&key);
+            let had = f.pod(&ns, &name).map(|p| uid(&p));
             f.remove_pod(&ns, &name);
             had
         }
-        "configmaps" => f.objs.lock().unwrap().cms.remove(&key).is_some(),
-        "secrets" => f.objs.lock().unwrap().secrets.remove(&key).is_some(),
-        _ => false,
+        "configmaps" => f.objs.lock().unwrap().cms.remove(&key).map(|v| uid(&v)),
+        "secrets" => f.objs.lock().unwrap().secrets.remove(&key).map(|v| uid(&v)),
+        _ => None,
     };
-    if found {
-        axum::Json(json!({ "kind": "Status", "status": "Success" })).into_response()
-    } else {
-        status(StatusCode::NOT_FOUND, "NotFound")
+    match found {
+        Some(u) => {
+            f.deleted(u);
+            axum::Json(json!({ "kind": "Status", "status": "Success" })).into_response()
+        }
+        None => status(StatusCode::NOT_FOUND, "NotFound"),
     }
 }
 
@@ -943,6 +1120,7 @@ async fn kubelet(f: Arc<Fake>, key: (String, String), log: Arc<LogBuf>) {
         })
         .unwrap_or_default();
     let (mut mem, mut disk) = (0u64, 0u64);
+    let mut last_token = String::new();
     let end = |code: i64, reason: &str| {
         let reason = reason.to_owned();
         f.set_pod(&key, move |p| {
@@ -973,10 +1151,14 @@ async fn kubelet(f: Arc<Fake>, key: (String, String), log: Arc<LogBuf>) {
                 log.push(1, format!("{n}={v}\n").into_bytes());
             }
             Step::Token | Step::TokenSha => {
-                let t = token_secret
+                // The kubelet keeps the file's last content while the Secret is missing.
+                if let Some(t) = token_secret
                     .as_deref()
                     .and_then(|s| f.secret_value(&ns, s, "token"))
-                    .unwrap_or_default();
+                {
+                    last_token = t;
+                }
+                let t = last_token.clone();
                 let line = if step == Step::Token {
                     t
                 } else {
