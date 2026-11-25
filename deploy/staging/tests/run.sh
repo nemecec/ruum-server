@@ -513,6 +513,61 @@ awk '/^resource "talos_machine_(configuration_apply|bootstrap)"/,/^}/' "$STG/tof
   [[ "$(grep -cE '^\s*node\s*=\s*hcloud_server\.node\[[^]]+\]\.ipv4_address$' "$TMP/talos-res.txt")" == 2 ]] &&
   ok "talos.tf: endpoints from talos_endpoints or the tunnel, never the public address directly; a precondition on each; nodes by public IPv4" || bad "talos.tf Talos resources"
 
+echo "== load balancer cutover guard (lb-guard.sh, Kimi re-check of O-53)"
+lg="$STG/lb-guard.sh"
+# lbplan NAME "ADDRESS BEFORE AFTER ACTIONS"...: a scrubbed plan with load balancer services
+# (BEFORE or AFTER - for null, else the destination port).
+lbplan() {
+  local name="$1" line addr b a acts out="[]"
+  shift
+  for line in "$@"; do
+    read -r addr b a acts <<<"$line"
+    out="$(jq -c --arg a "$addr" --arg b "$b" --arg n "$a" --arg x "$acts" \
+      '. + [{address: $a, mode: "managed", type: "hcloud_load_balancer_service", change: {actions: ($x | split(",")),
+        before: (if $b == "-" then null else {destination_port: ($b | tonumber), listen_port: 80} end),
+        after: (if $n == "-" then null else {destination_port: ($n | tonumber), listen_port: 80} end)}}]' <<<"$out")"
+  done
+  jq -n --argjson rc "$out" '{format_version: "1.2", resource_changes: $rc}' >"$TMP/$name.json"
+  echo "$TMP/$name.json"
+}
+lb_move="$(lbplan lbmove 'hcloud_load_balancer_service.http 30080 30081 update' 'hcloud_load_balancer_service.https 30443 30443 update')"
+lb_repl="$(lbplan lbrepl 'hcloud_load_balancer_service.http 30080 30081 delete,create')"
+lb_new="$(lbplan lbnew 'hcloud_load_balancer_service.http - 30081 create' 'hcloud_load_balancer_service.https - 30443 create')"
+lb_same="$(lbplan lbsame 'hcloud_load_balancer_service.http 30081 30081 update')"
+[[ "$(bash "$lg" ports "$lb_move")" == 30081 && "$(bash "$lg" ports "$lb_repl")" == 30081 && -z "$(bash "$lg" ports "$lb_new")" && -z "$(bash "$lg" ports "$lb_same")" ]] &&
+  ok "lb-guard ports: a changed destination port of an existing service (update or replace), not a new service or a health check change" || bad "lb-guard ports"
+LG="$TMP/lbguard" && mkdir -p "$LG"
+# A fake kubectl: the edge Services of LG_SERVICES (nodePorts), or a failure for LG_SERVICES=fail.
+cat >"$LG/kubectl" <<'FAKE'
+#!/usr/bin/env bash
+echo "$*" >>"$LG_CALLS"
+[[ "$*" == "-n edge get services -o json --request-timeout=20s" ]] || { echo "fake kubectl: unexpected: $*" >&2; exit 9; }
+[[ "$LG_SERVICES" != fail ]] || { echo "Unable to connect to the server: EOF" >&2; exit 1; }
+jq -n --arg p "$LG_SERVICES" '{items: [$p | split(" ")[] | select(. != "") | {spec: {ports: [{nodePort: tonumber}]}}]}'
+FAKE
+chmod +x "$LG/kubectl"
+lguard() { env PATH="$LG:$PATH" LG_CALLS="$LG/calls" "$@" bash "$lg" check "$plan"; }
+plan="$lb_move"
+expect 1 "lb-guard refuses to move port 80 to 30081 before the chart made the Service ruum-edge-http" lguard LG_SERVICES="30080 30443"
+grep -qF 'NodePort 30081' "$TMP/out" && grep -qF 'deploy the chart first' "$TMP/out" && ok "... and says which NodePort and what to do" || bad "lb-guard's message: $(cat "$TMP/out")"
+expect 0 "lb-guard passes once a Service of the edge has NodePort 30081" lguard LG_SERVICES="30080 30443 30081"
+expect 1 "lb-guard refuses when the edge Services cannot be listed" lguard LG_SERVICES=fail
+plan="$lb_repl"
+expect 1 "lb-guard refuses a replaced load balancer service with a NodePort that nothing serves" lguard LG_SERVICES="30080 30443"
+rm -f "$LG/calls"
+plan="$lb_new"
+expect 0 "lb-guard passes a new cluster's load balancer without asking Kubernetes" lguard LG_SERVICES=fail
+plan="$p_none"
+expect 0 "lb-guard passes a plan without a load balancer change" lguard LG_SERVICES=fail
+[[ ! -e "$LG/calls" ]] && ok "... and contacts nothing then" || bad "lb-guard called kubectl for a plan without a port move"
+# steps.sh apply runs the guard after the plan and before the first tofu apply.
+awk '/^  apply\)$/,/^    ;;$/' "$STG/steps.sh" >"$TMP/apply-step.txt"
+lg_line="$(grep -n 'lb-guard.sh" check "$WORK/cluster.json" || die' "$TMP/apply-step.txt" | cut -d: -f1)"
+ta_line="$(grep -n 'require_talos_access "$phase"' "$TMP/apply-step.txt" | cut -d: -f1)"
+tf_line="$(grep -n 'tofu apply' "$TMP/apply-step.txt" | head -1 | cut -d: -f1)"
+[[ -n "$lg_line" && -n "$tf_line" && "$ta_line" -lt "$lg_line" && "$lg_line" -lt "$tf_line" ]] &&
+  ok "steps.sh apply runs lb-guard.sh check after the plan and before tofu apply" || bad "steps.sh apply does not run lb-guard.sh before tofu apply"
+
 echo "== admin tunnel: control socket and forward checks (Kimi review F4)"
 F4="$TMP/f4"
 mkdir -p "$F4/home/.config/ruum" "$F4/work" "$F4/work2"
@@ -1196,7 +1251,10 @@ YAML
     # token. The init container runs as in the pod: user 65532, read-only root, no capabilities.
     awk '/^            - \|$/ {on=1; next} /^          resources:/ {on=0} on {sub(/^              /, ""); print}' "$TMP/edge-init.yaml" >"$TMP/wait-api.sh"
     cafile="$(sed -n 's/.*{ name: SSL_CERT_FILE, value: \(.*\) }.*/\1/p' "$TMP/edge-init.yaml")"
-    sed 's/-lt 60/-lt 2/' "$TMP/wait-api.sh" >"$TMP/wait-api-short.sh"
+    # The same script with a limit of 4 s, and of 6 s for the server that never answers.
+    sed 's/^limit=120$/limit=4/' "$TMP/wait-api.sh" >"$TMP/wait-api-short.sh"
+    sed 's/^limit=120$/limit=6/' "$TMP/wait-api.sh" >"$TMP/wait-api-6.sh"
+    tmpmount="$(sed -n 's/.*{ name: init-tmp, mountPath: \(.*\) }.*/\1/p' "$TMP/edge-init.yaml")"
     printf '{\n\tadmin off\n\tskip_install_trust\n\tauto_https disable_redirects\n}\nhttps://127.0.0.1:8443 {\n\ttls internal\n\trespond "no" 401\n}\n' >"$TMP/api.Caddyfile"
     apisrv="ruum-stg-apisrv-$$"
     if docker run -d --rm --name "$apisrv" -v "$TMP/api.Caddyfile:/etc/caddy/Caddyfile:ro" "caddy:$CADDY_VERSION-alpine" >/dev/null 2>"$TMP/apisrv.err"; then
@@ -1209,11 +1267,12 @@ YAML
       init() {
         local m=()
         [[ -n "${2:-}" ]] && m=(-v "$2:${cafile:-/nonexistent}:ro")
-        docker run --rm --network "container:$apisrv" --user 65532:65532 --read-only --cap-drop ALL \
+        docker run --rm --network "container:$apisrv" --user 65532:65532 --read-only --tmpfs "${tmpmount:-/nonexistent}" --cap-drop ALL \
           -e KUBERNETES_SERVICE_HOST=127.0.0.1 -e KUBERNETES_SERVICE_PORT="${PORT_OVERRIDE:-8443}" -e "SSL_CERT_FILE=${cafile:-/nonexistent}" \
           ${m[@]+"${m[@]}"} --entrypoint /bin/sh "caddy:$CADDY_VERSION-alpine" -c "$(cat "$1")"
       }
-      grep -qF -- '-lt 2 ]' "$TMP/wait-api-short.sh" && [[ -s "$TMP/wait-api.sh" && -n "$cafile" ]] || bad "could not take the init script or its CA path from the rendered edge"
+      grep -qxF 'limit=120' "$TMP/wait-api.sh" && grep -qxF 'limit=4' "$TMP/wait-api-short.sh" && grep -qxF 'limit=6' "$TMP/wait-api-6.sh" && [[ -n "$cafile" && "$tmpmount" == /tmp ]] ||
+        bad "could not take the init script (limit=120), its CA path or its /tmp mount from the rendered edge"
       t0=$SECONDS
       out="$(init "$TMP/wait-api.sh" "$TMP/apica.crt" 2>&1)"; rc=$?
       [[ $rc == 0 && -z "$out" && $((SECONDS - t0)) -lt 30 ]] &&
@@ -1227,6 +1286,16 @@ YAML
       [[ $rc == 0 && "$out" == *"the API server did not answer"*"Caddy starts anyway"* ]] &&
         ok "a closed port: the init container gives up with a message and lets Caddy start" ||
         bad "the init container on a closed port (rc $rc): $out"
+      # Kimi re-check of O-53: a server that accepts and never answers (busybox nc runs "sleep"
+      # for each connection). wget's -T does not limit the TLS handshake, so without a hard
+      # limit one try waits until the server closes. With limit=6 the script must end in time.
+      docker exec -d "$apisrv" nc -ll -p 9444 -e sleep 600
+      sleep 1
+      t0=$SECONDS
+      out="$(PORT_OVERRIDE=9444 init "$TMP/wait-api-6.sh" "$TMP/apica.crt" 2>&1)"; rc=$?
+      [[ $rc == 0 && "$out" == *"the API server did not answer in 6 s"*"Caddy starts anyway"* && $((SECONDS - t0)) -le 10 ]] &&
+        ok "a server that never answers: the init container keeps its limit (6 s here, 120 s in the chart) and lets Caddy start" ||
+        bad "the init container against a server that never answers (rc $rc, $((SECONDS - t0)) s for a limit of 6 s): $out"
       docker rm -f "$apisrv" >/dev/null 2>&1
     else
       bad "could not start the stand-in API server: $(head -3 "$TMP/apisrv.err")"
@@ -2061,7 +2130,7 @@ FAKE
     sleep 1
   }
   upg() { rm -f "$FU/fake/"*; env PATH="$FU/bin:$PATH" FAKE_DIR="$FU/fake" FAKE_EXT="$fu_ext" FAKE_TLS_PORT="$FU_PORT" RUUM_UPGRADE_RETRY_PAUSE=0.2 \
-    RUUM_STAGING_WORK="$FU" "$@" bash "$FU/ops/upgrade-talos.sh"; }
+    RUUM_STAGING_WORK="$FU" "$@" timeout 120 bash "$FU/ops/upgrade-talos.sh"; }
   tls_server staging.ruum.space
   expect 0 "upgrade-talos.sh retries kubectl wait while the API forward is down, then checks the edge (backlog O-54)" upg
   [[ "$(cat "$FU/fake/node-waits" 2>/dev/null)" == 3 ]] && ok "upgrade-talos.sh waited for the node three times (two connection failures)" || bad "upgrade-talos.sh did not retry the node wait: $(cat "$FU/fake/node-waits" 2>/dev/null)"
@@ -2075,6 +2144,26 @@ FAKE
   kill "$FU_PID" 2>/dev/null; wait "$FU_PID" 2>/dev/null
   FU_PORT=1
   expect 1 "upgrade-talos.sh stops when the node's edge does not answer TLS" upg RUUM_UPGRADE_EDGE_SECONDS=2
+  # Kimi re-check of O-53: an edge port that accepts the connection and never answers TLS.
+  # retry's limit is a hard limit (3 s here, plus timeout's 5 s for a kill), so the script stops
+  # in time instead of waiting for ever (upg's own timeout of 120 s would give exit 124).
+  if command -v python3 >/dev/null; then
+    FU_PORT=$(( 20000 + RANDOM % 20000 ))
+    python3 -c 'import socket, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(64)
+held = []
+while True: held.append(s.accept()[0])' "$FU_PORT" &
+    FU_PID=$!
+    sleep 1
+    t0=$SECONDS
+    expect 1 "upgrade-talos.sh stops when the node's edge accepts TCP and never answers TLS (Kimi re-check of O-53)" upg RUUM_UPGRADE_EDGE_SECONDS=3
+    [[ $((SECONDS - t0)) -le 15 ]] && grep -qF 'stopping before the next node' "$TMP/out" &&
+      ok "... within its limit ($((SECONDS - t0)) s for 3 s), with the message that it stops" || bad "upgrade-talos.sh against a stalled edge: $((SECONDS - t0)) s for a limit of 3 s: $(tail -2 "$TMP/out")"
+    kill "$FU_PID" 2>/dev/null; wait "$FU_PID" 2>/dev/null
+  else
+    echo "== upgrade-talos.sh against a stalled edge: skipped (no python3)"
+  fi
 else
   echo "== upgrade-talos.sh with fakes: skipped (no openssl with x509 -checkhost, or no jq)"
 fi
