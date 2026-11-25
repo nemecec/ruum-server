@@ -1066,17 +1066,22 @@ YAML
     awk -v kind="kind: $2" -v name="  name: $3" 'function out() { if (index(doc, "\n" kind "\n") && index(doc, "\n" name "\n")) printf "%s", doc; doc = "\n" }
       BEGIN { doc = "\n" } /^---/ { out(); next } { doc = doc $0 "\n" } END { out() }' "$1"
   }
-  # The Kubernetes runtime driver (I6-1): with the app runtime only, its account and token.
-  doc_of "$TMP/ruum-apps.yaml" Deployment ruum-server >"$TMP/srv-apps.yaml"
+  # S-87 (decision 2026-11-25): the driver is off by default, and then the server has no token.
+  doc_of "$TMP/ruum-apps.yaml" Deployment ruum-server >"$TMP/srv-default.yaml"
+  ! grep -qE 'RUUM_RUNTIME_DRIVER|serviceAccountName|serviceAccountToken' "$TMP/srv-default.yaml" && grep -qF 'automountServiceAccountToken: false' "$TMP/srv-default.yaml" &&
+    ok "the Kubernetes driver is off by default and the server gets no ServiceAccount token (S-87)" || bad "the default chart runs the Kubernetes driver or gives the server a token (S-87)"
+  # The Kubernetes runtime driver (I6-1) when turned on: with the app runtime only, its account and token.
+  expect 0 "render charts/ruum with the app runtime and the driver on" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.kubernetes=true
+  doc_of "$TMP/out" Deployment ruum-server >"$TMP/srv-apps.yaml"
   grep -qF 'serviceAccountName: ruum-server' "$TMP/srv-apps.yaml" && grep -qF '{ name: RUUM_RUNTIME_DRIVER, value: kubernetes }' "$TMP/srv-apps.yaml" &&
     grep -qF 'serviceAccountToken: { path: token, expirationSeconds: 3600 }' "$TMP/srv-apps.yaml" && grep -qF 'automountServiceAccountToken: false' "$TMP/srv-apps.yaml" &&
     ok "with the app runtime the server runs the Kubernetes driver with a projected token only" || bad "the server has no Kubernetes driver, or its token is not the projected one"
   grep -qF 'name: RUUM_REGISTRY' "$TMP/srv-apps.yaml" && bad "a registry is set although none is given" || ok "no registry unless one is given (app images fail closed)"
   grep -qF 'RUUM_RUNTIME_DRIVER' "$TMP/ruum.yaml" && bad "the Kubernetes driver renders without the app runtime" || ok "without the app runtime no Kubernetes driver"
   expect 0 "the server env with the app runtime is what the server reads" bash "$HERE/server-env.sh" "$TMP/ruum-apps.yaml"
-  expect 0 "render charts/ruum with a registry" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.registry=registry.ruum-apps.svc:5000
+  expect 0 "render charts/ruum with a registry" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.kubernetes=true --set runtime.registry=registry.ruum-apps.svc:5000
   grep -qF '{ name: RUUM_REGISTRY, value: "registry.ruum-apps.svc:5000" }' "$TMP/out" && ok "the registry reaches the server" || bad "runtime.registry is not RUUM_REGISTRY"
-  expect 1 "charts/ruum refuses a registry that is not host:port" helm template ruum "$STG/charts/ruum" "${A[@]}" --set 'runtime.registry=http://x/y'
+  expect 1 "charts/ruum refuses a registry that is not host:port" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.kubernetes=true --set 'runtime.registry=http://x/y'
   expect 0 "render charts/ruum with the driver off" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.kubernetes=false
   grep -qF 'RUUM_RUNTIME_DRIVER' "$TMP/out" && bad "runtime.kubernetes=false still renders the driver" || ok "runtime.kubernetes=false keeps the in-memory driver"
   doc_of "$TMP/ruum-apps.yaml" Deployment ruum-gateway >"$TMP/gw.yaml"

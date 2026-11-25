@@ -102,7 +102,7 @@ fi
 # 4. A node22 app.
 node="${RUUM_STAGING_SMOKE_NODE22:-$(secret STG_SMOKE_NODE22_HOST)}"
 if [[ "${RUUM_STAGING_SMOKE_NODE22_READY:-}" != 1 ]]; then
-  echo "BLOCKED node22 app: the runtime driver is there (I6-1), but node22 deploys are refused (runtime_not_ready) and staging has no builder or registry yet; the gateway answers 502 after the sign-in"
+  echo "BLOCKED node22 app: the Kubernetes runtime driver (I6-1) is off on staging until S-87, node22 deploys are refused (runtime_not_ready) and staging has no builder or registry yet; the gateway answers 502 after the sign-in"
 elif [[ -n "$node" && "$node" == *".$APPS" ]]; then
   app_checks node22 "$node"
 else

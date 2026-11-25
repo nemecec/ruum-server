@@ -29,3 +29,12 @@ Decided by the person after the run 9 digest. Not provisional.
    be scoped, the static bucket lives on Garage (self-hosted, read-only per-bucket keys) or the
    gateway holds no key and fetches through short-lived links signed by the core. Until this card
    lands, staging serves no static files (no gateway bucket key is made).
+5. **The Kubernetes runtime driver stays off until S-87 is fixed (2026-11-25).** Kimi's re-check
+   of card I6-1 (run 15) showed that the S-83 admission rule binds a sandbox pod to "its own"
+   Secret through the `ruum.instance` label, which the pod's creator sets. A holder of the
+   runtime ServiceAccount's token (not only a fully compromised server) could create a pod with
+   another instance's label and mount that instance's Secret. The person chose to turn the driver
+   off (`runtime.kubernetes: false` in `charts/ruum`), so the server gets no token of
+   `ruum/ruum-server`. It is turned on again only with an ownership binding that the creator
+   cannot forge (backlog S-87; likely the in-sandbox supervisor that also fixes I6-20). Nothing
+   is lost today: staging has no builder or registry, so node22 deploys are refused anyway.
