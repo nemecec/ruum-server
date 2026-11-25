@@ -48,7 +48,12 @@
 //! no password is issued. Drop: `NOLOGIN`, sessions end, what it owns goes to the owner and
 //! every right and default privilege it holds or owns in the database goes ([`strip_in_tx`]),
 //! then in the database's restore points, then in any other database of the engine whose owner
-//! named it in a grant or a policy ([`strip_elsewhere`]), `DROP ROLE`, then the row.
+//! named it in a grant or a policy ([`strip_elsewhere`]), `DROP ROLE`, then the row. A grant
+//! made again between the strip and `DROP ROLE` (2BP01) makes the step strip and try again, up
+//! to [`DROP_ATTEMPTS`] times. `drop_database` first marks its app roles with a comment that
+//! names the database ([`mark_for_drop`]) and, once the database is gone, sets their connection
+//! limit to 0 (out of the budget); a retried `drop_database` of the gone database drops the
+//! marked roles that the first try left ([`drop_marked`]) before it answers `NotFound`.
 //! `ruum_dbhost` may only signal or revoke with the privileges of the role or the owner, so it
 //! takes membership in them inside the one transaction of the step and gives it back before
 //! the commit (a failure rolls the grant back too).
@@ -64,7 +69,7 @@
 use super::copy::{
     leftover_dependencies, restore_points, revoke_old_rights, set_allow_connections,
 };
-use super::errors::internal;
+use super::errors::{internal, sqlstate};
 use super::lens::{ident, literal};
 use super::setup::{self, run};
 use super::{DbState, PostgresEngine, neutral_name};
@@ -84,6 +89,14 @@ pub(crate) const APP_SEARCH_PATH: &str = "public, extensions";
 
 /// The key of the advisory lock that serializes the budget check and `CREATE ROLE`.
 const BUDGET_LOCK: i64 = 0x5275_756d_4435; // "RuumD5"
+
+/// How often the end of an app role strips and tries `DROP ROLE` again when a dependency came
+/// back after the strip (2BP01: another database's owner granted the role a right again).
+pub(crate) const DROP_ATTEMPTS: usize = 5;
+
+/// The comment on an app role whose database `drop_database` drops: this text and the name of
+/// the database. It is in the shared catalog, so it outlives the database and its meta data.
+const DROPPED_WITH: &str = "ruum: dropped with ";
 
 /// A warning once per process when `ruum_dbhost` may not set `temp_file_limit`.
 static TEMP_FILE_WARNED: AtomicBool = AtomicBool::new(false);
@@ -1080,47 +1093,52 @@ pub(crate) async fn drop_role(engine: &PostgresEngine, role: &RoleRef) -> Result
         .await?;
         drop(admin);
         end_sessions(engine, std::slice::from_ref(&name), None).await?;
-        // Its rights in the database (as the owner and as the role itself).
-        {
-            let _membership = engine.membership.lock().await;
-            let mut conn = engine.dbhost(&state.name).await?;
-            let r = async {
-                run(&mut conn, "begin", "begin".to_string()).await?;
-                strip_in_tx(
-                    &mut conn,
-                    state.meta.role(RoleKind::Owner),
-                    false,
-                    std::slice::from_ref(&name),
-                )
-                .await?;
-                run(&mut conn, "commit", "commit".to_string()).await
+        let drop_sql = format!(
+            "revoke connect, temporary on database {db} from {r};\n\
+             drop role if exists {r}",
+            db = ident(&state.name),
+            r = ident(&name)
+        );
+        let mut dropped = false;
+        for _ in 0..DROP_ATTEMPTS {
+            // Its rights in the database (as the owner and as the role itself).
+            {
+                let _membership = engine.membership.lock().await;
+                let mut conn = engine.dbhost(&state.name).await?;
+                let r = async {
+                    run(&mut conn, "begin", "begin".to_string()).await?;
+                    strip_in_tx(
+                        &mut conn,
+                        state.meta.role(RoleKind::Owner),
+                        false,
+                        std::slice::from_ref(&name),
+                    )
+                    .await?;
+                    run(&mut conn, "commit", "commit".to_string()).await
+                }
+                .await;
+                let _ = conn.close().await;
+                r?;
             }
-            .await;
-            let _ = conn.close().await;
-            r?;
-        }
-        // Its rights in the restore points of the database (snapshot databases), and any right
-        // that another database's owner gave it (a grant or a policy may name any role).
-        let points = restore_points(engine, &state.name).await?;
-        for other in dependent_databases(engine, &name, &state.name).await? {
-            if points.iter().any(|(_, _, s)| *s == other) {
-                strip_snapshot(engine, &state, &other, &name).await?;
-            } else {
-                strip_elsewhere(engine, &other, &name).await?;
+            // Its rights in the restore points of the database (snapshot databases), and any
+            // right that another database's owner gave it (a grant or a policy may name any
+            // role).
+            let points = restore_points(engine, &state.name).await?;
+            for other in dependent_databases(engine, &name, &state.name).await? {
+                if points.iter().any(|(_, _, s)| *s == other) {
+                    strip_snapshot(engine, &state, &other, &name).await?;
+                } else {
+                    strip_elsewhere(engine, &other, &name).await?;
+                }
+            }
+            if try_drop(engine, drop_sql.clone()).await? {
+                dropped = true;
+                break;
             }
         }
-        let mut admin = engine.admin().await?;
-        run(
-            &mut admin,
-            "drop the app role",
-            format!(
-                "revoke connect, temporary on database {db} from {r};\n\
-                 drop role if exists {r}",
-                db = ident(&state.name),
-                r = ident(&name)
-            ),
-        )
-        .await?;
+        if !dropped {
+            return Err(still_depends());
+        }
     }
     // The row last: a crash before this leaves a row whose role is gone, dropped again later.
     let mut conn = engine.dbhost(&state.name).await?;
@@ -1144,14 +1162,137 @@ pub(crate) async fn drop_orphans(
     let mut first = None;
     for name in names {
         let r = async {
-            for other in dependent_databases(engine, name, "").await? {
-                strip_elsewhere(engine, &other, name).await?;
+            for _ in 0..DROP_ATTEMPTS {
+                for other in dependent_databases(engine, name, "").await? {
+                    strip_elsewhere(engine, &other, name).await?;
+                }
+                if try_drop(engine, format!("drop role if exists {}", ident(name))).await? {
+                    return Ok(());
+                }
+            }
+            Err(still_depends())
+        }
+        .await;
+        if let Err(e) = r
+            && first.is_none()
+        {
+            first = Some(e);
+        }
+    }
+    first.map_or(Ok(()), Err)
+}
+
+/// The error when every try of [`DROP_ATTEMPTS`] met a dependency that came back.
+fn still_depends() -> EngineError {
+    EngineError::Internal(format!(
+        "drop the app role: a dependency came back after each of {DROP_ATTEMPTS} strips (2BP01)"
+    ))
+}
+
+/// Runs the `DROP ROLE` statement `sql` of an app role (with the statements before it, in one
+/// implicit transaction). `Ok(false)` when an object still depends on the role (2BP01): a right
+/// given to it again after the strip; the caller strips again.
+async fn try_drop(engine: &PostgresEngine, sql: String) -> Result<bool, EngineError> {
+    #[cfg(test)]
+    before_drop_hook(engine).await?;
+    let mut admin = engine.admin().await?;
+    match sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+        .execute(&mut *admin)
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(e) if sqlstate(&e).as_deref() == Some("2BP01") => Ok(false),
+        Err(e) => Err(internal("drop the app role", e)),
+    }
+}
+
+/// Tests only: runs the script of [`PostgresEngine::before_role_drop`] as the owner of its
+/// database, once per call while its count lasts.
+#[cfg(test)]
+async fn before_drop_hook(engine: &PostgresEngine) -> Result<(), EngineError> {
+    let job = {
+        let mut slot = engine.before_role_drop.lock();
+        match slot.as_mut() {
+            Some((db, sql, n)) if *n > 0 => {
+                *n -= 1;
+                Some((db.clone(), sql.clone()))
+            }
+            _ => None,
+        }
+    };
+    let Some((db, sql)) = job else {
+        return Ok(());
+    };
+    let state = engine.resolve(&db).await?;
+    let (mut owner, _) = engine.pool(&state, RoleKind::Owner).open(engine).await?;
+    let r = sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+        .execute(&mut owner)
+        .await
+        .map(|_| ())
+        .map_err(|e| internal("run the script before DROP ROLE", e));
+    let _ = owner.close().await;
+    r
+}
+
+/// Marks the app roles `names` of `database`, which `drop_database` is about to drop: a comment
+/// on each role names the database ([`DROPPED_WITH`]). The comment is in the shared catalog, so
+/// a retried `drop_database` still finds the roles after the database and its `ruum_meta.roles`
+/// are gone ([`drop_marked`]). Only `ruum_dbhost` (with `ADMIN` on the role) can set it.
+pub(crate) async fn mark_for_drop(
+    engine: &PostgresEngine,
+    database: &str,
+    names: &[String],
+) -> Result<(), EngineError> {
+    let text = literal(&format!("{DROPPED_WITH}{database}"));
+    let mut sql = String::new();
+    for name in names {
+        if can_login(engine, name).await?.is_some() {
+            sql.push_str(&format!("comment on role {} is {text};\n", ident(name)));
+        }
+    }
+    if sql.is_empty() {
+        return Ok(());
+    }
+    let mut admin = engine.admin().await?;
+    run(&mut admin, "mark the app roles of a dropped database", sql).await
+}
+
+/// Takes the mark of [`mark_for_drop`] off again (the drop of the database failed). Best effort:
+/// a mark left on a role of a live database does nothing, as [`drop_marked`] acts only when the
+/// named database is gone.
+pub(crate) async fn unmark(engine: &PostgresEngine, names: &[String]) {
+    for name in names {
+        if let Ok(Some(_)) = can_login(engine, name).await
+            && let Ok(mut admin) = engine.admin().await
+        {
+            let _ = run(
+                &mut admin,
+                "unmark an app role",
+                format!("comment on role {} is null", ident(name)),
+            )
+            .await;
+        }
+    }
+}
+
+/// Sets the connection limit of the app roles `names` of a dropped database to 0: a role that
+/// another database still holds back no longer counts against the app budget ([`budget`] sums
+/// positive limits only). Goes on after a failure and returns the first one.
+pub(crate) async fn release_connections(
+    engine: &PostgresEngine,
+    names: &[String],
+) -> Result<(), EngineError> {
+    let mut first = None;
+    for name in names {
+        let r = async {
+            if can_login(engine, name).await?.is_none() {
+                return Ok(());
             }
             let mut admin = engine.admin().await?;
             run(
                 &mut admin,
-                "drop the app role",
-                format!("drop role if exists {}", ident(name)),
+                "take a dropped app role out of the budget",
+                format!("alter role {} connection limit 0", ident(name)),
             )
             .await
         }
@@ -1163,6 +1304,39 @@ pub(crate) async fn drop_orphans(
         }
     }
     first.map_or(Ok(()), Err)
+}
+
+/// Drops the app roles that an earlier `drop_database` of `database` marked and could not drop
+/// ([`mark_for_drop`]), once `database` is gone: out of the budget, then [`drop_orphans`]. A
+/// role that can log in is never taken (the mark of a live role is stale).
+pub(crate) async fn drop_marked(
+    engine: &PostgresEngine,
+    database: &str,
+) -> Result<(), EngineError> {
+    let mut admin = engine.admin().await?;
+    let names: Vec<String> = sqlx::query(
+        "select r.rolname::text from pg_catalog.pg_roles r
+          where r.rolname ~ '^r_[0-9a-f]{16}$' and not r.rolcanlogin
+            and pg_catalog.shobj_description(r.oid, 'pg_authid') = $1
+            and not exists (select 1 from pg_catalog.pg_database where datname = $2)
+          order by 1",
+    )
+    .persistent(false)
+    .bind(format!("{DROPPED_WITH}{database}"))
+    .bind(database)
+    .fetch_all(&mut *admin)
+    .await
+    .map_err(|e| internal("read the marked app roles of a dropped database", e))?
+    .into_iter()
+    .map(|r| r.get(0))
+    .collect();
+    drop(admin);
+    if names.is_empty() {
+        return Ok(());
+    }
+    // Out of the budget first: a role that stays (the drop fails again) holds back nothing.
+    let _ = release_connections(engine, &names).await;
+    drop_orphans(engine, &names).await
 }
 
 /// Refuses logins of the app roles `names` and ends their sessions (`drop_database`, before its
