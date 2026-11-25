@@ -118,6 +118,16 @@ pub struct DockerConfig {
     /// The most log bytes the driver keeps for ended instances together; the oldest instance of
     /// the tenant with the most ended log bytes is forgotten first.
     pub max_ended_log_bytes: usize,
+    /// The byte budget of the live (not ended) instances' log rings, and each tenant's share of
+    /// it (backlog S-91; `crate::logs::LogBudget`).
+    pub max_live_log_bytes: usize,
+    pub max_tenant_live_log_bytes: usize,
+    /// The sandbox supervisor (backlog I6-20): a static `ruum-supervisor` binary on the engine's
+    /// host. With it, the driver binds it read-only at `/ruum/bin/ruum-supervisor` as the
+    /// entrypoint and gives the secret values on standard input (never in `Config.Env`); the
+    /// supervisor redacts the app's output inside the sandbox. `None`: the app runs directly
+    /// with its secret values in its environment (the laptop without the binary).
+    pub supervisor: Option<PathBuf>,
 }
 
 /// The default health check: busybox `wget` without a proxy, quiet, output discarded, a 2 s
@@ -168,6 +178,9 @@ impl DockerConfig {
             drained_retention: Duration::from_secs(60),
             max_ended_instances: 1024,
             max_ended_log_bytes: 256 * 1024 * 1024,
+            max_live_log_bytes: 64 * 1024 * 1024,
+            max_tenant_live_log_bytes: 16 * 1024 * 1024,
+            supervisor: None,
         }
     }
 
@@ -192,6 +205,19 @@ impl DockerConfig {
         }
         if self.max_instances == 0 {
             return bad("the instance cap must be above zero".to_owned());
+        }
+        if self.max_tenant_live_log_bytes == 0
+            || self.max_tenant_live_log_bytes > self.max_live_log_bytes
+        {
+            return bad(
+                "a tenant's live log share is above zero and at most the live log budget"
+                    .to_owned(),
+            );
+        }
+        if let Some(p) = &self.supervisor
+            && !p.is_absolute()
+        {
+            return bad("the supervisor binary is an absolute path".to_owned());
         }
         if self.health_command.first().map(String::as_str) != Some("CMD") {
             return bad("the health command starts with CMD (no shell)".to_owned());

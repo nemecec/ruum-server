@@ -1,0 +1,27 @@
+[package]
+name = "ruum-supervisor"
+description = "The sandbox supervisor (backlog I6-20, S-89): the first process of every app sandbox. It fetches the run's secret values over a per-run channel, starts the app, and redacts its output before the container runtime sees it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# A static binary for `*-unknown-linux-musl` (docs/STEP3.md "The sandbox supervisor"): std, `nix`
+# (safe wrappers of prctl, setrlimit, waitpid, kill and sigwait) and the redactor of ruum-core,
+# compiled from its own file (src/lib.rs). No async runtime, no TLS, no C code.
+[dependencies]
+nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "ruum-supervisor"
+path = "src/main.rs"

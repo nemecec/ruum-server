@@ -2,29 +2,31 @@
 //!
 //! - **The API**: pods, ConfigMaps and Secrets of namespaces (each with a `uid`), pod logs
 //!   (followed, one stream or both), label selectors, resourceVersion conflicts on `PUT`, merge
-//!   patches with `stringData`. A bearer token is required. As a real API server, a Secret
-//!   `patch` answers with the changed Secret and a Secret `delete` with `propagationPolicy:
-//!   Foreground` or `Orphan` answers with the Secret (a finalizer was added), data included.
+//!   patches with `stringData`, and `TokenReview`s of the projected tokens the fake kubelet
+//!   issued (audience, ServiceAccount, the pod's name and uid, `exp`). A bearer token is
+//!   required. As a real API server, a Secret `patch` answers with the changed Secret and a
+//!   Secret `delete` with `propagationPolicy: Foreground` or `Orphan` answers with the Secret.
 //! - **The garbage collector**: deleting an object deletes every object whose `ownerReferences`
 //!   name its uid, and theirs (at once, or after `gc_delay_ms`).
-//! - **RBAC**: the rules of the driver's Role are read from the chart
+//! - **RBAC**: the rules of the driver's Role and ClusterRole are read from the chart
 //!   (`deploy/staging/charts/platform/templates/runtime-rbac.yaml`) and every other verb,
 //!   resource or namespace is `403`. So a driver change that needs a new right fails here until
-//!   the Role has it.
-//! - **Admission**: the namespace's rules of backlog S-83 as `k8s/manifests/apps-admission.yaml`
-//!   states them (`runtimeClassName: gvisor`, no service account token by automount or projected
-//!   volume, no host network, no init or ephemeral containers, only `emptyDir` volumes and the
-//!   pod's own Secret, no `envFrom`, environment values only from the pod's own Secret, the
-//!   default service account); quantities are written back in the API server's canonical form
-//!   (`64Mi`), as a real API server does. The Secret rules of the same file ([`admit_secret`]).
-//! - **The kubelet**: each pod runs the conformance program of its arguments
-//!   (`ruum_core::runtime::program`): output into the log, environment values from the pod
-//!   (Secret keys resolved at start), the token read from the Secret at each read (a real
-//!   kubelet refreshes the file within a minute, and keeps the last content while the Secret is
-//!   missing), the memory limit (`OOMKilled`), the size of the
-//!   memory-backed `/tmp` (a full disk), `activeDeadlineSeconds` (`DeadlineExceeded`) and the
-//!   readiness of `serve` and `unhealthy`.
-//! - **The registry**: `HEAD /v2/<repo>/manifests/<digest>` answers for pushed images only.
+//!   the chart has it.
+//! - **Admission**: the namespace's rules as `k8s/manifests/apps-admission.yaml` states them
+//!   ([`admit`], [`admit_secret`]); quantities are written back in the API server's canonical
+//!   form (`64Mi`), as a real API server does.
+//! - **The kubelet and the sandbox supervisor** (backlog I6-20, S-89): a pod with a projected
+//!   service account token gets a token the fake issued for that pod (its name and uid). A pod
+//!   whose command is the supervisor's fetches its launch data from the `--launch-url` (the
+//!   test's supervisor listener) with that token and its address (header `x-fake-peer`), then
+//!   runs the conformance program of the launch command (`/ruum-program` and its steps,
+//!   `ruum_core::runtime::program`), redacting every line with the launch values through
+//!   `ruum-core`'s redactor as the real supervisor does, before the line reaches the pod log. A
+//!   token step asks `/v1/token` for the current token first. A refused launch ends the pod with
+//!   125 ([`Fake::launches`] records each answer). Also: the memory limit (`OOMKilled`), the size
+//!   of the memory-backed `/tmp` (a full disk), `activeDeadlineSeconds` (`DeadlineExceeded`) and
+//!   the readiness of `serve` and `unhealthy`.
+//! - **The registry**: manifests (`HEAD` and `GET`) and config blobs of pushed images only.
 
 #![allow(dead_code)]
 
@@ -35,6 +37,8 @@ use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ruum_core::runtime::program::{DISK_FULL, Step, token_sha};
+use ruum_core::runtime::redact::LineRedactor;
+use ruum_supervisor::protocol::{SUPERVISOR_PATH, TokenAnswer};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -96,11 +100,33 @@ pub enum Tamper {
     ServiceAccount,
     /// A host port on the container.
     HostPort,
+    /// A writable supervisor volume in the app container.
+    WritableSupervisor,
+    /// Another audience of the projected token.
+    TokenAudience,
+}
+
+/// What the fake knows of a projected token it issued.
+#[derive(Clone, Debug)]
+pub struct Issued {
+    pub audience: String,
+    pub namespace: String,
+    pub service_account: String,
+    pub pod: String,
+    pub pod_uid: String,
+    pub exp: i64,
 }
 
 pub struct Fake {
     objs: Mutex<Objects>,
     rules: Vec<(String, Vec<String>)>,
+    cluster_rules: Vec<(String, Vec<String>)>,
+    /// The projected tokens the kubelet issued.
+    pub issued: Mutex<HashMap<String, Issued>>,
+    /// Each launch answer the supervisor got: (pod, HTTP status).
+    pub launches: Mutex<Vec<(String, u16)>>,
+    /// The registry's objects by digest (manifests and config blobs).
+    blobs: Mutex<HashMap<String, Vec<u8>>>,
     namespace: String,
     pub calls: Mutex<Vec<(String, String, String)>>,
     registry: Mutex<HashSet<(String, String)>>,
@@ -118,6 +144,15 @@ pub struct Fake {
 
 /// The Role of the driver, read from the chart: `(resource, verbs)`.
 pub fn role_rules() -> Vec<(String, Vec<String>)> {
+    rules_of("kind: Role", "[\"\"]")
+}
+
+/// The ClusterRole of the driver (the `TokenReview`s of backlog S-89): `(resource, verbs)`.
+pub fn cluster_rules() -> Vec<(String, Vec<String>)> {
+    rules_of("kind: ClusterRole", "[\"authentication.k8s.io\"]")
+}
+
+fn rules_of(kind_line: &str, group: &str) -> Vec<(String, Vec<String>)> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../deploy/staging/charts/platform/templates/runtime-rbac.yaml"
@@ -127,10 +162,10 @@ pub fn role_rules() -> Vec<(String, Vec<String>)> {
     let mut in_role = false;
     for line in text.lines() {
         if line.starts_with("kind: ") {
-            in_role = line == "kind: Role";
+            in_role = line == kind_line;
         }
         let l = line.trim();
-        if !in_role || !l.starts_with("- { apiGroups: [\"\"], resources: [") {
+        if !in_role || !l.starts_with(&format!("- {{ apiGroups: {group}, resources: [")) {
             continue;
         }
         let res = l
@@ -150,7 +185,7 @@ pub fn role_rules() -> Vec<(String, Vec<String>)> {
             ));
         }
     }
-    assert!(!out.is_empty(), "no rules read from {path}");
+    assert!(!out.is_empty(), "no {kind_line} rules read from {path}");
     out
 }
 
@@ -218,6 +253,10 @@ impl Fake {
         let fake = Arc::new(Fake {
             objs: Mutex::new(Objects::default()),
             rules: role_rules(),
+            cluster_rules: cluster_rules(),
+            issued: Mutex::new(HashMap::new()),
+            launches: Mutex::new(Vec::new()),
+            blobs: Mutex::new(HashMap::new()),
             namespace: namespace.to_owned(),
             calls: Mutex::new(Vec::new()),
             registry: Mutex::new(HashSet::new()),
@@ -240,6 +279,10 @@ impl Fake {
                     .delete(object_delete),
             )
             .route("/api/v1/namespaces/{ns}/pods/{name}/log", get(pod_log))
+            .route(
+                "/apis/authentication.k8s.io/v1/tokenreviews",
+                axum::routing::post(token_review),
+            )
             .route("/v2/{*rest}", get(registry))
             .with_state(fake.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -256,6 +299,42 @@ impl Fake {
             .lock()
             .unwrap()
             .insert((repo.to_owned(), digest.to_owned()));
+    }
+
+    /// Pushes an image manifest and its config blob; returns the manifest's digest.
+    pub fn push_image(&self, repo: &str, manifest: &[u8], config: &[u8]) -> String {
+        let digest = ruum_core::runtime::OciDigest::of(manifest)
+            .as_str()
+            .to_owned();
+        let cfg = ruum_core::runtime::OciDigest::of(config)
+            .as_str()
+            .to_owned();
+        let mut b = self.blobs.lock().unwrap();
+        b.insert(digest.clone(), manifest.to_vec());
+        b.insert(cfg.clone(), config.to_vec());
+        drop(b);
+        self.push(repo, &digest);
+        self.push(repo, &cfg);
+        digest
+    }
+
+    /// Issues a projected token for a pod (what the kubelet does for a `serviceAccountToken`
+    /// volume source). The token is a JWT in shape, with `exp`.
+    pub fn issue(&self, i: Issued) -> String {
+        use base64::Engine;
+        let b64 = |v: &Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap())
+        };
+        let token = format!(
+            "{}.{}.{}",
+            b64(&json!({ "alg": "RS256" })),
+            b64(
+                &json!({ "aud": [i.audience], "exp": i.exp, "sub": format!("system:serviceaccount:{}:{}", i.namespace, i.service_account), "jti": uuid::Uuid::now_v7().to_string() })
+            ),
+            "fake-signature"
+        );
+        self.issued.lock().unwrap().insert(token.clone(), i);
+        token
     }
 
     /// `Err` (401 or 403) unless the token and the Role allow the call.
@@ -278,9 +357,13 @@ impl Fake {
             .lock()
             .unwrap()
             .push((ns.to_owned(), verb.to_owned(), resource.to_owned()));
-        let ok = ns == self.namespace
-            && self
-                .rules
+        let rules = if ns.is_empty() {
+            &self.cluster_rules
+        } else {
+            &self.rules
+        };
+        let ok = (ns.is_empty() || ns == self.namespace)
+            && rules
                 .iter()
                 .any(|(r, verbs)| r == resource && verbs.iter().any(|v| v == verb));
         if ok {
@@ -300,6 +383,19 @@ impl Fake {
             .pods
             .get(&(ns.to_owned(), name.to_owned()))
             .map(|p| p.obj.clone())
+    }
+
+    /// Everything a pod wrote to its log, both streams (what the node's CRI log file holds).
+    pub fn raw_log(&self, ns: &str, name: &str) -> String {
+        let o = self.objs.lock().unwrap();
+        let Some(p) = o.pods.get(&(ns.to_owned(), name.to_owned())) else {
+            return String::new();
+        };
+        let chunks = p.log.chunks.lock().unwrap();
+        chunks
+            .iter()
+            .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+            .collect()
     }
 
     pub fn pods(&self) -> Vec<Value> {
@@ -477,8 +573,8 @@ impl Fake {
     }
 }
 
-/// The rules of `deploy/staging/k8s/manifests/apps-admission.yaml` (backlog S-83), in the same
-/// order and with the same meaning.
+/// The pod rules of `deploy/staging/k8s/manifests/apps-admission.yaml` (policy
+/// `ruum-apps-gvisor`, backlog S-83 and S-89), in the same order and with the same meaning.
 pub fn admit(pod: &Value) -> Result<(), &'static str> {
     let spec = &pod["spec"];
     let arr = |v: &Value| v.as_array().cloned().unwrap_or_default();
@@ -486,100 +582,69 @@ pub fn admit(pod: &Value) -> Result<(), &'static str> {
         return Err("pods in ruum-apps run in gVisor only");
     }
     if spec["automountServiceAccountToken"] != json!(false) {
-        return Err("no service account token");
+        return Err("no automounted service account token");
     }
     if spec["hostNetwork"] == json!(true) {
         return Err("never the node's network");
     }
-    if !arr(&spec["initContainers"]).is_empty() || !arr(&spec["ephemeralContainers"]).is_empty() {
-        return Err("no init or ephemeral containers");
+    if !arr(&spec["ephemeralContainers"]).is_empty() {
+        return Err("no ephemeral containers");
     }
-    if !(spec.get("serviceAccountName").is_none() || spec["serviceAccountName"] == json!("default"))
-    {
-        return Err("the default service account only");
+    let inits = arr(&spec["initContainers"]);
+    let init_ok = inits.is_empty()
+        || (inits.len() == 1
+            && inits[0]["name"] == json!("ruum-supervisor")
+            && arr(&inits[0]["volumeMounts"]).len() == 1
+            && inits[0]["volumeMounts"][0]["name"] == json!("ruum-bin"));
+    if !init_ok {
+        return Err("at most the init container ruum-supervisor, which mounts only ruum-bin");
     }
-    let own = pod
-        .pointer("/metadata/labels/ruum.instance")
-        .and_then(Value::as_str)
-        .map(|i| format!("ruum-i-{}", i.replace('-', "")))
-        .unwrap_or_default();
-    let own_secret = |name: &Value| !own.is_empty() && name.as_str() == Some(own.as_str());
+    if spec["serviceAccountName"] != json!("ruum-sandbox") {
+        return Err("the service account ruum-sandbox only");
+    }
     for v in arr(&spec["volumes"]) {
         let empty_dir = v.get("emptyDir").is_some();
-        let secret = v
-            .get("secret")
-            .is_some_and(|s| own_secret(&s["secretName"]));
-        if !(empty_dir || secret) {
-            return Err("volumes: only emptyDir and the instance's own Secret");
+        let sources = arr(&v["projected"]["sources"]);
+        let token = v.get("projected").is_some()
+            && sources.len() == 1
+            && sources[0]["serviceAccountToken"]["audience"] == json!("ruum-supervisor")
+            && sources[0]["serviceAccountToken"]["expirationSeconds"] == json!(600)
+            && sources[0].as_object().is_some_and(|o| o.len() == 1);
+        let only = v.as_object().is_some_and(|o| o.len() == 2);
+        if !(only && (empty_dir || token)) {
+            return Err("volumes: only emptyDir and the supervisor's projected token");
         }
     }
-    for c in arr(&spec["containers"]) {
+    for c in arr(&spec["containers"]).iter().chain(inits.iter()) {
         if !arr(&c["envFrom"]).is_empty() {
             return Err("no envFrom");
         }
-        for e in arr(&c["env"]) {
-            if let Some(from) = e.get("valueFrom")
-                && !from
-                    .get("secretKeyRef")
-                    .is_some_and(|r| own_secret(&r["name"]))
-            {
-                return Err("environment values only from the instance's own Secret");
-            }
+        if arr(&c["env"]).iter().any(|e| e.get("valueFrom").is_some()) {
+            return Err("no environment value from another object");
+        }
+        if c.get("terminationMessagePath")
+            .is_some_and(|p| p != &json!("/dev/termination-log"))
+            || c.get("terminationMessagePolicy")
+                .is_some_and(|p| p != &json!("File"))
+        {
+            return Err("the default termination message path and policy File");
+        }
+    }
+    for c in arr(&spec["containers"]) {
+        if arr(&c["volumeMounts"])
+            .iter()
+            .any(|m| m["name"] == json!("ruum-bin") && m["readOnly"] != json!(true))
+        {
+            return Err("ruum-bin is read-only in every container");
         }
     }
     Ok(())
 }
 
-/// The Secret rules of `deploy/staging/k8s/manifests/apps-admission.yaml` (policy
-/// `ruum-apps-secrets`, Kimi run 15 I6-1 finding 4), in the same order and with the same
-/// meaning, for a create.
-pub fn admit_secret(secret: &Value) -> Result<(), &'static str> {
-    let meta = &secret["metadata"];
-    if secret
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("Opaque")
-        != "Opaque"
-    {
-        return Err("Secrets in ruum-apps are of type Opaque only");
-    }
-    if meta["annotations"].as_object().is_some_and(|a| {
-        a.keys()
-            .any(|k| k.starts_with("kubernetes.io/service-account"))
-    }) {
-        return Err("no service account annotation");
-    }
-    let own = meta
-        .pointer("/labels/ruum.instance")
-        .and_then(Value::as_str)
-        .map(|i| format!("ruum-i-{}", i.replace('-', "")))
-        .unwrap_or_default();
-    let name = meta["name"].as_str().unwrap_or_default();
-    let hex = name.strip_prefix("ruum-i-").unwrap_or_default();
-    if own.is_empty()
-        || name != own
-        || hex.len() != 32
-        || !hex.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
-    {
-        return Err("an instance Secret, ruum-i-<its ruum.instance label without dashes>");
-    }
-    let finalizers = meta["finalizers"].as_array().map_or(0, Vec::len);
-    let refs = meta["ownerReferences"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let key = format!("{}-", own.replace("ruum-i-", "ruum-k-"));
-    if finalizers != 0
-        || refs.len() != 1
-        || refs[0]["apiVersion"] != json!("v1")
-        || refs[0]["kind"] != json!("ConfigMap")
-        || !refs[0]["name"]
-            .as_str()
-            .is_some_and(|n| n.starts_with(&key))
-    {
-        return Err("owned by one key ConfigMap of its instance, no finalizer");
-    }
-    Ok(())
+/// The Secret rule of `deploy/staging/k8s/manifests/apps-admission.yaml` (policy
+/// `ruum-apps-secrets`, backlog S-89): no Secret in ruum-apps at all.
+pub fn admit_secret(_secret: &Value) -> Result<(), &'static str> {
+    Err("no Secret in ruum-apps (the sandbox values are sealed in the records, backlog S-89)")
 }
 
 fn plural_ok(kind: &str) -> bool {
@@ -740,6 +805,32 @@ async fn collection_post(
                 }
                 Tamper::HostPort => {
                     obj["spec"]["containers"][0]["ports"][0]["hostPort"] = json!(8080);
+                }
+                Tamper::WritableSupervisor => {
+                    if let Some(m) = obj
+                        .pointer_mut("/spec/containers/0/volumeMounts")
+                        .and_then(Value::as_array_mut)
+                    {
+                        for x in m.iter_mut() {
+                            if x["name"] == json!("ruum-bin") {
+                                x["readOnly"] = json!(false);
+                            }
+                        }
+                    }
+                }
+                Tamper::TokenAudience => {
+                    if let Some(v) = obj
+                        .pointer_mut("/spec/volumes")
+                        .and_then(Value::as_array_mut)
+                    {
+                        for x in v.iter_mut() {
+                            if let Some(t) =
+                                x.pointer_mut("/projected/sources/0/serviceAccountToken")
+                            {
+                                t["audience"] = json!("other-audience");
+                            }
+                        }
+                    }
                 }
             }
             obj["status"] = json!({ "phase": "Pending" });
@@ -1001,27 +1092,160 @@ async fn pod_log(
     Response::new(Body::from_stream(stream))
 }
 
+/// `POST /apis/authentication.k8s.io/v1/tokenreviews` (cluster-scoped, the ClusterRole).
+async fn token_review(State(f): State<Arc<Fake>>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Err(r) = f.allow(&headers, "", "create", "tokenreviews") {
+        return r;
+    }
+    let Ok(req) = serde_json::from_slice::<Value>(&body) else {
+        return status(StatusCode::BAD_REQUEST, "not JSON");
+    };
+    let token = req
+        .pointer("/spec/token")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let wanted: Vec<String> = req
+        .pointer("/spec/audiences")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let issued = f.issued.lock().unwrap().get(token).cloned();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let st = match issued {
+        Some(i) if i.exp > now && wanted.iter().any(|a| *a == i.audience) => json!({
+            "authenticated": true,
+            "audiences": [i.audience],
+            "user": {
+                "username": format!("system:serviceaccount:{}:{}", i.namespace, i.service_account),
+                "groups": ["system:serviceaccounts"],
+                "extra": {
+                    "authentication.kubernetes.io/pod-name": [i.pod],
+                    "authentication.kubernetes.io/pod-uid": [i.pod_uid],
+                },
+            },
+        }),
+        Some(_) => json!({ "authenticated": false, "error": "audience or expiry" }),
+        None => json!({ "authenticated": false, "error": "invalid bearer token" }),
+    };
+    (
+        StatusCode::CREATED,
+        axum::Json(json!({ "apiVersion": "authentication.k8s.io/v1", "kind": "TokenReview", "status": st })),
+    )
+        .into_response()
+}
+
 async fn registry(
     State(f): State<Arc<Fake>>,
     method: Method,
     Path(rest): Path<String>,
 ) -> Response {
-    let _ = method;
-    let Some((repo, digest)) = rest.split_once("/manifests/") else {
-        return StatusCode::NOT_FOUND.into_response();
+    let (repo, digest) = match rest.split_once("/manifests/") {
+        Some(x) => x,
+        None => match rest.split_once("/blobs/") {
+            Some(x) => x,
+            None => return StatusCode::NOT_FOUND.into_response(),
+        },
     };
-    if f.registry
+    if !f
+        .registry
         .lock()
         .unwrap()
         .contains(&(repo.to_owned(), digest.to_owned()))
     {
-        StatusCode::OK.into_response()
-    } else {
-        StatusCode::NOT_FOUND.into_response()
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if method == Method::HEAD {
+        return StatusCode::OK.into_response();
+    }
+    match f.blobs.lock().unwrap().get(digest) {
+        Some(b) => (StatusCode::OK, b.clone()).into_response(),
+        None => StatusCode::OK.into_response(),
     }
 }
 
-/// Runs a pod's program (see the module docs).
+/// The fake sandbox supervisor of one pod: the launch values, the current token, one redactor
+/// per stream (`ruum-core`'s, as the real supervisor).
+struct Sup {
+    out: LineRedactor,
+    err: LineRedactor,
+    base: Vec<String>,
+    token: String,
+    url: String,
+    bearer: String,
+    peer: String,
+}
+
+impl Sup {
+    fn values(&self) -> Vec<String> {
+        let mut v = self.base.clone();
+        v.push(self.token.clone());
+        v
+    }
+
+    /// Redacts a chunk of one stream; the complete lines, each with its line end.
+    fn push(&mut self, stream: u8, data: &[u8]) -> Vec<u8> {
+        let now = time::OffsetDateTime::now_utc();
+        let lines = if stream == 1 {
+            self.out.push_bytes(data, now)
+        } else {
+            self.err.push_bytes(data, now)
+        };
+        let mut out = Vec::new();
+        for (_, l) in lines {
+            out.extend_from_slice(l.as_bytes());
+            out.push(b'\n');
+        }
+        out
+    }
+
+    fn finish(&mut self) -> (Vec<u8>, Vec<u8>) {
+        let now = time::OffsetDateTime::now_utc();
+        let join = |lines: Vec<(time::OffsetDateTime, String)>| {
+            let mut out = Vec::new();
+            for (_, l) in lines {
+                out.extend_from_slice(l.as_bytes());
+                out.push(b'\n');
+            }
+            out
+        };
+        (join(self.out.finish(now)), join(self.err.finish(now)))
+    }
+
+    /// The current token from `/v1/token`, redacted before it is used (as the supervisor).
+    async fn refresh(&mut self) {
+        let r = reqwest::Client::new()
+            .post(format!("{}/v1/token", self.url))
+            .bearer_auth(&self.bearer)
+            .header("x-fake-peer", &self.peer)
+            .send()
+            .await;
+        if let Ok(r) = r
+            && r.status() == StatusCode::OK
+            && let Ok(a) = r.json::<TokenAnswer>().await
+            && a.check().is_ok()
+            && a.token != self.token
+        {
+            self.base.push(std::mem::replace(&mut self.token, a.token));
+            let all = self.values();
+            self.out.set_values(all.iter().map(String::as_str));
+            self.err.set_values(all.iter().map(String::as_str));
+        }
+    }
+}
+
+/// The value after `flag` in a command.
+fn arg_after(cmd: &[String], flag: &str) -> Option<String> {
+    cmd.iter()
+        .position(|a| a == flag)
+        .and_then(|i| cmd.get(i + 1))
+        .cloned()
+}
+
+/// Runs a pod (see the module docs): the kubelet, the supervisor's launch and the program.
 async fn kubelet(f: Arc<Fake>, key: (String, String), log: Arc<LogBuf>) {
     let Some(pod) = f.pod(&key.0, &key.1) else {
         return;
@@ -1031,7 +1255,7 @@ async fn kubelet(f: Arc<Fake>, key: (String, String), log: Arc<LogBuf>) {
         .cloned()
         .unwrap_or_default();
     let ns = key.0.clone();
-    // Environment values; a missing Secret key never starts the container.
+    // Plain environment values (admission refuses any other kind).
     let mut env: HashMap<String, String> = HashMap::new();
     for e in c
         .get("env")
@@ -1039,45 +1263,10 @@ async fn kubelet(f: Arc<Fake>, key: (String, String), log: Arc<LogBuf>) {
         .cloned()
         .unwrap_or_default()
     {
-        let name = e["name"].as_str().unwrap().to_owned();
-        let value = match e.get("value").and_then(Value::as_str) {
-            Some(v) => Some(v.to_owned()),
-            None => {
-                let secret = e
-                    .pointer("/valueFrom/secretKeyRef/name")
-                    .and_then(Value::as_str);
-                let k = e
-                    .pointer("/valueFrom/secretKeyRef/key")
-                    .and_then(Value::as_str);
-                match (secret, k) {
-                    (Some(s), Some(k)) => f.secret_value(&ns, s, k),
-                    _ => None,
-                }
-            }
-        };
-        match value {
-            Some(v) => {
-                env.insert(name, v);
-            }
-            None => {
-                f.set_pod(&key, |p| {
-                    p["status"]["containerStatuses"] = json!([{ "name": "app", "ready": false,
-                        "state": { "waiting": { "reason": "CreateContainerConfigError" } } }]);
-                });
-                return;
-            }
+        if let (Some(n), Some(v)) = (e["name"].as_str(), e["value"].as_str()) {
+            env.insert(n.to_owned(), v.to_owned());
         }
     }
-    let token_secret = pod
-        .pointer("/spec/volumes")
-        .and_then(Value::as_array)
-        .and_then(|v| {
-            v.iter()
-                .find(|v| v["name"] == "token")
-                .and_then(|v| v.pointer("/secret/secretName"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        });
     let memory_limit = c
         .pointer("/resources/limits/memory")
         .and_then(Value::as_str)
@@ -1104,6 +1293,7 @@ async fn kubelet(f: Arc<Fake>, key: (String, String), log: Arc<LogBuf>) {
         p["status"] = json!({
             "phase": "Running",
             "podIP": ip,
+            "podIPs": [{ "ip": ip }],
             "containerStatuses": [{ "name": "app", "ready": false,
                 "state": { "running": { "startedAt": started_at } } }],
         });
@@ -1149,17 +1339,6 @@ async fn kubelet(f: Arc<Fake>, key: (String, String), log: Arc<LogBuf>) {
             }
         });
     }
-    let args: Vec<String> = c
-        .get("args")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
-    let (mut mem, mut disk) = (0u64, 0u64);
-    let mut last_token = String::new();
     let end = |code: i64, reason: &str| {
         let reason = reason.to_owned();
         f.set_pod(&key, move |p| {
@@ -1174,39 +1353,182 @@ async fn kubelet(f: Arc<Fake>, key: (String, String), log: Arc<LogBuf>) {
             p["status"]["containerStatuses"][0]["ready"] = json!(r);
         });
     };
+    // The projected token of the pod (the kubelet issues it for this pod only).
+    let token = pod
+        .pointer("/spec/volumes")
+        .and_then(Value::as_array)
+        .and_then(|v| {
+            v.iter().find_map(|v| {
+                v.pointer("/projected/sources/0/serviceAccountToken")
+                    .cloned()
+            })
+        })
+        .map(|t| {
+            f.issue(Issued {
+                audience: t["audience"].as_str().unwrap_or_default().to_owned(),
+                namespace: ns.clone(),
+                service_account: pod
+                    .pointer("/spec/serviceAccountName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default")
+                    .to_owned(),
+                pod: key.1.clone(),
+                pod_uid: pod
+                    .pointer("/metadata/uid")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                exp: time::OffsetDateTime::now_utc().unix_timestamp()
+                    + t["expirationSeconds"].as_i64().unwrap_or(3600),
+            })
+        });
+    let command: Vec<String> = c
+        .get("command")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    // The supervisor: one launch, then the program of its command with every line redacted.
+    let (mut sup, args) = if command.first().map(String::as_str) == Some(SUPERVISOR_PATH) {
+        let (Some(url), Some(bearer)) = (arg_after(&command, "--launch-url"), token) else {
+            log.push(2, b"ruum-supervisor: no launch channel\n".to_vec());
+            end(125, "Error");
+            return;
+        };
+        // As the real supervisor: 503, 429 and transport errors are tried again (the seal of
+        // the pod's run is written right after the pod), anything else ends the launch.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let (code, body) = loop {
+            let r = reqwest::Client::new()
+                .post(format!("{url}/v1/launch"))
+                .bearer_auth(&bearer)
+                .header("x-fake-peer", &ip)
+                .send()
+                .await;
+            let (code, body) = match r {
+                Ok(r) => {
+                    let code = r.status().as_u16();
+                    (code, r.bytes().await.unwrap_or_default())
+                }
+                Err(_) => (0, Bytes::new()),
+            };
+            if matches!(code, 0 | 429 | 503) && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                continue;
+            }
+            break (code, body);
+        };
+        f.launches.lock().unwrap().push((key.1.clone(), code));
+        let launch = match ruum_supervisor::run::parse_launch(&body, true) {
+            Ok(l) if code == 200 => l,
+            _ => {
+                log.push(
+                    2,
+                    format!("ruum-supervisor: the launch failed: status {code}\n").into_bytes(),
+                );
+                end(125, "Error");
+                return;
+            }
+        };
+        if launch.argv.first().map(String::as_str) != Some("/ruum-program") {
+            log.push(
+                2,
+                b"ruum-supervisor: the app's command did not start\n".to_vec(),
+            );
+            end(127, "Error");
+            return;
+        }
+        for (k, v) in &launch.env {
+            env.insert(k.clone(), v.clone());
+        }
+        let values = launch.values();
+        let red =
+            || LineRedactor::new(values.iter().map(String::as_str)).with_max_line_bytes(16 * 1024);
+        let token = launch.token.clone().unwrap_or_default();
+        let mut base = values.clone();
+        base.retain(|v| *v != token);
+        let sup = Sup {
+            out: red(),
+            err: red(),
+            base,
+            token,
+            url,
+            bearer,
+            peer: ip.clone(),
+        };
+        (Some(sup), launch.argv[1..].to_vec())
+    } else {
+        // Not the supervisor (a pod made by hand): its arguments, unredacted.
+        let args: Vec<String> = c
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (None, args)
+    };
+    let emit = |sup: &mut Option<Sup>, stream: u8, data: Vec<u8>| match sup {
+        Some(s) => {
+            let out = s.push(stream, &data);
+            if !out.is_empty() {
+                log.push(stream, out);
+            }
+        }
+        None => log.push(stream, data),
+    };
+    let flush = |sup: &mut Option<Sup>| {
+        if let Some(s) = sup {
+            let (o, e) = s.finish();
+            if !o.is_empty() {
+                log.push(1, o);
+            }
+            if !e.is_empty() {
+                log.push(2, e);
+            }
+        }
+    };
+    let (mut mem, mut disk) = (0u64, 0u64);
     for arg in args {
         let Some(step) = Step::parse(&arg) else {
-            log.push(2, format!("unknown step {arg}\n").into_bytes());
+            emit(&mut sup, 2, format!("unknown step {arg}\n").into_bytes());
+            flush(&mut sup);
             end(2, "Error");
             return;
         };
         match step {
-            Step::Print(t) => log.push(1, format!("{t}\n").into_bytes()),
-            Step::Write(t) => log.push(1, t.into_bytes()),
-            Step::Stderr(t) => log.push(2, format!("{t}\n").into_bytes()),
-            Step::StderrWrite(t) => log.push(2, t.into_bytes()),
+            Step::Print(t) => emit(&mut sup, 1, format!("{t}\n").into_bytes()),
+            Step::Write(t) => emit(&mut sup, 1, t.into_bytes()),
+            Step::Stderr(t) => emit(&mut sup, 2, format!("{t}\n").into_bytes()),
+            Step::StderrWrite(t) => emit(&mut sup, 2, t.into_bytes()),
             Step::Env(n) => {
                 let v = env.get(&n).cloned().unwrap_or_default();
-                log.push(1, format!("{n}={v}\n").into_bytes());
+                emit(&mut sup, 1, format!("{n}={v}\n").into_bytes());
             }
             Step::Token | Step::TokenSha => {
-                // The kubelet keeps the file's last content while the Secret is missing.
-                if let Some(t) = token_secret
-                    .as_deref()
-                    .and_then(|s| f.secret_value(&ns, s, "token"))
-                {
-                    last_token = t;
-                }
-                let t = last_token.clone();
+                // The supervisor writes the token file; the program reads the newest one.
+                let t = match &mut sup {
+                    Some(s) => {
+                        s.refresh().await;
+                        s.token.clone()
+                    }
+                    None => String::new(),
+                };
                 let line = if step == Step::Token {
-                    t
+                    t.clone()
                 } else {
                     token_sha(&t)
                 };
-                log.push(1, format!("{line}\n").into_bytes());
+                emit(&mut sup, 1, format!("{line}\n").into_bytes());
             }
             Step::Sleep(d) => tokio::time::sleep(d).await,
             Step::Exit(code) => {
+                flush(&mut sup);
                 end(
                     i64::from(code),
                     if code == 0 { "Completed" } else { "Error" },
@@ -1214,23 +1536,27 @@ async fn kubelet(f: Arc<Fake>, key: (String, String), log: Arc<LogBuf>) {
                 return;
             }
             Step::Serve => {
+                flush(&mut sup);
                 ready(has_probe);
                 std::future::pending::<()>().await;
             }
             Step::Unhealthy => {
+                flush(&mut sup);
                 ready(false);
                 std::future::pending::<()>().await;
             }
             Step::Alloc(b) => {
                 mem += b;
                 if mem > memory_limit {
+                    flush(&mut sup);
                     end(137, "OOMKilled");
                     return;
                 }
             }
             Step::Disk(b) => {
                 if disk + b > disk_limit {
-                    log.push(1, format!("{DISK_FULL}\n").into_bytes());
+                    emit(&mut sup, 1, format!("{DISK_FULL}\n").into_bytes());
+                    flush(&mut sup);
                     end(1, "Error");
                     return;
                 }
@@ -1238,5 +1564,6 @@ async fn kubelet(f: Arc<Fake>, key: (String, String), log: Arc<LogBuf>) {
             }
         }
     }
+    flush(&mut sup);
     end(0, "Completed");
 }

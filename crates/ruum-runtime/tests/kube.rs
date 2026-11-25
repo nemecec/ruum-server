@@ -18,6 +18,7 @@ use ruum_core::runtime::{
     Route, RuntimeDriver, RuntimeError, RuntimeUsage, SecretValue, ServiceSpec, WorkloadIdentity,
     WorkloadKind, WorkloadSpec,
 };
+use ruum_runtime::kube::{LaunchRefusal, RecordKey};
 use ruum_runtime::{EgressNetwork, EgressRegistry};
 use ruum_runtime::{KubeConfig, KubeDriver, SharedService, repository};
 use std::collections::BTreeMap;
@@ -83,7 +84,68 @@ struct World {
     fake: Arc<Fake>,
     cfg: KubeConfig,
     egress: Arc<Recording>,
+    /// The driver behind the test's supervisor listener: the newest one `driver` made (in
+    /// production every server replica answers it).
+    listener: Arc<Mutex<Option<Arc<KubeDriver>>>>,
     _dir: TempDir,
+}
+
+/// The supervisor listener of the server, as `crates/ruum-server` serves it, except that the
+/// peer address comes from the fake kubelet's header `x-fake-peer` (the pods' addresses are
+/// fake).
+async fn start_listener(slot: Arc<Mutex<Option<Arc<KubeDriver>>>>) -> u16 {
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
+    async fn answer(
+        slot: Arc<Mutex<Option<Arc<KubeDriver>>>>,
+        headers: HeaderMap,
+        launch: bool,
+    ) -> axum::response::Response {
+        let bearer = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or_default()
+            .to_owned();
+        let peer: std::net::IpAddr = headers
+            .get("x-fake-peer")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or([127, 0, 0, 1].into());
+        let Some(d) = slot.lock().unwrap().clone() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        let r = if launch {
+            d.supervisor_launch(&bearer, peer).await
+        } else {
+            d.supervisor_token(&bearer, peer).await
+        };
+        match r {
+            Ok(body) => {
+                (StatusCode::OK, [("content-type", "application/json")], body).into_response()
+            }
+            Err(LaunchRefusal::Forbidden) => StatusCode::FORBIDDEN.into_response(),
+            Err(LaunchRefusal::NotReady) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            Err(LaunchRefusal::TooMany) => StatusCode::TOO_MANY_REQUESTS.into_response(),
+        }
+    }
+    let app = axum::Router::new()
+        .route(
+            "/v1/launch",
+            axum::routing::post(|State(s), h| answer(s, h, true)),
+        )
+        .route(
+            "/v1/token",
+            axum::routing::post(|State(s), h| answer(s, h, false)),
+        )
+        .with_state(slot);
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(l, app).await.unwrap();
+    });
+    port
 }
 
 /// A temporary folder for the token file, removed at the end.
@@ -137,24 +199,41 @@ async fn world(split: bool) -> World {
     cfg.reregister_every = Duration::from_millis(300);
     cfg.split_log_streams = split;
     cfg.extra_labels = BTreeMap::from([("ruum.test".into(), "i61".into())]);
+    // The sandbox supervisor (I6-20, S-89): the record key, the pinned image, the listener.
+    cfg.record_key = Some(RecordKey::new(rand::random()));
+    cfg.supervisor_image = format!(
+        "registry.test:5000/ruum-supervisor@sha256:{}",
+        "5".repeat(64)
+    );
+    cfg.network_encrypted = true;
+    let listener = Arc::new(Mutex::new(None));
+    cfg.supervisor_address = "127.0.0.1".into();
+    cfg.supervisor_port = start_listener(listener.clone()).await;
     World {
         fake,
         cfg,
         egress: Arc::new(Recording::default()),
+        listener,
         _dir: TempDir(dir),
     }
 }
 
 impl World {
-    fn driver(&self, usage: Arc<MemoryUsage>) -> KubeDriver {
-        KubeDriver::new(self.cfg.clone(), self.egress.clone(), usage).unwrap()
+    fn driver(&self, usage: Arc<MemoryUsage>) -> Arc<KubeDriver> {
+        let d = Arc::new(KubeDriver::new(self.cfg.clone(), self.egress.clone(), usage).unwrap());
+        *self.listener.lock().unwrap() = Some(d.clone());
+        d
     }
 
     /// A driver whose own sweep never runs (the test calls `sweep`).
     fn quiet_driver(&self) -> Arc<KubeDriver> {
         let mut cfg = self.cfg.clone();
         cfg.sweep_every = Duration::from_secs(3600);
-        Arc::new(KubeDriver::new(cfg, self.egress.clone(), Arc::new(MemoryUsage::new())).unwrap())
+        let d = Arc::new(
+            KubeDriver::new(cfg, self.egress.clone(), Arc::new(MemoryUsage::new())).unwrap(),
+        );
+        *self.listener.lock().unwrap() = Some(d.clone());
+        d
     }
 
     fn service(&self, identity: WorkloadIdentity, idle: Option<Duration>) -> WorkloadSpec {
@@ -167,10 +246,31 @@ impl World {
         spec
     }
 
+    /// An image of the conformance program: its entrypoint `/ruum-program` (the fake kubelet
+    /// runs the steps after it), pushed to the repository of the identity.
     fn image(&self, identity: &WorkloadIdentity) -> ImageRef {
-        let digest = OciDigest::of(uuid::Uuid::now_v7().as_bytes());
-        self.fake.push(&repository(identity), digest.as_str());
-        ImageRef::Oci(digest)
+        let config = serde_json::json!({
+            "architecture": "amd64", "os": "linux",
+            "config": { "Entrypoint": ["/ruum-program"], "Cmd": [] },
+            "rootfs": { "type": "layers", "diff_ids": [] },
+        })
+        .to_string();
+        let config_digest = OciDigest::of(config.as_bytes());
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": { "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest.as_str(), "size": config.len() },
+            "layers": [],
+            "annotations": { "test": uuid::Uuid::now_v7().to_string() },
+        })
+        .to_string();
+        let digest = self.fake.push_image(
+            &repository(identity),
+            manifest.as_bytes(),
+            config.as_bytes(),
+        );
+        ImageRef::Oci(OciDigest::parse(&digest).unwrap())
     }
 
     fn spec(&self, identity: WorkloadIdentity, steps: &[Step]) -> WorkloadSpec {
@@ -206,7 +306,7 @@ fn identity() -> WorkloadIdentity {
 }
 
 async fn wait_state(
-    d: &dyn RuntimeDriver,
+    d: &KubeDriver,
     tenant: TenantId,
     id: ruum_core::runtime::InstanceId,
     pred: impl Fn(&InstanceState) -> bool,
@@ -254,7 +354,7 @@ impl DriverFixture for Fixture {
 async fn the_kubernetes_driver_passes_the_conformance_suite() {
     let world = world(true).await;
     let usage = Arc::new(MemoryUsage::new());
-    let driver: Arc<dyn RuntimeDriver> = Arc::new(world.driver(usage.clone()));
+    let driver: Arc<dyn RuntimeDriver> = world.driver(usage.clone());
     let f = Fixture {
         world,
         driver,
@@ -270,19 +370,29 @@ async fn the_kubernetes_driver_passes_the_conformance_suite() {
     // refused call would have failed a case), and no Secret was ever read.
     let calls = f.world.fake.calls.lock().unwrap().clone();
     assert!(
-        calls.iter().all(|(ns, _, _)| ns == NS),
+        calls
+            .iter()
+            .all(|(ns, _, r)| ns == NS || (ns.is_empty() && r == "tokenreviews")),
         "a call outside {NS}"
     );
     assert!(
-        !calls
-            .iter()
-            .any(|(_, v, r)| r == "secrets" && matches!(v.as_str(), "get" | "list" | "watch")),
-        "the driver read a Secret"
+        !calls.iter().any(|(_, _, r)| r == "secrets"),
+        "the driver touched a Secret"
+    );
+    assert!(f.world.fake.secret_names().is_empty(), "a Secret exists");
+    // The pods took their launch data from the supervisor listener; a pod whose instance ended
+    // before its launch (a stop right after the start) is refused.
+    let launches = f.world.fake.launches.lock().unwrap().clone();
+    assert!(
+        launches.iter().filter(|(_, c)| *c == 200).count() > launches.len() / 2
+            && launches.iter().all(|(_, c)| matches!(c, 200 | 403)),
+        "{launches:?}"
     );
 }
 
-/// The pod is the sandbox of rule 1 in gVisor, and no secret value is outside the Secret: not in
-/// the pod, not in the record.
+/// The pod is the sandbox of rule 1 in gVisor with the sandbox supervisor as its first process
+/// (I6-20), and no secret value is in any Kubernetes object in the clear: not in the pod, not in
+/// the record (sealed), and there is no Secret at all (S-89).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_pod_is_a_restricted_gvisor_sandbox_without_secret_values() {
     let w = world(false).await;
@@ -297,13 +407,12 @@ async fn the_pod_is_a_restricted_gvisor_sandbox_without_secret_values() {
     spec.previous_secrets = vec![SecretValue::new("old-value-of-the-secret")];
     let token = spec.workload_token.expose().to_owned();
     let s = d.start(spec).await.unwrap();
-    let pod = w
-        .fake
-        .pod(NS, &ruum_runtime::kube::pod_name(s.id, 1))
-        .unwrap();
+    let pod_n = ruum_runtime::kube::pod_name(s.id, 1);
+    let pod = w.fake.pod(NS, &pod_n).unwrap();
     let p = |ptr: &str| pod.pointer(ptr).cloned().unwrap_or_default();
     assert_eq!(p("/spec/runtimeClassName"), "gvisor");
     assert_eq!(p("/spec/automountServiceAccountToken"), false);
+    assert_eq!(p("/spec/serviceAccountName"), "ruum-sandbox");
     assert_eq!(p("/spec/enableServiceLinks"), false);
     assert_eq!(p("/spec/hostNetwork"), false);
     assert_eq!(p("/spec/restartPolicy"), "Never");
@@ -334,12 +443,49 @@ async fn the_pod_is_a_restricted_gvisor_sandbox_without_secret_values() {
         "ruum-egress",
         "the egress proxy by /etc/hosts"
     );
+    // The supervisor: installed by the init container from the pinned image into a read-only
+    // volume, the app container's command, the projected token of the audience ruum-supervisor.
+    assert_eq!(
+        p("/spec/initContainers/0/image"),
+        serde_json::json!(w.cfg.supervisor_image)
+    );
+    assert_eq!(p(&format!("{c}/command/0")), "/ruum/bin/ruum-supervisor");
+    let mounts = p(&format!("{c}/volumeMounts")).to_string();
+    assert!(
+        mounts.contains(r#""mountPath":"/ruum/bin","name":"ruum-bin","readOnly":true"#),
+        "{mounts}"
+    );
+    assert_eq!(
+        p("/spec/volumes/3/projected/sources/0/serviceAccountToken/audience"),
+        "ruum-supervisor"
+    );
+    assert_eq!(p(&format!("{c}/terminationMessagePolicy")), "File");
     let env = p(&format!("{c}/env"));
     let env_s = env.to_string();
     assert!(env_s.contains("\"HTTPS_PROXY\""), "{env_s}");
     assert!(env_s.contains("http://ruum-egress:3128"), "{env_s}");
-    assert!(env_s.contains("secretKeyRef"), "{env_s}");
-    // No secret value in any pod or record (the Secret holds them).
+    assert!(
+        !env_s.contains("valueFrom") && !env_s.contains("API_KEY"),
+        "{env_s}"
+    );
+    // The app got its value from the supervisor, and its output is redacted before the kubelet
+    // writes it (the pod log holds the supervisor's output only).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let logs = d.logs(id.tenant, s.id, None, 100).await.unwrap();
+        if logs.iter().any(|l| l.text == "API_KEY=<hidden secret>") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the app did not get its value: {logs:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let raw = w.fake.raw_log(NS, &pod_n);
+    assert!(raw.contains("API_KEY=<hidden secret>"), "{raw}");
+    assert!(!raw.contains(&secret), "the node's log holds the secret");
+    // No secret value in any pod or record, and no Secret.
     let all: String = w
         .fake
         .pods()
@@ -355,11 +501,9 @@ async fn the_pod_is_a_restricted_gvisor_sandbox_without_secret_values() {
         assert!(!all.contains(v), "{what} is in a pod or a record");
     }
     assert!(all.contains("visible"), "the plain value is in the pod");
-    // The Secret exists while the instance lives and goes with it.
-    let name = ruum_runtime::kube::object_name(s.id);
-    assert!(w.fake.secret_names().contains(&name));
+    assert!(all.contains("\\\"sealed\\\""), "the record has no seal");
+    assert!(w.fake.secret_names().is_empty(), "a Secret exists");
     d.stop(id.tenant, s.id).await.unwrap();
-    assert!(!w.fake.secret_names().contains(&name), "the Secret stayed");
 }
 
 /// A pod that the API server stored with another setting (an admission step changed it) is
@@ -375,6 +519,8 @@ async fn a_changed_pod_is_refused() {
         Tamper::ChangeHostAlias,
         Tamper::ServiceAccount,
         Tamper::HostPort,
+        Tamper::WritableSupervisor,
+        Tamper::TokenAudience,
     ] {
         *w.fake.tamper.lock().unwrap() = t;
         let err = d
@@ -786,177 +932,512 @@ async fn a_short_jobs_log_is_read_after_it_ended() {
     }
 }
 
-/// The fake's admission is the namespace's rule set (S-83): a projected token, another
-/// instance's Secret and `envFrom` are refused; the driver's own pod passes (every test above).
+/// The fake's admission is the namespace's rule set (S-83, S-89): the supervisor's pod passes
+/// (every test above); a Secret volume, an environment value from any object, `envFrom`,
+/// another service account, a projected token of another audience or lifetime, another init
+/// container, a writable supervisor volume and another termination message path are refused.
 #[test]
-fn the_admission_rules_refuse_tokens_and_other_secrets() {
-    let own = uuid::Uuid::now_v7();
+fn the_admission_rules_admit_only_the_supervisor_shape() {
     let base = serde_json::json!({
-        "metadata": { "labels": { "ruum.instance": own.to_string() } },
+        "metadata": { "labels": { "ruum.instance": uuid::Uuid::now_v7().to_string() } },
         "spec": {
             "runtimeClassName": "gvisor",
+            "serviceAccountName": "ruum-sandbox",
             "automountServiceAccountToken": false,
-            "containers": [{ "name": "app", "env": [] }],
-            "volumes": [{ "name": "token", "secret": { "secretName": format!("ruum-i-{}", own.simple()) } }],
+            "initContainers": [{ "name": "ruum-supervisor", "volumeMounts": [{ "name": "ruum-bin", "mountPath": "/ruum/bin" }] }],
+            "containers": [{ "name": "app", "env": [{ "name": "MODE", "value": "x" }],
+                "terminationMessagePath": "/dev/termination-log", "terminationMessagePolicy": "File",
+                "volumeMounts": [{ "name": "ruum-bin", "mountPath": "/ruum/bin", "readOnly": true }] }],
+            "volumes": [
+                { "name": "ruum-bin", "emptyDir": { "medium": "Memory" } },
+                { "name": "ruum-id", "projected": { "sources": [{ "serviceAccountToken": {
+                    "audience": "ruum-supervisor", "expirationSeconds": 600, "path": "token" } }] } },
+            ],
         },
     });
-    assert!(kube_fake::admit(&base).is_ok());
-    let mut projected = base.clone();
-    projected["spec"]["volumes"] = serde_json::json!([{ "name": "t", "projected": { "sources": [
-        { "serviceAccountToken": { "path": "token" } }] } }]);
-    let mut other = base.clone();
-    other["spec"]["volumes"][0]["secret"]["secretName"] =
-        serde_json::json!(format!("ruum-i-{}", uuid::Uuid::now_v7().simple()));
-    let mut env = base.clone();
-    env["spec"]["containers"][0]["env"] = serde_json::json!([{ "name": "X", "valueFrom": {
-        "secretKeyRef": { "name": "ruum-i-00000000000000000000000000000000", "key": "token" } } }]);
-    let mut env_from = base.clone();
-    env_from["spec"]["containers"][0]["envFrom"] =
-        serde_json::json!([{ "secretRef": { "name": "x" } }]);
-    let mut account = base.clone();
-    account["spec"]["serviceAccountName"] = serde_json::json!("ruum-server");
-    for (what, pod) in [
-        ("projected token", projected),
-        ("another Secret", other),
-        ("another Secret's value", env),
-        ("envFrom", env_from),
-        ("service account", account),
-    ] {
+    assert_eq!(kube_fake::admit(&base), Ok(()));
+    let change = |f: &dyn Fn(&mut serde_json::Value)| {
+        let mut p = base.clone();
+        f(&mut p);
+        p
+    };
+    let cases = [
+        (
+            "a Secret volume",
+            change(&|p| {
+                p["spec"]["volumes"][0] =
+                    serde_json::json!({ "name": "t", "secret": { "secretName": "ruum-i-0" } })
+            }),
+        ),
+        (
+            "an environment value from a Secret",
+            change(
+                &|p| p["spec"]["containers"][0]["env"] = serde_json::json!([{ "name": "X", "valueFrom": { "secretKeyRef": { "name": "x", "key": "y" } } }]),
+            ),
+        ),
+        (
+            "an environment value from a ConfigMap",
+            change(
+                &|p| p["spec"]["containers"][0]["env"] = serde_json::json!([{ "name": "X", "valueFrom": { "configMapKeyRef": { "name": "x", "key": "y" } } }]),
+            ),
+        ),
+        (
+            "envFrom",
+            change(&|p| {
+                p["spec"]["containers"][0]["envFrom"] =
+                    serde_json::json!([{ "secretRef": { "name": "x" } }])
+            }),
+        ),
+        (
+            "the default service account",
+            change(&|p| p["spec"]["serviceAccountName"] = serde_json::json!("default")),
+        ),
+        (
+            "the server's service account",
+            change(&|p| p["spec"]["serviceAccountName"] = serde_json::json!("ruum-server")),
+        ),
+        (
+            "an API audience",
+            change(&|p| {
+                p["spec"]["volumes"][1]["projected"]["sources"][0]["serviceAccountToken"]["audience"] =
+                    serde_json::json!("https://kubernetes.default.svc")
+            }),
+        ),
+        (
+            "a long-lived token",
+            change(&|p| {
+                p["spec"]["volumes"][1]["projected"]["sources"][0]["serviceAccountToken"]["expirationSeconds"] =
+                    serde_json::json!(86400)
+            }),
+        ),
+        (
+            "a projected Secret",
+            change(&|p| {
+                p["spec"]["volumes"][1]["projected"]["sources"] =
+                    serde_json::json!([{ "secret": { "name": "x" } }])
+            }),
+        ),
+        (
+            "a second source",
+            change(&|p| {
+                p["spec"]["volumes"][1]["projected"]["sources"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({ "configMap": { "name": "x" } }))
+            }),
+        ),
+        (
+            "another init container",
+            change(&|p| p["spec"]["initContainers"][0]["name"] = serde_json::json!("other")),
+        ),
+        (
+            "an init container with more mounts",
+            change(&|p| {
+                p["spec"]["initContainers"][0]["volumeMounts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({ "name": "ruum-id", "mountPath": "/x" }))
+            }),
+        ),
+        (
+            "a writable supervisor",
+            change(&|p| {
+                p["spec"]["containers"][0]["volumeMounts"][0]["readOnly"] = serde_json::json!(false)
+            }),
+        ),
+        (
+            "another termination path",
+            change(&|p| {
+                p["spec"]["containers"][0]["terminationMessagePath"] = serde_json::json!("/tmp/x")
+            }),
+        ),
+        (
+            "a fallback to logs",
+            change(&|p| {
+                p["spec"]["containers"][0]["terminationMessagePolicy"] =
+                    serde_json::json!("FallbackToLogsOnError")
+            }),
+        ),
+        (
+            "no gVisor",
+            change(&|p| p["spec"]["runtimeClassName"] = serde_json::json!("runc")),
+        ),
+        (
+            "an automounted token",
+            change(&|p| p["spec"]["automountServiceAccountToken"] = serde_json::json!(true)),
+        ),
+        (
+            "an ephemeral container",
+            change(&|p| p["spec"]["ephemeralContainers"] = serde_json::json!([{ "name": "x" }])),
+        ),
+    ];
+    for (what, pod) in cases {
         assert!(kube_fake::admit(&pod).is_err(), "{what} was admitted");
     }
 }
 
-/// The runtime identity reads no Secret by any verb (Kimi run 15, I6-1 finding 1): not by `get`,
-/// `list` or `watch`, not by a no-op `patch` or an `update` (their answer is the Secret) and not
-/// by a `delete` with a finalizer (`Foreground` or `Orphan`: its answer is the Secret too). The
-/// fake API server answers each of these with the Secret's data where its Role allows the verb.
+/// The runtime identity has no verb on Secrets at all (S-89: no Secret holds a value, so none is
+/// needed): create, get, list, watch, patch, update and delete are refused by its Role, and the
+/// namespace admits no Secret anyway.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_runtime_identity_reads_no_secret_by_any_verb() {
+async fn the_runtime_identity_has_no_verb_on_secrets() {
     let w = world(false).await;
     let d = w.driver(Arc::new(MemoryUsage::new()));
-    let id = identity();
-    let spec = w.service(id, None);
-    let token = spec.workload_token.expose().to_owned();
-    let s = d.start(spec).await.unwrap();
+    let s = d.start(w.service(identity(), None)).await.unwrap();
     let name = ruum_runtime::kube::object_name(s.id);
-    assert!(w.fake.secret_names().contains(&name));
     let base = format!("{}/api/v1/namespaces/{NS}/secrets", w.cfg.api_url);
     let one = format!("{base}/{name}");
     let http = reqwest::Client::new();
+    let body =
+        serde_json::json!({ "apiVersion": "v1", "kind": "Secret", "metadata": { "name": name } });
     let calls = [
+        ("create", http.post(&base).json(&body)),
         ("get", http.get(&one)),
         ("list", http.get(&base)),
         ("watch", http.get(&base).query(&[("watch", "true")])),
         (
-            "no-op patch",
+            "patch",
             http.patch(&one)
                 .header("content-type", "application/merge-patch+json")
                 .body("{}"),
         ),
-        (
-            "update",
-            http.put(&one)
-                .json(&serde_json::json!({ "metadata": { "name": name } })),
-        ),
-        (
-            "delete (foreground)",
-            http.delete(&one)
-                .json(&serde_json::json!({ "propagationPolicy": "Foreground" })),
-        ),
-        (
-            "delete (orphan)",
-            http.delete(&one)
-                .json(&serde_json::json!({ "propagationPolicy": "Orphan" })),
-        ),
+        ("update", http.put(&one).json(&body)),
+        ("delete", http.delete(&one)),
     ];
     for (what, req) in calls {
         let r = req.bearer_auth(TOKEN).send().await.unwrap();
-        let code = r.status().as_u16();
-        let body = r.text().await.unwrap_or_default();
-        assert!(!body.contains(&token), "{what} answered with the token");
-        assert_eq!(code, 403, "{what} is allowed: {body}");
+        assert_eq!(r.status().as_u16(), 403, "{what} of a Secret is allowed");
     }
-    assert!(w.fake.secret_names().contains(&name), "the Secret went");
+    assert!(
+        kube_fake::admit_secret(&body).is_err(),
+        "a Secret was admitted"
+    );
+    assert!(w.fake.secret_names().is_empty());
 }
 
-/// A token rotation creates the Secret again under a new key once the garbage collector removed
-/// the old one (it may take a while); the old key goes, the new key is owned by the record (whose
-/// uid stays the same through its replacements), the new Secret holds the new token and the
-/// secret values, and an ended instance keeps neither a key nor a Secret. (The conformance suite
-/// checks that the pod reads the new token.)
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_rotation_waits_for_the_garbage_collector() {
-    let w = world(false).await;
-    let d = w.driver(Arc::new(MemoryUsage::new()));
-    let id = identity();
-    let mut spec = w.service(id, None);
-    spec.env = vec![EnvVar::secret(
-        "API_KEY",
-        SecretValue::new(format!("v-{}", uuid::Uuid::now_v7().simple())),
-    )];
-    let s = d.start(spec).await.unwrap();
-    let keys = |w: &World| -> Vec<String> {
-        w.fake
-            .config_maps()
+/// Waits until the fake kubelet recorded the launch of `pod` (its status code).
+async fn wait_launched(w: &World, pod: &str) -> u16 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some((_, c)) = w
+            .fake
+            .launches
+            .lock()
+            .unwrap()
             .iter()
-            .filter(|c| c.pointer("/metadata/labels/ruum.role") == Some(&serde_json::json!("key")))
-            .map(|c| c["metadata"]["name"].as_str().unwrap().to_owned())
-            .collect()
-    };
-    let first = keys(&w);
-    assert_eq!(first.len(), 1, "one key: {first:?}");
-    // Running: the record was replaced at least once since the key was made.
-    wait_state(&d, id.tenant, s.id, |x| *x == InstanceState::Running).await;
-    w.fake.gc_delay_ms.store(300, Ordering::SeqCst);
+            .rev()
+            .find(|(p, _)| p == pod)
+        {
+            return *c;
+        }
+        assert!(Instant::now() < deadline, "no launch of {pod}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+impl World {
+    /// The record ConfigMap of an instance, as the fake stores it.
+    fn record(&self, id: ruum_core::runtime::InstanceId) -> serde_json::Value {
+        let name = ruum_runtime::kube::object_name(id);
+        self.fake
+            .config_maps()
+            .into_iter()
+            .find(|c| c["metadata"]["name"] == serde_json::json!(name))
+            .expect("the record")
+    }
+
+    /// Replaces the record's data as a holder of the runtime identity's token can (`PUT` with
+    /// the current resourceVersion).
+    async fn put_record_data(&self, id: ruum_core::runtime::InstanceId, data: serde_json::Value) {
+        let mut cm = self.record(id);
+        cm["data"] = data;
+        let url = format!(
+            "{}/api/v1/namespaces/{NS}/configmaps/{}",
+            self.cfg.api_url,
+            ruum_runtime::kube::object_name(id)
+        );
+        let r = reqwest::Client::new()
+            .put(url)
+            .bearer_auth(TOKEN)
+            .json(&cm)
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "{}", r.status());
+    }
+
+    /// Changes the record's JSON (`data.record`) with `f` and writes it back.
+    async fn change_record(
+        &self,
+        id: ruum_core::runtime::InstanceId,
+        f: impl Fn(&mut serde_json::Value),
+    ) {
+        let cm = self.record(id);
+        let mut rec: serde_json::Value =
+            serde_json::from_str(cm["data"]["record"].as_str().unwrap()).unwrap();
+        f(&mut rec);
+        self.put_record_data(id, serde_json::json!({ "record": rec.to_string() }))
+            .await;
+    }
+
+    /// A projected token for `pod` (its name and uid now) and the pod's address, as the kubelet
+    /// gives them to the pod.
+    fn pod_token(&self, pod: &str) -> (String, std::net::IpAddr) {
+        let p = self.fake.pod(NS, pod).expect("the pod");
+        let tok = self.fake.issue(kube_fake::Issued {
+            audience: "ruum-supervisor".into(),
+            namespace: NS.into(),
+            service_account: "ruum-sandbox".into(),
+            pod: pod.into(),
+            pod_uid: p["metadata"]["uid"].as_str().unwrap().into(),
+            exp: time::OffsetDateTime::now_utc().unix_timestamp() + 600,
+        });
+        let ip = p["status"]["podIP"].as_str().unwrap().parse().unwrap();
+        (tok, ip)
+    }
+
+    /// Makes a pod as a holder of the runtime identity's token can (`POST`).
+    async fn create_pod(&self, pod: &serde_json::Value) -> u16 {
+        let mut body = pod.clone();
+        if let Some(m) = body["metadata"].as_object_mut() {
+            for k in ["uid", "resourceVersion", "namespace"] {
+                m.remove(k);
+            }
+        }
+        body.as_object_mut().unwrap().remove("status");
+        reqwest::Client::new()
+            .post(format!("{}/api/v1/namespaces/{NS}/pods", self.cfg.api_url))
+            .bearer_auth(TOKEN)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+}
+
+/// S-89, the binding the pod's creator cannot forge: a holder of the runtime identity's token
+/// deletes a running sandbox pod and makes it again, the same in every byte (it passes the
+/// admission rules and the exhaustive read-back). The new pod has another uid, so the kubelet's
+/// token names a pod that the seal does not: its launch is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pod_made_again_by_the_runtime_identity_gets_no_launch_data() {
+    let w = world(false).await;
+    let d = w.quiet_driver();
+    let id = identity();
+    let mut spec = w.spec(id, &[Step::Env("API_KEY".into()), Step::Serve]);
+    let secret = format!("victim-{}", uuid::Uuid::now_v7().simple());
+    spec.env = vec![EnvVar::secret("API_KEY", SecretValue::new(secret.clone()))];
+    let s = d.start(spec).await.unwrap();
+    let pod_n = ruum_runtime::kube::pod_name(s.id, 1);
+    assert_eq!(wait_launched(&w, &pod_n).await, 200);
+    let honest = w.fake.pod(NS, &pod_n).unwrap();
+    let url = format!("{}/api/v1/namespaces/{NS}/pods/{pod_n}", w.cfg.api_url);
+    let r = reqwest::Client::new()
+        .delete(url)
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    w.fake.launches.lock().unwrap().clear();
+    assert_eq!(w.create_pod(&honest).await, 201, "the copy is admitted");
+    assert_eq!(
+        wait_launched(&w, &pod_n).await,
+        403,
+        "the copy got the launch data"
+    );
+    let raw = w.fake.raw_log(NS, &pod_n);
+    assert!(!raw.contains(&secret), "{raw}");
+    // A pod under another name with the victim's labels gets nothing either.
+    let mut other = honest.clone();
+    other["metadata"]["name"] = serde_json::json!(format!("{pod_n}9"));
+    assert_eq!(w.create_pod(&other).await, 201);
+    assert_eq!(wait_launched(&w, &format!("{pod_n}9")).await, 403);
+}
+
+/// S-89: the launch data is given once per pod, only to the pod's own address, only for a token
+/// of the sandbox ServiceAccount with the audience ruum-supervisor; a token request comes only
+/// after the launch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_launch_is_once_per_pod_from_its_address_and_audience() {
+    let w = world(false).await;
+    let d = w.quiet_driver();
+    let id = identity();
+    let s = d.start(w.service(id, None)).await.unwrap();
+    let pod_n = ruum_runtime::kube::pod_name(s.id, 1);
+    assert_eq!(wait_launched(&w, &pod_n).await, 200);
+    let (tok, ip) = w.pod_token(&pod_n);
+    assert_eq!(
+        d.supervisor_launch(&tok, ip).await.unwrap_err(),
+        LaunchRefusal::Forbidden,
+        "a second launch"
+    );
+    assert!(
+        d.supervisor_token(&tok, ip).await.is_ok(),
+        "the token after the launch"
+    );
+    let elsewhere: std::net::IpAddr = "10.9.9.9".parse().unwrap();
+    assert_eq!(
+        d.supervisor_token(&tok, elsewhere).await.unwrap_err(),
+        LaunchRefusal::Forbidden,
+        "another address"
+    );
+    let p = w.fake.pod(NS, &pod_n).unwrap();
+    let uid = p["metadata"]["uid"].as_str().unwrap().to_owned();
+    for (what, aud, sa) in [
+        ("another audience", "kubernetes", "ruum-sandbox"),
+        ("another ServiceAccount", "ruum-supervisor", "default"),
+    ] {
+        let bad = w.fake.issue(kube_fake::Issued {
+            audience: aud.into(),
+            namespace: NS.into(),
+            service_account: sa.into(),
+            pod: pod_n.clone(),
+            pod_uid: uid.clone(),
+            exp: time::OffsetDateTime::now_utc().unix_timestamp() + 600,
+        });
+        assert_eq!(
+            d.supervisor_token(&bad, ip).await.unwrap_err(),
+            LaunchRefusal::Forbidden,
+            "{what}"
+        );
+    }
+    assert_eq!(
+        d.supervisor_token("not-a-token", ip).await.unwrap_err(),
+        LaunchRefusal::Forbidden
+    );
+}
+
+/// S-89: a writer of ConfigMaps changes a fixed field of the record (the image), or moves the
+/// seal of another instance into it: the seal no longer matches and every request is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_changed_record_or_a_moved_seal_is_refused() {
+    let w = world(false).await;
+    let d = w.quiet_driver();
+    let (a, b) = (identity(), identity());
+    let sa = d.start(w.service(a, None)).await.unwrap();
+    let sb = d.start(w.service(b, None)).await.unwrap();
+    let (pa, pb) = (
+        ruum_runtime::kube::pod_name(sa.id, 1),
+        ruum_runtime::kube::pod_name(sb.id, 1),
+    );
+    assert_eq!(wait_launched(&w, &pa).await, 200);
+    assert_eq!(wait_launched(&w, &pb).await, 200);
+    let (ta, ia) = w.pod_token(&pa);
+    let (tb, ib) = w.pod_token(&pb);
+    assert!(d.supervisor_token(&ta, ia).await.is_ok());
+    w.change_record(sa.id, |r| {
+        r["image"] = serde_json::json!("registry.test:5000/ruum/evil/evil@sha256:00")
+    })
+    .await;
+    assert_eq!(
+        d.supervisor_token(&ta, ia).await.unwrap_err(),
+        LaunchRefusal::Forbidden,
+        "a changed image"
+    );
+    let sealed_a: serde_json::Value =
+        serde_json::from_str(w.record(sa.id)["data"]["record"].as_str().unwrap()).unwrap();
+    w.change_record(sb.id, |r| r["sealed"] = sealed_a["sealed"].clone())
+        .await;
+    assert_eq!(
+        d.supervisor_token(&tb, ib).await.unwrap_err(),
+        LaunchRefusal::Forbidden,
+        "a moved seal"
+    );
+}
+
+/// A token rotation seals the new token into the record; the supervisor gets it at its next
+/// token request (the conformance suite checks that the app reads it, redacted). An older seal
+/// put back by a writer of the record is refused (S-89 rollback).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rotation_reseals_and_an_older_seal_is_refused() {
+    let w = world(false).await;
+    let d = w.quiet_driver();
+    let id = identity();
+    let s = d.start(w.service(id, None)).await.unwrap();
+    let pod_n = ruum_runtime::kube::pod_name(s.id, 1);
+    assert_eq!(wait_launched(&w, &pod_n).await, 200);
+    let before = w.record(s.id);
     let new = format!("tok-rotated-{}", uuid::Uuid::now_v7().simple());
-    let t0 = Instant::now();
     d.rotate_token(id.tenant, s.id, SecretValue::new(new.clone()))
         .await
         .unwrap();
+    let after = w.record(s.id);
+    assert_ne!(before["data"], after["data"], "the seal did not change");
     assert!(
-        t0.elapsed() >= Duration::from_millis(300),
-        "no wait for the collector"
+        !after.to_string().contains(&new),
+        "the new token is in the record in the clear"
     );
-    let now = keys(&w);
-    assert_eq!(now.len(), 1, "one key: {now:?}");
-    assert_ne!(now, first, "the old key stayed");
-    let cms = w.fake.config_maps();
-    let uid_of = |name: &str| {
-        cms.iter()
-            .find(|c| c["metadata"]["name"] == serde_json::json!(name))
-            .and_then(|c| c.pointer("/metadata/uid").cloned())
-            .unwrap()
-    };
-    let record_uid = uid_of(&ruum_runtime::kube::object_name(s.id));
-    assert!(record_uid.as_str().is_some_and(|u| !u.is_empty()));
-    let key = cms
-        .iter()
-        .find(|c| c["metadata"]["name"] == serde_json::json!(now[0]))
+    let (tok, ip) = w.pod_token(&pod_n);
+    let answer = d
+        .supervisor_token(&tok, ip)
+        .await
+        .expect("the current token");
+    let answer: serde_json::Value = serde_json::from_slice(&answer).unwrap();
+    assert_eq!(answer["token"], serde_json::json!(new));
+    // The seal of before the rotation, put back (a writer of ConfigMaps): refused.
+    w.put_record_data(s.id, before["data"].clone()).await;
+    assert_eq!(
+        d.supervisor_token(&tok, ip).await.unwrap_err(),
+        LaunchRefusal::Forbidden
+    );
+}
+
+/// S-91: the running instances' log rings of one process stay within the live budget and each
+/// tenant's share as lines arrive; the sweep brings the total under the budget by taking from
+/// the tenant with the most bytes, so a quiet tenant keeps its lines.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_logs_stay_within_the_budget() {
+    let mut w = world(false).await;
+    w.cfg.max_live_log_bytes = 96 * 1024;
+    w.cfg.max_tenant_live_log_bytes = 48 * 1024;
+    let d = w.quiet_driver();
+    let quiet = identity();
+    let q = d
+        .start(w.spec(quiet, &[Step::Print("quiet line".into()), Step::Serve]))
+        .await
         .unwrap();
-    assert_eq!(
-        key.pointer("/metadata/ownerReferences/0/uid"),
-        Some(&record_uid),
-        "the new key is not owned by the record"
-    );
-    let secrets = w.fake.secrets();
-    assert_eq!(secrets.len(), 1);
-    assert_eq!(secrets[0]["data"]["token"], serde_json::json!(new));
+    let line = "n".repeat(1000);
+    let mut steps: Vec<Step> = (0..60).map(|_| Step::Print(line.clone())).collect();
+    steps.push(Step::Serve);
+    let (a, b) = (identity(), identity());
+    let mut ids = Vec::new();
+    for t in [a, b] {
+        for _ in 0..4 {
+            ids.push((t, d.start(w.spec(t, &steps)).await.unwrap().id));
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    // Every program printed its 60 lines (the pod logs hold them; the driver's rings keep what
+    // the budget allows).
+    for (_, i) in &ids {
+        let pod = ruum_runtime::kube::pod_name(*i, 1);
+        while w.fake.raw_log(NS, &pod).lines().count() < 60 {
+            assert!(Instant::now() < deadline, "the lines did not arrive");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for t in [a, b] {
+        assert!(
+            d.live_log_bytes(Some(t.tenant)) <= 48 * 1024,
+            "{}",
+            d.live_log_bytes(Some(t.tenant))
+        );
+    }
+    assert!(d.live_log_bytes(None) <= 96 * 1024 + 48 * 1024);
+    d.sweep().await;
     assert!(
-        secrets[0]["data"]["env.API_KEY"]
-            .as_str()
-            .is_some_and(|v| v.starts_with("v-")),
-        "the secret value is not in the new Secret"
+        d.live_log_bytes(None) <= 96 * 1024,
+        "{}",
+        d.live_log_bytes(None)
     );
     assert_eq!(
-        secrets[0].pointer("/metadata/ownerReferences/0/name"),
-        Some(&serde_json::json!(now[0]))
-    );
-    w.fake.gc_delay_ms.store(0, Ordering::SeqCst);
-    d.stop(id.tenant, s.id).await.unwrap();
-    assert!(keys(&w).is_empty(), "the key of an ended instance stayed");
-    assert!(
-        w.fake.secrets().is_empty(),
-        "the Secret of an ended instance stayed"
+        d.logs(quiet.tenant, q.id, None, 10).await.unwrap().len(),
+        1,
+        "the quiet tenant lost its line"
     );
 }
 
@@ -1058,51 +1539,4 @@ async fn scaled_to_zero_logs_count_to_the_byte_cap() {
     d.rotate_token(id.tenant, s.id, SecretValue::new("tok-after-the-cap-1234"))
         .await
         .unwrap();
-}
-
-/// The Secret rules of `apps-admission.yaml` (policy `ruum-apps-secrets`, Kimi run 15 I6-1
-/// finding 4): a service account token Secret, a service account annotation, a Secret that is not
-/// its label's instance Secret, one without its key as the one owner and one with a finalizer
-/// are refused; the driver's own Secret passes (every test above).
-#[test]
-fn the_secret_rules_refuse_token_secrets() {
-    let own = uuid::Uuid::now_v7();
-    let base = serde_json::json!({
-        "type": "Opaque",
-        "metadata": {
-            "name": format!("ruum-i-{}", own.simple()),
-            "labels": { "ruum.instance": own.to_string() },
-            "ownerReferences": [{ "apiVersion": "v1", "kind": "ConfigMap",
-                "name": format!("ruum-k-{}-1", own.simple()), "uid": "u" }],
-        },
-    });
-    assert!(kube_fake::admit_secret(&base).is_ok());
-    let mut token = base.clone();
-    token["type"] = serde_json::json!("kubernetes.io/service-account-token");
-    let mut annotated = base.clone();
-    annotated["metadata"]["annotations"] =
-        serde_json::json!({ "kubernetes.io/service-account.name": "default" });
-    let mut other = base.clone();
-    other["metadata"]["name"] =
-        serde_json::json!(format!("ruum-i-{}", uuid::Uuid::now_v7().simple()));
-    let mut unowned = base.clone();
-    unowned["metadata"]
-        .as_object_mut()
-        .unwrap()
-        .remove("ownerReferences");
-    let mut foreign = base.clone();
-    foreign["metadata"]["ownerReferences"][0]["name"] =
-        serde_json::json!(format!("ruum-k-{}-1", uuid::Uuid::now_v7().simple()));
-    let mut finalized = base.clone();
-    finalized["metadata"]["finalizers"] = serde_json::json!(["example.com/keep"]);
-    for (what, s) in [
-        ("service account token type", token),
-        ("service account annotation", annotated),
-        ("another instance's name", other),
-        ("no owner", unowned),
-        ("another instance's key", foreign),
-        ("a finalizer", finalized),
-    ] {
-        assert!(kube_fake::admit_secret(&s).is_err(), "{what} was admitted");
-    }
 }

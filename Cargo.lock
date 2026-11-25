@@ -3184,6 +3184,7 @@ dependencies = [
 name = "ruum-runtime"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -3196,6 +3197,7 @@ dependencies = [
  "reqwest",
  "ruum-core",
  "ruum-egress",
+ "ruum-supervisor",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -3257,6 +3259,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "ruum-supervisor"
+version = "0.1.0"
+dependencies = [
+ "nix",
+ "serde",
+ "serde_json",
+ "time",
 ]
 
 [[package]]

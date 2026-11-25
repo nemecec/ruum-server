@@ -383,37 +383,45 @@ person can veto it.
 
 ## I. The sandbox supervisor (2026-11-25)
 
-Status: `provisional`. Proposed by card I6-20 (backlog I6-20, S-89, S-91; decision 0008-5). The
-design and its threat model are in `docs/STEP3.md` "The sandbox supervisor". A person can veto
-it; the Kubernetes driver stays off on staging until the person turns it on (0008-5).
+Status: `provisional`. Proposed by card I6-20 (backlog I6-20, S-89, S-91; decision 0008-5),
+revised after Kimi's design review (`ruum-server-wt/panel/kimi-i620-design.md`). The design and
+its threat model are in `docs/STEP3.md` "The sandbox supervisor". A person can veto it; the
+Kubernetes driver stays off on staging until the person turns it on (0008-5).
 
 1. **A supervisor is the first process of every app sandbox.** `ruum-supervisor` (static Rust,
-   std and `libc` only, `crates/ruum-runtime/supervisor`) starts the app as its child, redacts
-   its standard output and standard error with `ruum-core`'s redactor before the container
-   runtime sees them, forwards signals, reaps children, sets the PID limit it is given and empties
-   `/dev/termination-log` at the end. It is non-dumpable, so the app (same user) cannot write to
-   its output streams through `/proc`. Both drivers use it: Kubernetes injects it with an init
-   container from a pinned image into a read-only memory volume; Docker binds it read-only from
-   the engine's host. This is option 2 of I6-20 ("a redacting supervisor inside the sandbox").
+   std, `nix` and `serde_json`, no `unsafe`, `crates/ruum-runtime/supervisor`) reads the run's
+   launch data once, starts the app as its child, redacts its standard output and standard error
+   with `ruum-core`'s redactor before the container runtime sees them, forwards signals, reaps
+   children, sets the PID limit it is given and empties `/dev/termination-log` before and after
+   the app. It is non-dumpable, so the app (same user) cannot write to its output streams
+   through `/proc`. Both drivers use it: Kubernetes injects it with an init container from a
+   pinned image into a read-only memory volume; Docker binds it read-only from the engine's host
+   and gives the launch data on standard input. This is option 2 of I6-20 ("a redacting
+   supervisor inside the sandbox").
 2. **No Kubernetes Secret holds an app's values (closes S-89).** The record ConfigMap carries the
-   values sealed with AES-256-GCM under a record key that only the server pods hold, bound to the
-   record by the associated data and to the record's fixed fields by a digest. The supervisor
-   fetches them from the server with the pod's projected service account token (audience
-   `ruum-supervisor`, ServiceAccount `ruum-sandbox` without rights). The server accepts only a
-   token that a `TokenReview` confirms for the pod named by the record's current run, with that
-   pod's `uid`, from that pod's address, and only when the stored pod is exactly the pod the
-   driver makes for the sealed record. The pod's creator cannot forge the kubelet's token.
+   values sealed with AES-256-GCM (a fresh random nonce per seal) under a record key that only
+   the server pods hold, bound by the associated data to the record's name, `uid` and the seal's
+   generation, and by a digest to the record's fixed fields. After it creates a run's pod, the
+   server seals that pod's `uid` as the authorized pod of the run. The supervisor fetches the
+   launch data once with the pod's projected service account token (audience
+   `ruum-supervisor`, ServiceAccount `ruum-sandbox` without rights); the server accepts only a
+   token that a `TokenReview` confirms for the sealed pod `uid`, from that pod's address, for a
+   stored pod that is exactly the driver's pod for the sealed record, and only once per pod. The
+   pod's creator cannot get the kubelet's token for a pod `uid` that a server process sealed.
 3. **Rights.** The runtime Role has no verb on Secrets; it gains `tokenreviews` `create`
    (ClusterRole). The admission policy of `ruum-apps` admits the service account `ruum-sandbox`,
-   one projected token volume of the audience `ruum-supervisor`, `emptyDir` volumes, one init
-   container `ruum-supervisor`, and no Secret volume, `valueFrom` or `envFrom`.
-4. **Transport inside the cluster is plain HTTP** with a source address check. Before a real
-   tenant's secret runs on Kubernetes, node-to-node traffic is encrypted (KubeSpan or the CNI's
-   WireGuard) or the listener gets TLS with a pinned certificate.
+   one projected token volume of the audience `ruum-supervisor` and expiry 600 s, `emptyDir`
+   volumes, one init container `ruum-supervisor`, the default termination message path and
+   policy, and no Secret volume, `valueFrom` or `envFrom`.
+4. **The launch channel is plain HTTP inside the cluster, so node-to-node traffic must be
+   encrypted.** The server refuses to start the Kubernetes driver unless
+   `RUUM_KUBE_SUPERVISOR_NETWORK=encrypted` states that every hop off a node is encrypted and
+   authenticated (Talos KubeSpan or the CNI's WireGuard); TLS with a pinned certificate is a
+   follow-up card.
 5. **Live log rings have a budget (S-91):** `max_live_log_bytes` per server process and
-   `max_tenant_live_log_bytes` per tenant, enforced as lines arrive; the noisy ring loses its own
-   oldest lines first.
+   `max_tenant_live_log_bytes` per tenant, enforced as lines arrive (a hard bound of the two
+   together) and by each sweep, which takes from the tenant with the most bytes first.
 6. **New binary and dependency (design 18.4, section E-5).** The supervisor is a new binary of
-   the platform; `libc` becomes a direct workspace dependency (it was in the tree through tokio
-   and others). The supervisor image needs a build and a pin of its own (a card for
-   `.github/workflows/images.yml`, decision 0008-3).
+   the platform; `nix` (0.31, already in the tree) becomes a direct workspace dependency so the
+   workspace keeps `unsafe_code = "forbid"`. The supervisor image needs a build and a pin of its
+   own (a card for `.github/workflows/images.yml`, decision 0008-3).

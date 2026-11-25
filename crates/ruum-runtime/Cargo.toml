@@ -13,6 +13,13 @@ workspace = true
 [dependencies]
 ruum-core.workspace = true
 ruum-egress.workspace = true
+# The sandbox supervisor's launch data types (backlog I6-20).
+ruum-supervisor.workspace = true
+# The sealed instance records of the Kubernetes driver (backlog S-89; decision 0006 I): AES-256-GCM
+# with a fresh random nonce per seal, base64url in the ConfigMap.
+aes-gcm.workspace = true
+rand.workspace = true
+base64.workspace = true
 async-trait.workspace = true
 bollard.workspace = true
 bytes.workspace = true
@@ -32,7 +39,5 @@ uuid.workspace = true
 [dev-dependencies]
 # The fake Kubernetes API server of the Kubernetes driver's tests (I6-1).
 axum.workspace = true
-rand.workspace = true
-base64.workspace = true
 # The recording stand-in registry of the builder's push tests (R-2b).
 wiremock.workspace = true
