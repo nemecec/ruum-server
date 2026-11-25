@@ -26,6 +26,16 @@
 {{- if and .Values.runtime.registry (not (regexMatch "^[a-z0-9.-]+(:[0-9]{1,5})?$" .Values.runtime.registry)) }}
 {{- fail "runtime.registry must be host or host:port" }}
 {{- end }}
+{{- /* The sandbox supervisor (backlog I6-20, S-89; decision 0006 I): the driver does not start
+       without its pinned image and without node-to-node encryption. */}}
+{{- if $kube }}
+{{- if not (regexMatch "^[a-z0-9./:-]+@sha256:[0-9a-f]{64}$" (.Values.runtime.supervisorImage | default "")) }}
+{{- fail "runtime.supervisorImage must be the sandbox supervisor's image by digest (name@sha256:...) when runtime.kubernetes is on" }}
+{{- end }}
+{{- if not .Values.runtime.nodeNetworkEncrypted }}
+{{- fail "runtime.nodeNetworkEncrypted must be true when runtime.kubernetes is on: the launch channel is plain HTTP (decision 0006 I point 4; deploy/staging/README.md)" }}
+{{- end }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -149,11 +159,22 @@ spec:
             {{- if .Values.runtime.registry }}
             - { name: RUUM_REGISTRY, value: {{ .Values.runtime.registry | quote }} }
             {{- end }}
+            # The sandbox supervisor (backlog I6-20, S-89): the record key (Secret
+            # ruum-runtime-record-key, k8s/apply.sh), the pinned image, the listener and the
+            # Service the sandboxes reach it by (they have no DNS: the driver resolves it).
+            - { name: RUUM_KUBE_RECORD_KEY_FILE, value: /var/run/secrets/ruum-runtime/record-key }
+            - { name: RUUM_KUBE_SUPERVISOR_IMAGE, value: {{ .Values.runtime.supervisorImage | quote }} }
+            - { name: RUUM_KUBE_SUPERVISOR_SERVICE, value: "ruum-supervisor.ruum.svc.cluster.local:8091" }
+            - { name: RUUM_KUBE_SUPERVISOR_LISTEN, value: "0.0.0.0:8091" }
+            - { name: RUUM_KUBE_SUPERVISOR_NETWORK, value: encrypted }
             {{- end }}
           ports:
             - { name: platform, containerPort: 8491 }
             - { name: dav, containerPort: 8492 }
             - { name: internal, containerPort: 8493 }
+            {{- if $kube }}
+            - { name: supervisor, containerPort: 8091 }
+            {{- end }}
           readinessProbe:
             httpGet: { path: /healthz, port: platform }
             periodSeconds: 5
@@ -181,6 +202,7 @@ spec:
             - { name: tmp, mountPath: /tmp }
             {{- if $kube }}
             - { name: kube-api, mountPath: /var/run/secrets/ruum-kube, readOnly: true }
+            - { name: record-key, mountPath: /var/run/secrets/ruum-runtime, readOnly: true }
             {{- end }}
       volumes:
         - name: pg-ca
@@ -197,6 +219,9 @@ spec:
             sources:
               - serviceAccountToken: { path: token, expirationSeconds: 3600 }
               - configMap: { name: kube-root-ca.crt, items: [{ key: ca.crt, path: ca.crt }] }
+        # The record key (backlog S-89): only the server pods hold it; ruum-apps has no right in ruum.
+        - name: record-key
+          secret: { secretName: ruum-runtime-record-key, items: [{ key: record-key, path: record-key }], defaultMode: 0440 }
         {{- end }}
 ---
 # Voluntary disruptions (a node drain, a Kubernetes upgrade) leave at least one server.
@@ -221,6 +246,20 @@ spec:
     - { name: platform, port: 8491, targetPort: platform }
     - { name: dav, port: 8492, targetPort: dav }
 ---
+{{- if $kube }}
+# The supervisor listener (backlog S-89): the sandboxes of ruum-apps fetch their launch data here
+# (charts/platform networkpolicies.yaml lets only them reach it). No public route.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ruum-supervisor
+  namespace: ruum
+spec:
+  selector: { app: ruum-server }
+  ports:
+    - { name: supervisor, port: 8091, targetPort: supervisor }
+---
+{{- end }}
 # The internal listener: the edge's on-demand TLS `ask` (review 1 B-6). No public route.
 apiVersion: v1
 kind: Service

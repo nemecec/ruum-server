@@ -9,10 +9,11 @@
 # The observer (O-51) reads only troubleshooting resources and pod logs in ruum, edge and
 # ruum-deploy. Its direct and group bindings pass the same checks, with a strict allow-list.
 #
-# The runtime driver (I6-1, the ServiceAccount ruum/ruum-server) makes the pods, records and
-# Secrets of app sandboxes in ruum-apps and nothing else; on Secrets it may only create (live
-# check): get, list, watch, patch, update and delete can each read a Secret (Kimi run 15, I6-1
-# finding 1), and a server-side dry run of a no-op patch must be refused.
+# The runtime driver (I6-1, the ServiceAccount ruum/ruum-server) makes the pods and records of
+# app sandboxes in ruum-apps, reads their logs and creates TokenReviews, and nothing else. No
+# verb on Secrets at all (backlog S-89: the values are sealed into the records), and a
+# server-side dry run of a no-op patch of a Secret must be refused. The sandbox pods' account
+# ruum-apps/ruum-sandbox has no right.
 #
 #   rbac-check.sh static FILE...   the rendered manifests (helm template; CI, tests/run.sh)
 #   rbac-check.sh live             the live cluster, with the admin kubeconfig (k8s/apply.sh runs
@@ -322,17 +323,26 @@ live() {
     want no "$c" "$ns" list secrets
   done
   want no "$c" auth create pods
-  # The runtime driver (backlog I6-1, charts/platform runtime-rbac.yaml): the pods, records and
-  # Secrets of sandboxes in ruum-apps, nothing else. On Secrets it only creates (every other verb
-  # can read one, Kimi run 15 I6-1 finding 1), uses no pod subresource but the log, gets no
-  # token and changes no RBAC.
+  # The runtime driver (backlog I6-1 and S-89, charts/platform runtime-rbac.yaml): the pods and
+  # records of sandboxes in ruum-apps and TokenReviews, nothing else. No verb on Secrets (every
+  # verb but create can read one, Kimi run 15 I6-1 finding 1, and none is needed since S-89),
+  # no pod subresource but the log, no token, no RBAC change.
   local r="system:serviceaccount:$RUNTIME_NS:$RUNTIME" verb sub
   for verb in create get list delete; do want yes "$r" "$APPS_NS" "$verb" pods; done
   want yes "$r" "$APPS_NS" get pods log
   for verb in create get list update delete; do want yes "$r" "$APPS_NS" "$verb" configmaps; done
-  want yes "$r" "$APPS_NS" create secrets
-  for verb in get list watch patch update delete deletecollection; do want no "$r" "$APPS_NS" "$verb" secrets; done
+  for verb in create get list watch patch update delete deletecollection; do want no "$r" "$APPS_NS" "$verb" secrets; done
   patch_refused "$r" "$APPS_NS"
+  want yes "$r" - create tokenreviews.authentication.k8s.io
+  want no "$r" - create subjectaccessreviews.authorization.k8s.io
+  # The sandbox pods' account (S-89): no right of its own.
+  local sb="system:serviceaccount:$APPS_NS:ruum-sandbox"
+  for verb in get list create; do
+    want no "$sb" "$APPS_NS" "$verb" pods
+    want no "$sb" "$APPS_NS" "$verb" configmaps
+    want no "$sb" "$APPS_NS" "$verb" secrets
+  done
+  want no "$sb" - create tokenreviews.authentication.k8s.io
   for sub in exec attach portforward; do want no "$r" "$APPS_NS" create pods "$sub"; done
   want no "$r" "$APPS_NS" patch pods ephemeralcontainers
   want no "$r" "$APPS_NS" update pods
@@ -403,7 +413,7 @@ live() {
     done
     audit_rights "$identity" - "$allowed"
   done
-  [[ $fail == 0 ]] && echo "rbac-check: the live deployer may only write release requests; the controller has the deploy rights and no Secret; the observer is read-only; the runtime driver has its sandbox rights in ruum-apps only and may only create Secrets (a no-op patch is refused)"
+  [[ $fail == 0 ]] && echo "rbac-check: the live deployer may only write release requests; the controller has the deploy rights and no Secret; the observer is read-only; the runtime driver has its sandbox rights in ruum-apps and TokenReviews only and no verb on Secrets (a no-op patch is refused); the sandbox account has none"
   return "$fail"
 }
 

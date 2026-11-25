@@ -1,27 +1,23 @@
 # Admission rules of the app sandboxes (backlog S-83, Kimi run 14 I-6 finding 4; backlog I6-1;
-# review of I6-1 change 5 and Kimi review of I6-1 finding 1).
+# backlog S-89 and I6-20, docs/STEP3.md "The sandbox supervisor", decision 0006 I).
 # Restricted Pod Security does not require a runtime class, so without this a pod in ruum-apps
 # that lacks runtimeClassName would run app code on the node's kernel. Every pod created or
 # changed in ruum-apps (whoever creates it: the runtime driver, an operator, a bug) must run in
-# gVisor, carry no service account token (neither automounted nor as a projected volume), use
-# the default service account, have no init or ephemeral containers, and reach no Secret but its
-# own: volumes are only emptyDir and the Secret ruum-i-<its ruum.instance label without dashes>,
-# environment values come only from that Secret, and there is no envFrom. The driver's Role may
-# create pods, so without these rules a pod could mount another instance's Secret (another
-# tenant's token and values) although the Role has no get on Secrets.
-# What the pod rules do not stop (backlog S-85, Kimi run 15 I6-1 finding 2): the label
-# ruum.instance is set by the pod's creator, so the ServiceAccount ruum-server (a compromised
-# server process) can still make a pod with another instance's label and mount that Secret. The
-# server is the authority for every instance (any replica wakes any instance from its Secret, and
-# it holds the values anyway: the secret store and the token issuer), so no rule here can tell
-# its honest pods from forged ones. The rules stop mistakes and bugs; decision S-89 in
-# docs/backlog/2026-11-24-run15.md names the design that closes it (I6-2).
-# The second policy (ruum-apps-secrets, Kimi run 15 I6-1 finding 4): every Secret created or
-# changed in ruum-apps is an instance Secret: type Opaque (never kubernetes.io/service-account-token,
-# which the token controller fills with a ServiceAccount token), no service-account annotation,
-# named ruum-i-<its ruum.instance label without dashes>, and a new one is owned by exactly one key
-# ConfigMap ruum-k-<the same ID>-<tag> and has no finalizer (the garbage collector removes it
-# with its key: the driver may not delete a Secret, see charts/platform runtime-rbac.yaml).
+# gVisor, use the ServiceAccount ruum-sandbox (no rights), carry no automounted service account
+# token, and have the shape of a sandbox with its supervisor:
+# - volumes are only emptyDir and one projected volume whose only source is a service account
+#   token of the audience ruum-supervisor with expirationSeconds 600 (the API server does not
+#   accept that audience; the kubelet issues it for this pod only, and the server's supervisor
+#   listener checks it with a TokenReview). No Secret volume, no other projected source;
+# - no environment value from another object (valueFrom) and no envFrom, in any container;
+# - at most one init container, named ruum-supervisor, which mounts only ruum-bin; no ephemeral
+#   containers; every app container mounts ruum-bin read-only;
+# - every container keeps the termination message path /dev/termination-log and the policy File
+#   (never FallbackToLogsOnError, which would copy unredacted logs into the pod status).
+# No Secret holds a value of a sandbox (the values are sealed into the records under a key the
+# runtime identity does not hold), so a pod's creator gains nothing by mounting one; the second
+# policy (ruum-apps-secrets) admits no Secret in ruum-apps at all, so a stray or forged Secret
+# (also a service account token Secret) cannot appear there.
 # ops/gvisor-check.sh checks the rules live (server-side dry runs that must be refused, and a
 # positive control); its control pod without gVisor runs in ops.
 # k8s/apply.sh applies this file after the runtime class.
@@ -41,33 +37,42 @@ spec:
         operations: ["CREATE", "UPDATE"]
         resources: ["pods", "pods/ephemeralcontainers"]
   variables:
-    # The pod's own Secret, or '' for a pod without the instance label (it may name no Secret).
-    - name: own
-      expression: "has(object.metadata.labels) && 'ruum.instance' in object.metadata.labels ? 'ruum-i-' + object.metadata.labels['ruum.instance'].replace('-', '') : ''"
+    # Every container of the pod, init containers included.
+    - name: all
+      expression: "object.spec.containers + (has(object.spec.initContainers) ? object.spec.initContainers : [])"
   validations:
     - expression: "has(object.spec.runtimeClassName) && object.spec.runtimeClassName == 'gvisor'"
       message: "pods in ruum-apps run in gVisor only (runtimeClassName: gvisor; backlog S-83)"
       reason: Forbidden
     - expression: "has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false"
-      message: "pods in ruum-apps carry no service account token (automountServiceAccountToken: false)"
+      message: "pods in ruum-apps carry no automounted service account token (automountServiceAccountToken: false)"
       reason: Forbidden
     - expression: "!has(object.spec.hostNetwork) || object.spec.hostNetwork == false"
       message: "pods in ruum-apps never use the node's network"
       reason: Forbidden
-    - expression: "(!has(object.spec.initContainers) || size(object.spec.initContainers) == 0) && (!has(object.spec.ephemeralContainers) || size(object.spec.ephemeralContainers) == 0)"
-      message: "pods in ruum-apps have no init or ephemeral containers"
+    - expression: "!has(object.spec.ephemeralContainers) || size(object.spec.ephemeralContainers) == 0"
+      message: "pods in ruum-apps have no ephemeral containers"
       reason: Forbidden
-    - expression: "!has(object.spec.serviceAccountName) || object.spec.serviceAccountName == 'default'"
-      message: "pods in ruum-apps use the default service account only"
+    - expression: "!has(object.spec.initContainers) || (size(object.spec.initContainers) == 1 && object.spec.initContainers[0].name == 'ruum-supervisor' && has(object.spec.initContainers[0].volumeMounts) && size(object.spec.initContainers[0].volumeMounts) == 1 && object.spec.initContainers[0].volumeMounts[0].name == 'ruum-bin')"
+      message: "pods in ruum-apps have at most the init container ruum-supervisor, which mounts only ruum-bin"
       reason: Forbidden
-    - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir) || (has(v.secret) && variables.own != '' && v.secret.secretName == variables.own))"
-      message: "pods in ruum-apps mount only emptyDir volumes and their instance's own Secret (no projected token, no other Secret)"
+    - expression: "has(object.spec.serviceAccountName) && object.spec.serviceAccountName == 'ruum-sandbox'"
+      message: "pods in ruum-apps use the ServiceAccount ruum-sandbox only (backlog S-89)"
       reason: Forbidden
-    - expression: "object.spec.containers.all(c, !has(c.envFrom) || size(c.envFrom) == 0)"
+    - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir) || (has(v.projected) && has(v.projected.sources) && size(v.projected.sources) == 1 && has(v.projected.sources[0].serviceAccountToken) && !has(v.projected.sources[0].secret) && !has(v.projected.sources[0].configMap) && !has(v.projected.sources[0].downwardAPI) && !has(v.projected.sources[0].clusterTrustBundle) && v.projected.sources[0].serviceAccountToken.audience == 'ruum-supervisor' && has(v.projected.sources[0].serviceAccountToken.expirationSeconds) && v.projected.sources[0].serviceAccountToken.expirationSeconds == 600))"
+      message: "pods in ruum-apps mount only emptyDir volumes and the supervisor's projected token (audience ruum-supervisor, 600 s); no Secret"
+      reason: Forbidden
+    - expression: "variables.all.all(c, !has(c.envFrom) || size(c.envFrom) == 0)"
       message: "pods in ruum-apps take no envFrom"
       reason: Forbidden
-    - expression: "object.spec.containers.all(c, !has(c.env) || c.env.all(e, !has(e.valueFrom) || (has(e.valueFrom.secretKeyRef) && variables.own != '' && e.valueFrom.secretKeyRef.name == variables.own)))"
-      message: "pods in ruum-apps take environment values only from their instance's own Secret"
+    - expression: "variables.all.all(c, !has(c.env) || c.env.all(e, !has(e.valueFrom)))"
+      message: "pods in ruum-apps take no environment value from another object (the supervisor gives the secret values)"
+      reason: Forbidden
+    - expression: "variables.all.all(c, (!has(c.terminationMessagePath) || c.terminationMessagePath == '/dev/termination-log') && (!has(c.terminationMessagePolicy) || c.terminationMessagePolicy == 'File'))"
+      message: "pods in ruum-apps keep the termination message path /dev/termination-log and the policy File"
+      reason: Forbidden
+    - expression: "object.spec.containers.all(c, !has(c.volumeMounts) || c.volumeMounts.all(m, m.name != 'ruum-bin' || (has(m.readOnly) && m.readOnly == true)))"
+      message: "pods in ruum-apps mount the supervisor (ruum-bin) read-only in every app container"
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1
@@ -97,22 +102,9 @@ spec:
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE"]
         resources: ["secrets"]
-  variables:
-    # The instance Secret of the object's ruum.instance label, or '' without the label.
-    - name: own
-      expression: "has(object.metadata.labels) && 'ruum.instance' in object.metadata.labels ? 'ruum-i-' + object.metadata.labels['ruum.instance'].replace('-', '') : ''"
   validations:
-    - expression: "has(object.type) && object.type == 'Opaque'"
-      message: "Secrets in ruum-apps are of type Opaque only (no service account token Secret)"
-      reason: Forbidden
-    - expression: "!has(object.metadata.annotations) || !object.metadata.annotations.exists(k, k.startsWith('kubernetes.io/service-account'))"
-      message: "Secrets in ruum-apps carry no service account annotation"
-      reason: Forbidden
-    - expression: "variables.own != '' && object.metadata.name == variables.own && object.metadata.name.matches('^ruum-i-[0-9a-f]{32}$')"
-      message: "a Secret in ruum-apps is an instance Secret, ruum-i-<its ruum.instance label without dashes>"
-      reason: Forbidden
-    - expression: "request.operation != 'CREATE' || ((!has(object.metadata.finalizers) || size(object.metadata.finalizers) == 0) && has(object.metadata.ownerReferences) && size(object.metadata.ownerReferences) == 1 && object.metadata.ownerReferences[0].apiVersion == 'v1' && object.metadata.ownerReferences[0].kind == 'ConfigMap' && object.metadata.ownerReferences[0].name.startsWith(variables.own.replace('ruum-i-', 'ruum-k-') + '-'))"
-      message: "a new Secret in ruum-apps is owned by one key ConfigMap of its instance and has no finalizer"
+    - expression: "false"
+      message: "no Secret in ruum-apps: the values of a sandbox are sealed into its record (backlog S-89)"
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

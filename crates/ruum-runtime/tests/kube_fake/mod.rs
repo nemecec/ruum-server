@@ -1116,7 +1116,7 @@ async fn token_review(State(f): State<Arc<Fake>>, headers: HeaderMap, body: Byte
     let issued = f.issued.lock().unwrap().get(token).cloned();
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let st = match issued {
-        Some(i) if i.exp > now && wanted.iter().any(|a| *a == i.audience) => json!({
+        Some(i) if i.exp > now && wanted.contains(&i.audience) => json!({
             "authenticated": true,
             "audiences": [i.audience],
             "user": {

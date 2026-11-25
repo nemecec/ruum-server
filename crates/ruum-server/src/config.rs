@@ -210,6 +210,14 @@ impl GallerySettings {
 ///   3). Without them no pod is registered and the proxy refuses every sandbox (fails closed);
 /// - `RUUM_KUBE_SPLIT_LOG_STREAMS` (`on` or `off`, default `off`): read standard output and
 ///   standard error apart (the API server's feature gate `PodLogsQuerySplitStreams`).
+/// - The sandbox supervisor (backlog I6-20, S-89; `docs/STEP3.md` "The sandbox supervisor"), all
+///   required with `kubernetes`: `RUUM_KUBE_RECORD_KEY_FILE` (64 hexadecimal characters: the
+///   key that seals the values in the instance records), `RUUM_KUBE_SUPERVISOR_IMAGE` (the
+///   supervisor's image, by digest), `RUUM_KUBE_SUPERVISOR_SERVICE` (`host:port`: the listener as
+///   the sandboxes reach it, a Service), `RUUM_KUBE_SUPERVISOR_LISTEN` (`addr:port`: the
+///   listener of this process) and `RUUM_KUBE_SUPERVISOR_NETWORK=encrypted` (node-to-node
+///   traffic is encrypted and authenticated: the launch channel is plain HTTP; decision 0006 I
+///   point 4). `RUUM_KUBE_NODE_ARCH` (default `amd64`): the platform of a multi-arch image.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeSettings {
     Memory,
@@ -228,6 +236,23 @@ pub struct KubeSettings {
     pub egress_control: Option<String>,
     pub egress_control_token_file: Option<PathBuf>,
     pub split_log_streams: bool,
+    pub record_key_file: PathBuf,
+    pub supervisor_image: String,
+    pub supervisor_service: (String, u16),
+    pub supervisor_listen: std::net::SocketAddr,
+    pub node_arch: String,
+}
+
+/// `host:port` of a setting.
+fn host_port(name: &str, v: &str) -> anyhow::Result<(String, u16)> {
+    let (host, port) = v
+        .rsplit_once(':')
+        .with_context(|| format!("{name} must be host:port"))?;
+    let port: u16 = port
+        .parse()
+        .with_context(|| format!("{name} must be host:port"))?;
+    anyhow::ensure!(!host.is_empty() && port != 0, "{name} must be host:port");
+    Ok((host.to_owned(), port))
 }
 
 impl RuntimeSettings {
@@ -287,6 +312,29 @@ impl RuntimeSettings {
                 anyhow::bail!("RUUM_KUBE_SPLIT_LOG_STREAMS must be on or off, not {other:?}")
             }
         };
+        // The sandbox supervisor (I6-20, S-89): no Kubernetes driver without it.
+        let need = |name: &str| {
+            get(name).with_context(|| {
+                format!("{name} is required with RUUM_RUNTIME_DRIVER=kubernetes (the sandbox supervisor, backlog S-89)")
+            })
+        };
+        let record_key_file = PathBuf::from(need("RUUM_KUBE_RECORD_KEY_FILE")?);
+        let supervisor_image = need("RUUM_KUBE_SUPERVISOR_IMAGE")?;
+        anyhow::ensure!(
+            supervisor_image.contains("@sha256:"),
+            "RUUM_KUBE_SUPERVISOR_IMAGE must name the image by digest (name@sha256:...)"
+        );
+        let supervisor_service = host_port(
+            "RUUM_KUBE_SUPERVISOR_SERVICE",
+            &need("RUUM_KUBE_SUPERVISOR_SERVICE")?,
+        )?;
+        let supervisor_listen: std::net::SocketAddr = need("RUUM_KUBE_SUPERVISOR_LISTEN")?
+            .parse()
+            .context("RUUM_KUBE_SUPERVISOR_LISTEN must be addr:port")?;
+        anyhow::ensure!(
+            get("RUUM_KUBE_SUPERVISOR_NETWORK").as_deref() == Some("encrypted"),
+            "RUUM_KUBE_SUPERVISOR_NETWORK must be encrypted: the launch channel is plain HTTP, so node-to-node traffic must be encrypted and authenticated first (KubeSpan or the CNI's WireGuard; decision 0006 I point 4)"
+        );
         // The service account token goes to the API server over TLS only.
         let api_url =
             get("RUUM_KUBE_API_URL").unwrap_or_else(|| "https://kubernetes.default.svc".into());
@@ -305,6 +353,11 @@ impl RuntimeSettings {
             egress_control,
             egress_control_token_file,
             split_log_streams,
+            record_key_file,
+            supervisor_image,
+            supervisor_service,
+            supervisor_listen,
+            node_arch: get("RUUM_KUBE_NODE_ARCH").unwrap_or_else(|| "amd64".into()),
         })))
     }
 }
@@ -367,14 +420,24 @@ mod tests {
     fn the_runtime_driver_is_memory_unless_kubernetes_is_asked() {
         assert_eq!(runtime(&[]).unwrap(), RuntimeSettings::Memory);
         assert!(runtime(&[("RUUM_RUNTIME_DRIVER", "docker")]).is_err());
-        let RuntimeSettings::Kubernetes(k) = runtime(&[
+        let digest = format!("r/ruum-supervisor@sha256:{}", "a".repeat(64));
+        let base = [
             ("RUUM_RUNTIME_DRIVER", "kubernetes"),
+            ("RUUM_KUBE_RECORD_KEY_FILE", "/run/ruum-runtime/record-key"),
+            ("RUUM_KUBE_SUPERVISOR_IMAGE", digest.as_str()),
             (
-                "RUUM_KUBE_EGRESS_PROXY",
-                "ruum-egress.ruum.svc.cluster.local:3128",
+                "RUUM_KUBE_SUPERVISOR_SERVICE",
+                "ruum-supervisor.ruum.svc.cluster.local:8091",
             ),
-        ])
-        .unwrap() else {
+            ("RUUM_KUBE_SUPERVISOR_LISTEN", "0.0.0.0:8091"),
+            ("RUUM_KUBE_SUPERVISOR_NETWORK", "encrypted"),
+        ];
+        let mut ok = base.to_vec();
+        ok.push((
+            "RUUM_KUBE_EGRESS_PROXY",
+            "ruum-egress.ruum.svc.cluster.local:3128",
+        ));
+        let RuntimeSettings::Kubernetes(k) = runtime(&ok).unwrap() else {
             panic!("not kubernetes");
         };
         assert_eq!(k.namespace, "ruum-apps");
@@ -385,6 +448,23 @@ mod tests {
             Some(("ruum-egress.ruum.svc.cluster.local".to_owned(), 3128))
         );
         assert!(!k.split_log_streams);
+        assert_eq!(k.supervisor_listen.port(), 8091);
+        assert_eq!(k.node_arch, "amd64");
+        // The supervisor settings are required, the image by digest, the network encrypted.
+        for missing in base.iter().skip(1) {
+            let all: Vec<_> = base.iter().filter(|x| x != &missing).cloned().collect();
+            assert!(runtime(&all).is_err(), "without {}", missing.0);
+        }
+        for (name, value) in [
+            ("RUUM_KUBE_SUPERVISOR_IMAGE", "r/ruum-supervisor:latest"),
+            ("RUUM_KUBE_SUPERVISOR_NETWORK", "plain"),
+            ("RUUM_KUBE_SUPERVISOR_SERVICE", "no-port"),
+            ("RUUM_KUBE_SUPERVISOR_LISTEN", "nowhere"),
+        ] {
+            let mut all: Vec<_> = base.iter().filter(|x| x.0 != name).cloned().collect();
+            all.push((name, value));
+            assert!(runtime(&all).is_err(), "{name}={value}");
+        }
         for bad in [
             &[("RUUM_KUBE_EGRESS_PROXY", "no-port")][..],
             &[("RUUM_KUBE_EGRESS_CONTROL", "unix:/run/x.sock")][..],
@@ -404,7 +484,7 @@ mod tests {
                 ("RUUM_KUBE_EGRESS_CONTROL_TOKEN_FILE", "/run/t"),
             ][..],
         ] {
-            let mut all = vec![("RUUM_RUNTIME_DRIVER", "kubernetes")];
+            let mut all = base.to_vec();
             all.extend_from_slice(bad);
             assert!(runtime(&all).is_err(), "{bad:?}");
         }

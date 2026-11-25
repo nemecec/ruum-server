@@ -12,19 +12,20 @@
 #    (status.nodeInfo.kernelVersion) and the gVisor pod must not: gVisor answers uname with its
 #    own kernel. A pod that does not start, or a control pod that does not see the node's
 #    kernel, fails the check (no pass on silence, decision 0006 G).
-# 3. The admission rules of ruum-apps (k8s/manifests/apps-admission.yaml): server-side dry runs
-#    of pods in ruum-apps that must be refused by the policy: without the runtime class, with a
-#    service account token (automounted, or as a projected volume), with another instance's
-#    Secret (a volume, or an environment value) and with envFrom. A gVisor pod that mounts its
-#    own instance Secret and takes a value from it must pass the dry run (the positive control:
-#    the refusals come from the rules, not from another error).
-# 4. The Secret rules of ruum-apps (the same file, policy ruum-apps-secrets; Kimi run 15 I6-1
-#    finding 4): server-side dry runs of Secrets in ruum-apps that must be refused: of the type
-#    kubernetes.io/service-account-token (the token controller would fill it with a token), with
-#    a service account annotation, named for another instance, and without its key as the one
-#    owner. The instance Secret owned by its key must pass (the positive control).
+# 3. The admission rules of ruum-apps (k8s/manifests/apps-admission.yaml, backlog S-83 and
+#    S-89): server-side dry runs of pods in ruum-apps that must be refused by the policy: without
+#    the runtime class, with an automounted token, with another ServiceAccount, with a projected
+#    token of another audience or lifetime, with a Secret (a volume, or an environment value),
+#    with envFrom, with another init container, with a writable supervisor volume, and with the
+#    termination message from the logs. A gVisor pod in the shape of the sandbox supervisor (the
+#    init container ruum-supervisor, the read-only volume ruum-bin, the projected token of the
+#    audience ruum-supervisor) must pass the dry run (the positive control: the refusals come
+#    from the rules, not from another error).
+# 4. The Secret rule of ruum-apps (the same file, policy ruum-apps-secrets, backlog S-89): a
+#    Secret in ruum-apps is refused, whatever it is (an Opaque one, a service account token
+#    Secret).
 # Not read-only in step 2: it creates two short pods per node (ruum-apps and ops) and deletes
-# them. Step 3 creates nothing (dry runs).
+# them. Steps 3 and 4 create nothing (dry runs).
 # Exit 1 on any failure.
 set -uo pipefail
 WORK="${RUUM_STAGING_WORK:-$HOME/.config/ruum/staging}"
@@ -71,7 +72,7 @@ pod_spec() {
         resources: { requests: { cpu: "10m", memory: "16Mi" }, limits: { memory: "32Mi" } },
         securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
       }]
-    } + (if $class != "" then { runtimeClassName: $class } else {} end))
+    } + (if $class != "" then { runtimeClassName: $class, serviceAccountName: "ruum-sandbox" } else {} end))
   }'
 }
 
@@ -136,53 +137,54 @@ refused() {
   fi
 }
 refused "without the runtime class gvisor" "gVisor only" ""
-refused "with a service account token" "service account token" gvisor '.spec.automountServiceAccountToken = true'
-refused "with a projected service account token" "mount only emptyDir" gvisor \
+refused "with an automounted service account token" "no automounted service account token" gvisor '.spec.automountServiceAccountToken = true'
+refused "with another ServiceAccount" "ServiceAccount ruum-sandbox only" gvisor '.spec.serviceAccountName = "default"'
+refused "with a projected token of the API's audience" "mount only emptyDir" gvisor \
   '.spec.volumes = [{name: "t", projected: {sources: [{serviceAccountToken: {path: "token"}}]}}]'
-refused "that mounts another instance's Secret" "mount only emptyDir" gvisor \
+refused "with a long-lived supervisor token" "mount only emptyDir" gvisor \
+  '.spec.volumes = [{name: "t", projected: {sources: [{serviceAccountToken: {path: "token", audience: "ruum-supervisor", expirationSeconds: 86400}}]}}]'
+refused "that mounts a Secret" "mount only emptyDir" gvisor \
   '.spec.volumes = [{name: "token", secret: {secretName: $other}}]'
-refused "that takes a value of another instance's Secret" "environment values only" gvisor \
+refused "that takes a value of a Secret" "no environment value from another object" gvisor \
   '.spec.containers[0].env = [{name: "X", valueFrom: {secretKeyRef: {name: $other, key: "token"}}}]'
 refused "with envFrom" "no envFrom" gvisor '.spec.containers[0].envFrom = [{secretRef: {name: $own}}]'
-out="$(dry_run gvisor '.spec.volumes = [{name: "token", secret: {secretName: $own}}]
-  | .spec.containers[0].env = [{name: "X", valueFrom: {secretKeyRef: {name: $own, key: "token"}}}]' || true)"
+refused "with another init container" "init container ruum-supervisor" gvisor \
+  '.spec.initContainers = [.spec.containers[0] | .name = "other"]'
+refused "with a writable supervisor volume" "read-only in every app container" gvisor \
+  '.spec.volumes = [{name: "ruum-bin", emptyDir: {medium: "Memory"}}] | .spec.containers[0].volumeMounts = [{name: "ruum-bin", mountPath: "/ruum/bin"}]'
+refused "with the termination message from the logs" "termination message path" gvisor \
+  '.spec.containers[0].terminationMessagePolicy = "FallbackToLogsOnError"'
+# The positive control: the shape of a sandbox with its supervisor (the driver's pod, pod.rs).
+out="$(dry_run gvisor '.spec.volumes = [{name: "ruum-bin", emptyDir: {medium: "Memory"}},
+    {name: "ruum-id", projected: {sources: [{serviceAccountToken: {path: "token", audience: "ruum-supervisor", expirationSeconds: 600}}]}}]
+  | .spec.initContainers = [.spec.containers[0] | .name = "ruum-supervisor" | .volumeMounts = [{name: "ruum-bin", mountPath: "/ruum/bin"}]]
+  | .spec.containers[0].volumeMounts = [{name: "ruum-bin", mountPath: "/ruum/bin", readOnly: true}, {name: "ruum-id", mountPath: "/ruum/id", readOnly: true}]' || true)"
 if [[ "$out" == "pod/gvisor-check-admission"* ]]; then
-  pass "a restricted gVisor pod with its own instance Secret passes the admission rules (the positive control)"
+  pass "a restricted gVisor pod in the shape of the sandbox supervisor passes the admission rules (the positive control)"
 else
-  bad "a restricted gVisor pod with its own Secret did not pass the dry run, so the refusals above prove nothing: ${out:-no answer}"
+  bad "a restricted gVisor pod in the supervisor's shape did not pass the dry run, so the refusals above prove nothing: ${out:-no answer}"
 fi
 
-# 4. The Secret rules of ruum-apps (Kimi run 15 I6-1 finding 4): dry runs, nothing is made.
-# secret_dry_run [JQ]: the API server's answer to the instance Secret of OWN_ID, changed by JQ.
+# 4. The Secret rule of ruum-apps (backlog S-89): dry runs, nothing is made.
+# secret_dry_run [JQ]: the API server's answer to a Secret in ruum-apps, changed by JQ.
 secret_dry_run() {
-  jq -cn --arg id "$OWN_ID" --arg own "$OWN_SECRET" --arg other "$OTHER_SECRET" "{apiVersion: \"v1\", kind: \"Secret\", type: \"Opaque\",
-    metadata: {name: \$own, namespace: \"ruum-apps\", labels: {\"ruum.instance\": \$id},
-      ownerReferences: [{apiVersion: \"v1\", kind: \"ConfigMap\", name: (\"ruum-k-\" + (\$own | ltrimstr(\"ruum-i-\")) + \"-check\"),
-        uid: \"00000000-0000-0000-0000-000000000001\"}]},
+  jq -cn --arg id "$OWN_ID" --arg own "$OWN_SECRET" "{apiVersion: \"v1\", kind: \"Secret\", type: \"Opaque\",
+    metadata: {name: \$own, namespace: \"ruum-apps\", labels: {\"ruum.instance\": \$id}},
     stringData: {token: \"not-a-secret\"}} | ${1:-.}" | kubectl create --dry-run=server -f - -o name 2>&1
 }
-# refused_secret WHAT NEEDLE JQ: the dry run must be refused by the Secret policy with NEEDLE.
+# refused_secret WHAT JQ: the dry run must be refused by the Secret policy.
 refused_secret() {
   local out
-  out="$(secret_dry_run "$3" || true)"
-  if [[ "$out" == *"ruum-apps-secrets"* && "$out" == *"$2"* ]]; then
-    pass "ruum-apps refuses a Secret $1 (the Secret rules)"
+  out="$(secret_dry_run "$2" || true)"
+  if [[ "$out" == *"ruum-apps-secrets"* && "$out" == *"no Secret in ruum-apps"* ]]; then
+    pass "ruum-apps refuses a Secret $1 (the Secret rule)"
   else
-    bad "ruum-apps did not refuse a Secret $1 with its Secret rules: ${out:-no answer} (k8s/manifests/apps-admission.yaml)"
+    bad "ruum-apps did not refuse a Secret $1 with its Secret rule: ${out:-no answer} (k8s/manifests/apps-admission.yaml)"
   fi
 }
-refused_secret "of the type kubernetes.io/service-account-token" "type Opaque only" \
-  '.type = "kubernetes.io/service-account-token" | .metadata.annotations = {"kubernetes.io/service-account.name": "default"}'
-refused_secret "with a service account annotation" "no service account annotation" \
-  '.metadata.annotations = {"kubernetes.io/service-account.name": "default"}'
-refused_secret "named for another instance" "an instance Secret" '.metadata.name = $other'
-refused_secret "without its key as the one owner" "owned by one key ConfigMap" 'del(.metadata.ownerReferences)'
-out="$(secret_dry_run || true)"
-if [[ "$out" == "secret/$OWN_SECRET"* ]]; then
-  pass "an instance Secret owned by its key passes the Secret rules (the positive control)"
-else
-  bad "an instance Secret owned by its key did not pass the dry run, so the Secret refusals above prove nothing: ${out:-no answer}"
-fi
+refused_secret "named for an instance (Opaque)" '.'
+refused_secret "of the type kubernetes.io/service-account-token" \
+  '.type = "kubernetes.io/service-account-token" | .metadata.annotations = {"kubernetes.io/service-account.name": "ruum-sandbox"}'
 
 [[ $fail == 0 ]] && echo "gvisor check: passed" || echo "gvisor check: FAILED"
 exit "$fail"

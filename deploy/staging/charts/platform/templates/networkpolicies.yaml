@@ -246,6 +246,23 @@ spec:
       ports:
         - { protocol: TCP, port: 443 }
 ---
+# The server's supervisor listener (backlog S-89): only sandboxes reach it, on its own port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: supervisor-from-sandboxes
+  namespace: ruum
+spec:
+  podSelector:
+    matchLabels: { app: ruum-server }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ruum-apps }
+      ports:
+        - { protocol: TCP, port: 8091 }
+---
 # The egress proxy: only sandboxes reach it.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -309,9 +326,10 @@ spec:
           podSelector:
             matchLabels: { app: ruum-gateway }
 ---
-# Sandboxes reach the egress proxy and nothing else: no DNS, no other sandbox, no platform
-# service, no metadata address (docs/STEP3.md "How an app runs" rule 2). An app sets
-# HTTPS_PROXY to the proxy's Service address; the proxy resolves names.
+# Sandboxes reach the egress proxy and the server's supervisor listener (backlog S-89: the
+# sandbox supervisor fetches its launch data there, port 8091 only), nothing else: no DNS, no
+# other sandbox, no other platform service, no metadata address (docs/STEP3.md "How an app runs"
+# rule 2). An app sets HTTPS_PROXY to the proxy's Service address; the proxy resolves names.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -328,6 +346,13 @@ spec:
             matchLabels: { app: ruum-egress }
       ports:
         - { protocol: TCP, port: 3128 }
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ruum }
+          podSelector:
+            matchLabels: { app: ruum-server }
+      ports:
+        - { protocol: TCP, port: 8091 }
 ---
 # The edge: from the load balancer over the private network (proxy protocol from 10.20.1.5).
 apiVersion: networking.k8s.io/v1

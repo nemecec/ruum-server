@@ -1785,7 +1785,7 @@ impl Inner {
         let (pod_n, pod_uid) = self.review(bearer).await?;
         for _ in 0..SEAL_TRIES {
             let (s, mut rec, rv, rec_uid) = self.authorize(&pod_n, &pod_uid, peer).await?;
-            let launched = s.launched.iter().any(|u| *u == pod_uid);
+            let launched = s.launched.contains(&pod_uid);
             if !launch {
                 if !launched {
                     tracing::warn!(target: "ruum::runtime", pod = %pod_n, "a token request before the launch was refused");

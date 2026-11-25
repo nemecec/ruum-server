@@ -218,6 +218,12 @@ printf 'database-url=postgres://ruum_gateway:%s@pg-rw.data.svc.cluster.local:543
 k -n ruum delete secret ruum-gateway-s3 --ignore-not-found >/dev/null
 # The egress proxy: the control token (a file in the pod) and EGRESS_DENY (not secret).
 printf 'control-token=%s\n' "$STG_EGRESS_CONTROL_TOKEN" | secret ruum ruum-egress
+# The record key of the Kubernetes runtime driver (backlog S-89; a file in the server pods, only
+# with runtime.kubernetes on). Optional until the driver is turned on (secrets-init.sh makes it).
+if [[ -n "${STG_RUUM_RUNTIME_RECORD_KEY:-}" ]]; then
+  [[ "$STG_RUUM_RUNTIME_RECORD_KEY" =~ ^[0-9a-f]{64}$ ]] || die "STG_RUUM_RUNTIME_RECORD_KEY is not 64 lowercase hexadecimal characters"
+  printf 'record-key=%s\n' "$STG_RUUM_RUNTIME_RECORD_KEY" | secret ruum ruum-runtime-record-key
+fi
 deny_before="$(k -n ruum get configmap ruum-egress-deny -o jsonpath='{.data.deny}' 2>/dev/null || true)"
 k -n ruum create configmap ruum-egress-deny --from-literal="deny=$STG_EGRESS_DENY" --dry-run=client -o yaml |
   k apply -f - >/dev/null

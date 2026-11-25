@@ -593,84 +593,119 @@ egress proxy (its identity is a registered address, and its control socket is in
 proxy's pod: backlog I6-2, a panel question); the database pooler, the telemetry listeners, the
 key set of user tokens for apps (P-97).
 
-### The runtime driver (backlog I6-1)
+### The runtime driver (backlog I6-1, I6-20, S-89)
 
 ruum-server starts app sandboxes as pods with `RUUM_RUNTIME_DRIVER=kubernetes`
 (`crates/ruum-runtime` `src/kube`, the same trait, spec and limits as the Docker driver of the
-laptop; its README "Kubernetes driver" lists every API call). `charts/ruum` sets it with the app
-runtime (both app images) unless `runtime.kubernetes=false`.
+laptop; its README "Kubernetes driver" lists every API call). **Off on staging** (decision
+0008-5): `charts/ruum` sets it only with the app runtime and `runtime.kubernetes=true`, and then
+it also needs `runtime.supervisorImage` (by digest) and `runtime.nodeNetworkEncrypted=true`, or
+the chart refuses to render.
 
 - **The pod of a run** (`ruum-i-<instance>-<run>` in `ruum-apps`): `runtimeClassName: gvisor`,
-  no service account token, no host namespace, user 10001, read-only root, `drop: [ALL]`, no
+  the ServiceAccount `ruum-sandbox` (no rights) with one projected token of the audience
+  `ruum-supervisor` (600 s), no host namespace, user 10001, read-only root, `drop: [ALL]`, no
   privilege escalation, `RuntimeDefault` seccomp, CPU and memory limits (requests = limits), a
   memory-backed `/tmp` of the disk limit, no DNS (`/etc/hosts` lines for the routes),
-  `restartPolicy: Never`, `activeDeadlineSeconds` for a job. The proxy variables point at the
-  egress proxy's Service, the only way out (network policies). Readiness is an exec probe inside
-  the sandbox, never from the node. The driver reads the stored pod back and deletes it when any
-  setting differs.
-- **The record and the Secret**: a ConfigMap `ruum-i-<instance>` holds the instance's state
-  (every server replica answers for every instance, also after a restart); a Secret of the same
-  name holds the workload token (mounted as the token file) and the secret environment values.
-  The driver only creates the Secret; it is owned by a key ConfigMap `ruum-k-<instance>-<tag>`,
-  and the garbage collector removes it when the driver deletes the key (a token rotation, an
-  end, the record's retention).
+  `restartPolicy: Never`, `activeDeadlineSeconds` for a job. The init container
+  `ruum-supervisor` copies the sandbox supervisor into a memory volume, which the app container
+  mounts read-only and runs as its first process (`docs/STEP3.md` "The sandbox supervisor"):
+  the supervisor fetches the secret values once from the server's supervisor listener and
+  redacts the app's output before the kubelet writes it. The driver reads the stored pod back
+  and deletes it when any setting differs.
+- **The record**: a ConfigMap `ruum-i-<instance>` holds the instance's state (every server
+  replica answers for every instance, also after a restart) and its values **sealed** under the
+  record key (Secret `ruum/ruum-runtime-record-key`, mounted only into the server pods), with the
+  `uid` of the pod a server process made for the run. No Secret in `ruum-apps`.
 - **Its rights** (`charts/platform` `runtime-rbac.yaml`): the ServiceAccount `ruum/ruum-server`
-  with a Role in `ruum-apps` only: pods (create, get, list, delete), `pods/log` (get), ConfigMaps
-  (create, get, list, update, delete), Secrets (create only: get, list and watch read a Secret,
-  and so do patch, update and a delete with a finalizer, which answer with the Secret; Kimi run
-  15, I6-1 finding 1).
-  No exec, attach or port-forward, no token request, no RBAC change. The server pod mounts the
-  account's token only as a projected volume (one hour) for the API server. `ops/rbac-check.sh
-  live` checks each right and each refusal, and tries a no-op patch of a Secret as the account
-  (a server-side dry run that must be refused).
-- **gVisor is enforced** (backlog S-83): `k8s/manifests/apps-admission.yaml`, a
-  ValidatingAdmissionPolicy, refuses every pod in `ruum-apps` without `runtimeClassName: gvisor`
-  or with a service account token, whoever makes it, and binds a pod's Secret by its
-  `ruum.instance` label. The pod's creator sets that label, so the rule stops mistakes and bugs,
-  not a compromised server process (backlog S-85; decision S-89 in
-  `docs/backlog/2026-11-24-run15.md`). A second policy admits only `Opaque` instance Secrets owned
-  by their key (no service account token Secret). `ops/gvisor-check.sh` runs its control pod
-  (without gVisor) in `ops` and proves both with server-side dry runs and positive controls.
-- **The gateway** reaches a running pod at its address and the service port: the core's sandbox
-  directory takes them from the driver. Nothing starts a deployment's instance from a visit yet
-  (no node22 deploys): the directory answers `not_running`.
+  with a Role in `ruum-apps`: pods (create, get, list, delete), `pods/log` (get), ConfigMaps
+  (create, get, list, update, delete); and one ClusterRole rule: `tokenreviews` (create). No verb
+  on Secrets, no exec, attach or port-forward, no token request, no RBAC change. The server pod
+  mounts the account's token only as a projected volume (one hour) for the API server.
+  `ops/rbac-check.sh live` checks each right and each refusal (also every Secret verb, a no-op
+  patch of a Secret, and that `ruum-apps/ruum-sandbox` has no right).
+- **Admission** (`k8s/manifests/apps-admission.yaml`): every pod in `ruum-apps` must have the
+  supervisor's shape (gVisor, the account `ruum-sandbox`, only `emptyDir` volumes and the
+  supervisor's projected token, no `valueFrom` or `envFrom`, at most the init container
+  `ruum-supervisor`, a read-only supervisor volume, the termination message from its file), and
+  no Secret is admitted in `ruum-apps`. `ops/gvisor-check.sh` proves the rules with server-side
+  dry runs and a positive control.
+- **The supervisor listener**: port 8091 of each server pod, the Service `ruum/ruum-supervisor`;
+  `charts/platform` `networkpolicies.yaml` lets only `ruum-apps` reach it, and the sandboxes reach
+  only it and the egress proxy.
 - **Not yet**: no registry (`runtime.registry` empty: every app image is `image_not_found`), no
-  egress registration (I6-2: the proxy refuses every sandbox, fails closed), logs are read only
-  by the replica that started the instance (only it knows the values to redact), and stdout and
+  egress registration (I6-2: the proxy refuses every sandbox, fails closed), no supervisor image
+  in `images.yml`, logs are read only by the replica that started the instance, and stdout and
   stderr come as one stream unless the API server has the feature gate
-  `PodLogsQuerySplitStreams` (`runtime.splitLogStreams`). Container logs also land in the node's
-  CRI log files (kubelet rotation), which the Docker driver avoids with the log driver `none`.
+  `PodLogsQuerySplitStreams` (`runtime.splitLogStreams`).
 
-#### The orchestrator: the driver on staging
+#### Turning the Kubernetes runtime driver on
 
-After the I-6 steps above (the I-6 apply of 2026-11-24 stopped before its platform step), with
-`main` at or after this change. Each step stops on the first error; the live release keeps
-serving.
+The binding that S-89 asked for exists (card I6-20), but the driver stays off until the person
+decides (decision 0008-5). Each step stops on the first error; the live release keeps serving.
 
-1. `RUUM_STAGING_APPLY=yes deploy/staging/secrets-push.sh platform`. New in this step: the
-   admission policy `ruum-apps-gvisor` (right after the runtime class), the ServiceAccount
-   `ruum/ruum-server` with the Role and RoleBinding `ruum-apps/ruum-runtime` (the platform chart),
-   the new lines of `ops/rbac-check.sh live` (the step stops when the driver has a right too many
-   or one too few) and the full `ops/gvisor-check.sh` (the control pod in `ops`, then
-   "ruum-apps refuses a pod without the runtime class gvisor", "ruum-apps refuses a pod with a
-   service account token" and "a restricted gVisor pod passes the admission rule"). The platform
-   step must come before the deploy: the new server pods name the ServiceAccount, and without it
-   the rollout stops (the old pods keep serving).
-2. `deploy/staging/deploy.sh <sha of main>`. ruum-server gets `RUUM_RUNTIME_DRIVER=kubernetes`,
-   the account and the projected token.
-3. Check:
-   - `deploy/staging/tool.sh kubectl -n ruum logs deploy/ruum-server | grep -E 'runtime driver|the sweep'`:
-     one line `runtime driver: Kubernetes (backlog I6-1)` per pod, the two expected warnings (no
-     egress control listener, no registry), and no `the sweep cannot list the instance records`
-     (that line means the Role or the token is wrong).
-   - `deploy/staging/tool.sh kubectl -n ruum-apps get pods,configmaps -l ruum.managed=ruum-runtime`:
-     nothing (no node22 deploys yet).
-   - `deploy/staging/status.sh --checks`: as before; the node22 line stays `BLOCKED` with the
-     reason (runtime_not_ready, no builder, no registry).
+The person:
 
-Going back: `deploy.sh --rollback` gives the previous server (no driver). The ServiceAccount,
-the Role and the admission policy stay; they are harmless (nothing else makes pods in
-`ruum-apps`, and gVisor-only is what that namespace is for).
+1. Decide to turn it on (a line in `docs/decisions/0008-person-decisions-2026-11-13.md` item 5
+   or a new decision), after reading `docs/STEP3.md` "The sandbox supervisor" (threat model) and
+   decision 0006 I.
+2. Delete any Secret left in `ruum-apps` by an older release: `deploy/staging/tool.sh kubectl -n
+   ruum-apps get secrets` must answer "No resources found"; otherwise `deploy/staging/tool.sh
+   kubectl -n ruum-apps delete secret <name>` for each (the new policy does not check existing
+   objects).
+
+The orchestrator (cards first, then the platform step):
+
+3. **The supervisor image**: a card adds `crates/ruum-runtime/supervisor/Dockerfile` to
+   `.github/workflows/images.yml` (linux/amd64, provenance as the other images, decision
+   0008-3). Its digest goes into `runtime.supervisorImage` (`ghcr.io/nemecec/ruum-supervisor@sha256:...`).
+4. **Node-to-node encryption** (decision 0006 I point 4): an O card turns on Talos KubeSpan
+   (`machine.network.kubespan.enabled: true` in `talos/patches/cluster.yaml`, applied through the
+   admin tunnel) or the CNI's WireGuard. Check on every node: `deploy/staging/tool.sh talosctl -n
+   <node ip> get kubespanpeerstatuses` lists every other node with state `up`. Only then may
+   `runtime.nodeNetworkEncrypted: true` be set.
+5. **I6-19**: the kubelet's `podPidsLimit` in the Talos machine config (the hard PID bound of a
+   sandbox), with its live fork check in `ops/gvisor-check.sh`.
+6. **The record key**: `deploy/staging/secrets-init.sh` (adds `STG_RUUM_RUNTIME_RECORD_KEY`, 64
+   hexadecimal characters; a name that is present is never changed), then
+   `RUUM_STAGING_APPLY=yes deploy/staging/secrets-push.sh platform`. This step also applies the
+   new admission policy, the ClusterRole `ruum-runtime-tokenreview`, the ServiceAccount
+   `ruum-apps/ruum-sandbox` and the network policies, and runs `ops/rbac-check.sh live`.
+7. **Live checks** before the switch:
+   - `deploy/staging/tool.sh bash deploy/staging/ops/gvisor-check.sh`: every line `PASS`, among
+     them "ruum-apps refuses a pod that mounts a Secret", "... with a projected token of the
+     API's audience", "... with a writable supervisor volume", "a restricted gVisor pod in the
+     shape of the sandbox supervisor passes the admission rules (the positive control)" and
+     "ruum-apps refuses a Secret named for an instance (Opaque)".
+   - `deploy/staging/tool.sh bash deploy/staging/ops/rbac-check.sh live` ends with "... the
+     runtime driver has its sandbox rights in ruum-apps and TokenReviews only and no verb on
+     Secrets ...; the sandbox account has none".
+   - `deploy/staging/tool.sh kubectl -n ruum get secret ruum-runtime-record-key -o name` answers
+     the Secret (never print its data).
+8. **The switch**: in a change of `deploy/staging/k8s/values` (or the chart values),
+   `runtime.kubernetes: true`, `runtime.supervisorImage: <digest>`,
+   `runtime.nodeNetworkEncrypted: true`; then `deploy/staging/deploy.sh <sha of main>`.
+9. **Checks after the deploy**:
+   - `deploy/staging/tool.sh kubectl -n ruum logs deploy/ruum-server | grep -E 'runtime driver|supervisor listener|the sweep'`:
+     per pod one line `runtime driver: Kubernetes (backlog I6-1)` and one `supervisor listener
+     (sandboxes only) listening`, the expected warnings (no egress control listener, no
+     registry), and no `the sweep cannot list the instance records`.
+   - `deploy/staging/tool.sh kubectl -n ruum get service ruum-supervisor` shows port 8091.
+   - `deploy/staging/status.sh --checks`: as before; the node22 line stays `BLOCKED` (no builder,
+     no registry).
+10. **The first sandbox** (once a registry and node22 deploys exist): start one app whose start
+    command prints a known test value of a secret; then the admin checks, on the pod:
+    `kubectl -n ruum-apps logs <pod>` shows `<hidden secret>` and not the value (the node's CRI
+    file holds the same lines); `kubectl -n ruum-apps exec <pod> -c app -- sh -c 'echo x >
+    /proc/1/fd/1'` fails with "Permission denied" (the supervisor is non-dumpable under
+    gVisor); `kubectl -n ruum-apps exec <pod> -c app -- sh -c 'kill -9 1; echo $?'` leaves the
+    pod running (PID 1 ignores it); and the server logs show one launch per pod and no `refused`
+    line for it. A pod made by hand as a copy of it gets no launch (`a supervisor request was
+    refused` in the server log, exit 125).
+
+Going back: `runtime.kubernetes: false` and a deploy. The ServiceAccounts, the Role, the
+ClusterRole, the admission policy and the record key stay; they are harmless (nothing else
+makes pods in `ruum-apps`).
 
 **What the node22 smoke check still needs**, in order: node22 deployments in the deploy pipeline
 (the build, image and start stages, and the spec maker of the sandbox directory); a builder that

@@ -50,4 +50,7 @@ add STG_NATS_RUUM_PASSWORD "$(rand_alnum 40)"
 add STG_PG_RUUM_GATEWAY_PASSWORD "$(rand_alnum 40)"
 add STG_GATEWAY_TOKEN_KEY "$(rand_b64url 32)"
 add STG_EGRESS_CONTROL_TOKEN "$(rand_alnum 48)"
+# The record key of the Kubernetes runtime driver (backlog S-89): 32 bytes, hexadecimal. It seals
+# the values in the sandbox records; only the server pods mount it (Secret ruum-runtime-record-key).
+add STG_RUUM_RUNTIME_RECORD_KEY "$(openssl rand -hex 32)"
 echo "secrets-init: done (names only above; keep a copy of TOFU_STATE_PASSPHRASE in the password manager)"

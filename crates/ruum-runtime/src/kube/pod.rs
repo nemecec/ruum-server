@@ -869,7 +869,8 @@ mod tests {
             .remove("stdin");
         assert_eq!(verify(&cfg, &sent, &stored), Ok(()));
         // Each of these must be refused.
-        let cases: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
+        type Change = Box<dyn Fn(&mut Value)>;
+        let cases: Vec<(&str, Change)> = vec![
             (
                 "a capability",
                 Box::new(|p| {
