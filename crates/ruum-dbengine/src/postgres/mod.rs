@@ -272,6 +272,9 @@ pub struct PostgresEngine {
     /// again between the strip and the drop, Kimi run 15 on D-5).
     #[cfg(test)]
     pub(crate) before_role_drop: crate::lock::Mutex<Option<(DatabaseRef, String, usize)>>,
+    /// Tests only: the read of a database's app roles fails (`app_roles::names`).
+    #[cfg(test)]
+    pub(crate) fail_app_names: AtomicBool,
 }
 
 /// Whether a name is a neutral database name (`d_` + 16 hex).
@@ -313,6 +316,8 @@ impl PostgresEngine {
             between_checks: Default::default(),
             #[cfg(test)]
             before_role_drop: Default::default(),
+            #[cfg(test)]
+            fail_app_names: AtomicBool::new(false),
         })
     }
 
