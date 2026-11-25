@@ -36,7 +36,8 @@ EDGE_HOST="$(sed -n 's/^  public: *\([a-z0-9.-]*\) *$/\1/p' "$HERE/../charts/ruu
 # retry SECONDS COMMAND...: runs COMMAND until it succeeds, at most SECONDS long in all (backlog
 # O-54). SECONDS is a hard limit (Kimi re-check of O-53): each try runs under timeout with what is
 # left of it, and timeout kills a try that hangs (a stalled connection, a TLS handshake that never
-# ends) with its whole process group, kubectl port-forward and openssl included. COMMAND may be a
+# ends) with its whole process group, kubectl port-forward and openssl included (SIGKILL 5 s after
+# the SIGTERM, for a try that does not end on it). No pause runs past the limit. COMMAND may be a
 # function of this script: the functions are exported (see below), and bash -c runs them.
 # timeout puts the try in a process group of its own, so a Ctrl-C reaches only this script, and a
 # foreground timeout would hold it until the try ends (review of the Kimi re-check fix). So the
@@ -55,8 +56,11 @@ retry() {
     wait "$pid" || rc=$?
     trap - INT TERM
     (( rc == 0 )) && return 0
-    (( SECONDS - start < limit )) || return 1
+    left=$(( limit - (SECONDS - start) ))
+    (( left > 0 )) || return 1
     log "failed: $* (the API forward may be on the node that rebooted); again in ${RETRY_PAUSE} s"
+    # Never sleep past the limit (Kimi, review of the fix).
+    if [[ "${RETRY_PAUSE%%.*}" =~ ^[0-9]+$ ]] && (( ${RETRY_PAUSE%%.*} >= left )); then return 1; fi
     sleep "$RETRY_PAUSE"
   done
 }
