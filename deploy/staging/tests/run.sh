@@ -2121,6 +2121,7 @@ case "$*" in
   "-n data get cluster pg "*) printf pg-1 ;;
   "-n data get pod pg-1 "*) printf stg-2 ;;
   "wait --for=condition=Ready node/stg-1 "*)
+    [[ -z "${FAKE_NODE_HANG:-}" ]] || { echo $$ >"$FAKE_DIR/hang.pid"; exec sleep 300; }
     n=$(( $(cat "$FAKE_DIR/node-waits" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$FAKE_DIR/node-waits"
     [[ $n -gt 2 ]] || { echo "Unable to connect to the server: EOF" >&2; exit 1; } ;;
   "-n data wait "*) ;;
@@ -2173,6 +2174,31 @@ while True: held.append(s.accept()[0])' "$FU_PORT" &
     [[ $((SECONDS - t0)) -le 15 ]] && grep -qF 'stopping before the next node' "$TMP/out" &&
       ok "... within its limit ($((SECONDS - t0)) s for 3 s), with the message that it stops" || bad "upgrade-talos.sh against a stalled edge: $((SECONDS - t0)) s for a limit of 3 s: $(tail -2 "$TMP/out")"
     kill "$FU_PID" 2>/dev/null; wait "$FU_PID" 2>/dev/null
+    # Review of the Kimi re-check fix: retry's timeout runs a try in a process group of its own,
+    # so a Ctrl-C reaches only the script. An INT to the script (here while the node wait hangs)
+    # must stop the try and the script at once, not after the try's limit (600 s here). python3
+    # restores the default INT action, which bash gives up for a command in the background.
+    rm -f "$FU/fake/"*
+    env PATH="$FU/bin:$PATH" FAKE_DIR="$FU/fake" FAKE_EXT="$fu_ext" FAKE_NODE_HANG=1 RUUM_STAGING_WORK="$FU" \
+      python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvp(sys.argv[1], sys.argv[1:])' \
+      bash "$FU/ops/upgrade-talos.sh" >"$TMP/out" 2>&1 &
+    sp=$!
+    for _ in $(seq 1 100); do [[ -s "$FU/fake/hang.pid" ]] && break; sleep 0.1; done
+    hp="$(cat "$FU/fake/hang.pid" 2>/dev/null)"
+    t0=$SECONDS
+    kill -INT "$sp" 2>/dev/null
+    for _ in $(seq 1 150); do kill -0 "$sp" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$sp" 2>/dev/null; then
+      bad "upgrade-talos.sh did not stop on INT during a retry try ($((SECONDS - t0)) s)"; kill -KILL "$sp" 2>/dev/null
+      [[ -n "$hp" ]] && kill -KILL "$hp" 2>/dev/null
+    else
+      wait "$sp"; src=$?
+      sleep 0.5
+      [[ -n "$hp" && $src -eq 130 ]] && ! kill -0 "$hp" 2>/dev/null &&
+        ok "upgrade-talos.sh stops at once on INT during a retry try, and the try ends with it ($((SECONDS - t0)) s, exit $src)" ||
+        bad "upgrade-talos.sh on INT during a retry try: exit $src, hung kubectl ${hp:-never started} $(kill -0 "$hp" 2>/dev/null && echo 'still runs')"
+    fi
+    [[ -n "$hp" ]] && kill -KILL "$hp" 2>/dev/null
   else
     echo "== upgrade-talos.sh against a stalled edge: skipped (no python3)"
   fi

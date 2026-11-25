@@ -38,13 +38,23 @@ EDGE_HOST="$(sed -n 's/^  public: *\([a-z0-9.-]*\) *$/\1/p' "$HERE/../charts/ruu
 # left of it, and timeout kills a try that hangs (a stalled connection, a TLS handshake that never
 # ends) with its whole process group, kubectl port-forward and openssl included. COMMAND may be a
 # function of this script: the functions are exported (see below), and bash -c runs them.
+# timeout puts the try in a process group of its own, so a Ctrl-C reaches only this script, and a
+# foreground timeout would hold it until the try ends (review of the Kimi re-check fix). So the
+# try runs in the background, and an INT or TERM to this script stops it and then the script.
 retry() {
-  local limit="$1" start=$SECONDS left
+  local limit="$1" start=$SECONDS left pid rc
   shift
   while :; do
     left=$(( limit - (SECONDS - start) ))
     (( left > 0 )) || return 1
-    timeout -k 5 "$left" bash -o pipefail -c '"$@"' retry "$@" && return 0
+    timeout -k 5 "$left" bash -o pipefail -c '"$@"' retry "$@" &
+    pid=$!
+    trap 'trap "" INT TERM; kill -TERM "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true; exit 130' INT
+    trap 'trap "" INT TERM; kill -TERM "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true; exit 143' TERM
+    rc=0
+    wait "$pid" || rc=$?
+    trap - INT TERM
+    (( rc == 0 )) && return 0
     (( SECONDS - start < limit )) || return 1
     log "failed: $* (the API forward may be on the node that rebooted); again in ${RETRY_PAUSE} s"
     sleep "$RETRY_PAUSE"
