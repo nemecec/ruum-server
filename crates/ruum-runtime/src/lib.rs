@@ -35,10 +35,13 @@
 //! ([`repository`]) before anything else, so the digest of another app's image is
 //! `image_not_found` also when the engine has it. The workload token is a host file in a
 //! private (0700) folder per instance, bind-mounted read-only at `TOKEN_FILE` and rewritten in
-//! place by `rotate_token`. Secret values reach the container at create only, as environment
-//! values; they are never in a label, a log line, an error text or `Debug` output (errors from
+//! place by `rotate_token`. With the sandbox supervisor ([`DockerConfig::supervisor`], backlog
+//! I6-20) the secret values reach the container once, on its standard input, and the supervisor
+//! redacts the app's output inside the sandbox; without it they are environment values at
+//! create. They are never in a label, a log line, an error text or `Debug` output (errors from
 //! the engine are redacted). Output streams through the redactor of `ruum-core` inside the
-//! driver into a bounded ring per instance; a line is cut at [`DockerConfig::max_line_bytes`].
+//! driver into a bounded ring per instance (and a live byte budget, S-91); a line is cut at
+//! [`DockerConfig::max_line_bytes`].
 //!
 //! # Docker API surface (for I-4's socket proxy)
 //!

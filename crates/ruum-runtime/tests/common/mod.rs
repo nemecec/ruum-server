@@ -23,6 +23,41 @@ pub const LABEL: &str = "ruum.test=s3w3r2a";
 pub const REGISTRY_IMAGE: &str =
     "registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373";
 
+/// The static sandbox supervisor (backlog I6-20) for the driver: `RUUM_SUPERVISOR_BIN`, or built
+/// here for `<arch>-unknown-linux-musl` (once per test binary, into `CARGO_TARGET_TMPDIR`). The
+/// musl target must be installed (`rustup target add`); without it the build fails, and the test
+/// fails when `CI` is set (the CI job installs the target), else it runs without a supervisor.
+pub fn supervisor_bin() -> Option<PathBuf> {
+    static BIN: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        if let Ok(p) = std::env::var("RUUM_SUPERVISOR_BIN") {
+            return Some(PathBuf::from(p));
+        }
+        let target = format!("{}-unknown-linux-musl", std::env::consts::ARCH);
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("supervisor");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+        let built = Command::new(cargo)
+            .args(["build", "--release", "-p", "ruum-supervisor", "--target", &target])
+            .env("CARGO_TARGET_DIR", &dir)
+            .current_dir(&root)
+            .status();
+        let bin = dir.join(&target).join("release/ruum-supervisor");
+        match built {
+            Ok(s) if s.success() && bin.is_file() => Some(bin),
+            other => {
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "the sandbox supervisor did not build for {target} ({other:?}); install the target"
+                );
+                eprintln!("the sandbox supervisor did not build for {target}: the Docker tests run without it");
+                None
+            }
+        }
+    })
+    .clone()
+}
+
 pub fn docker_host() -> String {
     std::env::var("RUUM_DOCKER_HOST").unwrap_or_else(|_| "unix:///var/run/docker.sock".to_owned())
 }
@@ -346,6 +381,7 @@ impl Harness {
         c.extra_labels
             .insert(LABEL_KEY.to_owned(), LABEL_VALUE.to_owned());
         c.stop_timeout = std::time::Duration::from_secs(5);
+        c.supervisor = supervisor_bin();
         c
     }
 

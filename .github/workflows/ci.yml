@@ -53,6 +53,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+          # Card I6-20: the Docker driver's tests build the static sandbox supervisor for this
+          # target (crates/ruum-runtime tests/common supervisor_bin; they fail under CI without it).
+          targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:

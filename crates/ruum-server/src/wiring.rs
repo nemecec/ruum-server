@@ -292,6 +292,19 @@ pub fn kube_driver(
     cfg.ca_file = k.ca_file.clone();
     cfg.registry = k.registry.clone();
     cfg.split_log_streams = k.split_log_streams;
+    // The sandbox supervisor (backlog I6-20, S-89): the record key, the pinned image, the
+    // listener as the sandboxes reach it. The settings refuse a plain node network.
+    let key = std::fs::read_to_string(&k.record_key_file)
+        .with_context(|| format!("cannot read {}", k.record_key_file.display()))?;
+    cfg.record_key = Some(
+        ruum_runtime::kube::RecordKey::from_hex(&key)
+            .map_err(|e| anyhow::anyhow!("RUUM_KUBE_RECORD_KEY_FILE: {e}"))?,
+    );
+    cfg.supervisor_image = k.supervisor_image.clone();
+    cfg.supervisor_address = k.supervisor_service.0.clone();
+    cfg.supervisor_port = k.supervisor_service.1;
+    cfg.network_encrypted = true;
+    cfg.node_arch = k.node_arch.clone();
     if let Some((host, port)) = &k.egress_proxy {
         cfg.routes.insert(
             Route::EgressProxy,
@@ -323,14 +336,25 @@ pub fn kube_driver(
             "the runtime driver has no registry (RUUM_REGISTRY): every app image is image_not_found"
         );
     }
-    let driver = ruum_runtime::KubeDriver::new(cfg, egress, Arc::new(UnmeteredUsage))?;
+    let driver = Arc::new(ruum_runtime::KubeDriver::new(
+        cfg,
+        egress,
+        Arc::new(UnmeteredUsage),
+    )?);
     tracing::info!(
         namespace = %k.namespace,
         runtime_class = %k.runtime_class,
         "runtime driver: Kubernetes (backlog I6-1)"
     );
-    Ok(Some(Arc::new(driver)))
+    // The supervisor listener of this process serves this driver (main.rs starts it).
+    let _ = SUPERVISOR.set((driver.clone(), k.supervisor_listen));
+    Ok(Some(driver))
 }
+
+/// The Kubernetes driver and the address of its supervisor listener (backlog S-89), set once by
+/// [`kube_driver`]; `main` serves [`crate::supervisor::router`] on it.
+pub static SUPERVISOR: std::sync::OnceLock<(Arc<ruum_runtime::KubeDriver>, std::net::SocketAddr)> =
+    std::sync::OnceLock::new();
 
 /// The sandbox directory over the Kubernetes driver: the gateway reaches a running pod at its
 /// address and the service port (the driver's last status of it). No spec maker yet: nothing

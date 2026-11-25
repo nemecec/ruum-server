@@ -17,6 +17,7 @@ mod config;
 mod migrate;
 mod seed;
 mod shutdown;
+mod supervisor;
 mod telemetry;
 mod wiring;
 
@@ -212,7 +213,31 @@ async fn main() -> anyhow::Result<()> {
             None => Ok(()),
         }
     };
-    let servers = async move { tokio::try_join!(platform, dav, internal).map(|_| ()) };
+    // The supervisor listener of the Kubernetes driver (backlog S-89), with the driver.
+    let supervisor = match wiring::SUPERVISOR.get() {
+        Some((driver, bind)) => {
+            let listener = tokio::net::TcpListener::bind(bind)
+                .await
+                .with_context(|| format!("bind {bind} (RUUM_KUBE_SUPERVISOR_LISTEN)"))?;
+            tracing::info!(addr = %bind, "supervisor listener (sandboxes only) listening");
+            Some(
+                axum::serve(
+                    listener,
+                    supervisor::router(driver.clone())
+                        .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(stop.clone().stopped()),
+            )
+        }
+        None => None,
+    };
+    let supervisor = async move {
+        match supervisor {
+            Some(serve) => serve.await,
+            None => Ok(()),
+        }
+    };
+    let servers = async move { tokio::try_join!(platform, dav, internal, supervisor).map(|_| ()) };
     match shutdown::drain(servers, stop, grace).await? {
         shutdown::Drained::Ended | shutdown::Drained::Clean => {
             tracing::info!("every connection is closed; bye")

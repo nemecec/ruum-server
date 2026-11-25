@@ -930,17 +930,24 @@ if has helm; then
   # The runtime driver's rights (I6-1): its Role in ruum-apps only, exactly these rules (the
   # driver's tests read the same file and the fake API server refuses everything else).
   awk '/^# Source: [a-z-]*\/templates\/runtime-rbac.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/platform.yaml" >"$TMP/runtime-rbac.yaml"
-  want_rules='  - { apiGroups: [""], resources: [pods], verbs: [create, get, list, delete] }
+  want_rules='  - { apiGroups: ["authentication.k8s.io"], resources: [tokenreviews], verbs: [create] }
+  - { apiGroups: [""], resources: [pods], verbs: [create, get, list, delete] }
   - { apiGroups: [""], resources: [pods/log], verbs: [get] }
-  - { apiGroups: [""], resources: [configmaps], verbs: [create, get, list, update, delete] }
-  - { apiGroups: [""], resources: [secrets], verbs: [create] }'
-  # Kimi run 15, I6-1 finding 1: create only on Secrets (patch, update and delete answer with the
-  # Secret, so each is a read).
+  - { apiGroups: [""], resources: [configmaps], verbs: [create, get, list, update, delete] }'
+  # Backlog S-89 (I6-20): no verb on Secrets at all (the values are sealed into the records), and
+  # the one cluster-wide right is creating TokenReviews (the supervisor listener's check).
   [[ "$(grep -E '^  - \{ apiGroups' "$TMP/runtime-rbac.yaml")" == "$want_rules" ]] &&
-    ok "the runtime driver may make pods, records and Secrets of sandboxes, and only create Secrets (no read, patch, update or delete)" || bad "the runtime driver's Role differs: $(grep -E 'apiGroups' "$TMP/runtime-rbac.yaml" | tr '\n' ' ')"
-  grep -qE 'kind: Cluster(Role|RoleBinding)' "$TMP/runtime-rbac.yaml" && bad "the runtime driver gets cluster-wide rights" || ok "the runtime driver's rights are namespaced"
-  [[ "$(grep -cE '^  namespace: ruum-apps$' "$TMP/runtime-rbac.yaml")" == 2 && "$(grep -cE '^  namespace: ruum$' "$TMP/runtime-rbac.yaml")" == 1 ]] &&
-    ok "its Role and RoleBinding are in ruum-apps, its ServiceAccount in ruum" || bad "runtime-rbac.yaml objects in other namespaces"
+    ok "the runtime driver may make pods and records of sandboxes and TokenReviews, and has no verb on Secrets" || bad "the runtime driver's rules differ: $(grep -E 'apiGroups' "$TMP/runtime-rbac.yaml" | tr '\n' ' ')"
+  grep -qE 'resources: \[secrets\]' "$TMP/runtime-rbac.yaml" && bad "the runtime driver has a rule on Secrets" || ok "the runtime driver has no rule on Secrets"
+  [[ "$(grep -cE '^kind: ClusterRole$' "$TMP/runtime-rbac.yaml")" == 1 && "$(grep -cE '^kind: ClusterRoleBinding$' "$TMP/runtime-rbac.yaml")" == 1 ]] &&
+    awk 'BEGIN{RS="---"} /kind: ClusterRoleBinding\n/' "$TMP/runtime-rbac.yaml" | grep -qE '^    name: ruum-server$' &&
+    awk 'BEGIN{RS="---"} /kind: ClusterRole\n/' "$TMP/runtime-rbac.yaml" | grep -cE '^  - \{' | grep -qx 1 &&
+    ok "its only cluster-wide right is one ClusterRole (TokenReviews), bound to ruum/ruum-server" || bad "runtime-rbac.yaml has other cluster-wide rights"
+  [[ "$(grep -cE '^  namespace: ruum-apps$' "$TMP/runtime-rbac.yaml")" == 3 && "$(grep -cE '^  namespace: ruum$' "$TMP/runtime-rbac.yaml")" == 1 ]] &&
+    ok "its Role, RoleBinding and the sandbox account are in ruum-apps, its ServiceAccount in ruum" || bad "runtime-rbac.yaml objects in other namespaces"
+  awk 'BEGIN{RS="---"} /name: ruum-sandbox\n/' "$TMP/runtime-rbac.yaml" | grep -qxF 'automountServiceAccountToken: false' &&
+    ! grep -qE '^ +name: ruum-sandbox$' <(awk 'BEGIN{RS="---"} /kind: (Cluster)?RoleBinding\n/' "$TMP/runtime-rbac.yaml") &&
+    ok "the sandbox account ruum-sandbox mounts no token and has no binding" || bad "the sandbox account ruum-sandbox has a binding or mounts a token"
   awk 'BEGIN{RS="---"} /kind: RoleBinding\n/' "$TMP/runtime-rbac.yaml" | grep -qE '^    name: ruum-server$' &&
     ok "the Role is bound to ruum/ruum-server only" || bad "the runtime driver's RoleBinding has another subject"
   grep -qxF 'automountServiceAccountToken: false' "$TMP/runtime-rbac.yaml" && ok "the ServiceAccount mounts no token by default" || bad "the ServiceAccount ruum-server mounts a token in every pod"
@@ -1127,18 +1134,27 @@ YAML
   doc_of "$TMP/ruum-apps.yaml" Deployment ruum-server >"$TMP/srv-default.yaml"
   ! grep -qE 'RUUM_RUNTIME_DRIVER|serviceAccountName|serviceAccountToken' "$TMP/srv-default.yaml" && grep -qF 'automountServiceAccountToken: false' "$TMP/srv-default.yaml" &&
     ok "the Kubernetes driver is off by default and the server gets no ServiceAccount token (S-89)" || bad "the default chart runs the Kubernetes driver or gives the server a token (S-89)"
-  # The Kubernetes runtime driver (I6-1) when turned on: with the app runtime only, its account and token.
-  expect 0 "render charts/ruum with the app runtime and the driver on" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.kubernetes=true
+  # The Kubernetes runtime driver (I6-1) when turned on: with the app runtime only, its account and
+  # token, and the sandbox supervisor (I6-20, S-89): its pinned image and encrypted node traffic.
+  K=(--set runtime.kubernetes=true --set "runtime.supervisorImage=ghcr.io/nemecec/ruum-supervisor@sha256:$(printf '%064d' 5)" --set runtime.nodeNetworkEncrypted=true)
+  expect 1 "charts/ruum refuses the driver without the supervisor's image (S-89)" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.kubernetes=true --set runtime.nodeNetworkEncrypted=true
+  expect 1 "charts/ruum refuses a supervisor image by tag" helm template ruum "$STG/charts/ruum" "${A[@]}" "${K[@]}" --set runtime.supervisorImage=ghcr.io/nemecec/ruum-supervisor:latest
+  expect 1 "charts/ruum refuses the driver without encrypted node traffic (decision 0006 I point 4)" helm template ruum "$STG/charts/ruum" "${A[@]}" "${K[@]}" --set runtime.nodeNetworkEncrypted=false
+  expect 0 "render charts/ruum with the app runtime and the driver on" helm template ruum "$STG/charts/ruum" "${A[@]}" "${K[@]}"
+  doc_of "$TMP/out" Service ruum-supervisor | grep -qF 'port: 8091' && ok "the supervisor listener has its Service (8091)" || bad "no Service ruum-supervisor"
   doc_of "$TMP/out" Deployment ruum-server >"$TMP/srv-apps.yaml"
   grep -qF 'serviceAccountName: ruum-server' "$TMP/srv-apps.yaml" && grep -qF '{ name: RUUM_RUNTIME_DRIVER, value: kubernetes }' "$TMP/srv-apps.yaml" &&
     grep -qF 'serviceAccountToken: { path: token, expirationSeconds: 3600 }' "$TMP/srv-apps.yaml" && grep -qF 'automountServiceAccountToken: false' "$TMP/srv-apps.yaml" &&
     ok "with the app runtime the server runs the Kubernetes driver with a projected token only" || bad "the server has no Kubernetes driver, or its token is not the projected one"
+  grep -qF '{ name: RUUM_KUBE_SUPERVISOR_NETWORK, value: encrypted }' "$TMP/srv-apps.yaml" && grep -qF '{ name: RUUM_KUBE_SUPERVISOR_LISTEN, value: "0.0.0.0:8091" }' "$TMP/srv-apps.yaml" &&
+    grep -qF 'secretName: ruum-runtime-record-key' "$TMP/srv-apps.yaml" && grep -qF '{ name: RUUM_KUBE_RECORD_KEY_FILE, value: /var/run/secrets/ruum-runtime/record-key }' "$TMP/srv-apps.yaml" &&
+    ok "the driver gets the record key, the supervisor listener and the encrypted-network setting (S-89)" || bad "the driver lacks the supervisor settings"
   grep -qF 'name: RUUM_REGISTRY' "$TMP/srv-apps.yaml" && bad "a registry is set although none is given" || ok "no registry unless one is given (app images fail closed)"
   grep -qF 'RUUM_RUNTIME_DRIVER' "$TMP/ruum.yaml" && bad "the Kubernetes driver renders without the app runtime" || ok "without the app runtime no Kubernetes driver"
   expect 0 "the server env with the app runtime is what the server reads" bash "$HERE/server-env.sh" "$TMP/ruum-apps.yaml"
-  expect 0 "render charts/ruum with a registry" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.kubernetes=true --set runtime.registry=registry.ruum-apps.svc:5000
+  expect 0 "render charts/ruum with a registry" helm template ruum "$STG/charts/ruum" "${A[@]}" "${K[@]}" --set runtime.registry=registry.ruum-apps.svc:5000
   grep -qF '{ name: RUUM_REGISTRY, value: "registry.ruum-apps.svc:5000" }' "$TMP/out" && ok "the registry reaches the server" || bad "runtime.registry is not RUUM_REGISTRY"
-  expect 1 "charts/ruum refuses a registry that is not host:port" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.kubernetes=true --set 'runtime.registry=http://x/y'
+  expect 1 "charts/ruum refuses a registry that is not host:port" helm template ruum "$STG/charts/ruum" "${A[@]}" "${K[@]}" --set 'runtime.registry=http://x/y'
   expect 0 "render charts/ruum with the driver off" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.kubernetes=false
   grep -qF 'RUUM_RUNTIME_DRIVER' "$TMP/out" && bad "runtime.kubernetes=false still renders the driver" || ok "runtime.kubernetes=false keeps the in-memory driver"
   doc_of "$TMP/ruum-apps.yaml" Deployment ruum-gateway >"$TMP/gw.yaml"
@@ -1207,9 +1223,13 @@ YAML
   P="$TMP/platform.yaml"
   doc_of "$P" NetworkPolicy sandboxes-only-to-egress >"$TMP/np-sb-out.yaml"
   grep -qF 'namespace: ruum-apps' "$TMP/np-sb-out.yaml" && grep -qF 'policyTypes: [Egress]' "$TMP/np-sb-out.yaml" && grep -qF 'podSelector: {}' "$TMP/np-sb-out.yaml" &&
-    [[ "$(grep -c 'port:' "$TMP/np-sb-out.yaml")" == 1 ]] && grep -qF '{ protocol: TCP, port: 3128 }' "$TMP/np-sb-out.yaml" &&
+    [[ "$(grep -c 'port:' "$TMP/np-sb-out.yaml")" == 2 ]] && grep -qF '{ protocol: TCP, port: 3128 }' "$TMP/np-sb-out.yaml" &&
     grep -qF 'matchLabels: { app: ruum-egress }' "$TMP/np-sb-out.yaml" && ! grep -q 'ipBlock\|kube-dns' "$TMP/np-sb-out.yaml" &&
-    ok "sandboxes reach only the egress proxy on 3128 (no DNS, no address block)" || bad "the sandboxes' egress policy allows more than the egress proxy"
+    grep -qF '{ protocol: TCP, port: 8091 }' "$TMP/np-sb-out.yaml" && grep -qF 'matchLabels: { app: ruum-server }' "$TMP/np-sb-out.yaml" &&
+    ok "sandboxes reach only the egress proxy on 3128 and the supervisor listener on 8091 (no DNS, no address block; S-89)" || bad "the sandboxes' egress policy allows more than the egress proxy and the supervisor listener"
+  doc_of "$P" NetworkPolicy supervisor-from-sandboxes >"$TMP/np-sup.yaml"
+  grep -qF 'kubernetes.io/metadata.name: ruum-apps' "$TMP/np-sup.yaml" && [[ "$(grep -c 'port:' "$TMP/np-sup.yaml")" == 1 ]] && grep -qF '{ protocol: TCP, port: 8091 }' "$TMP/np-sup.yaml" &&
+    ok "only ruum-apps reaches the supervisor listener, on 8091 only (S-89)" || bad "the supervisor listener's ingress is not ruum-apps on 8091"
   doc_of "$P" NetworkPolicy default-deny-ingress | grep . >/dev/null || bad "no default deny"
   awk '/^  name: default-deny-ingress$/ {getline; print}' "$P" | grep -xF '  namespace: ruum-apps' >/dev/null && ok "ruum-apps denies all ingress by default" || bad "ruum-apps has no default deny ingress"
   doc_of "$P" NetworkPolicy sandboxes-from-gateway >"$TMP/np-sb-in.yaml"
@@ -1783,7 +1803,7 @@ R=system:serviceaccount:ruum:ruum-server
 for verb in create get list delete; do echo "$R ruum-apps $verb pods -" >>"$FA/allow"; done
 echo "$R ruum-apps get pods log" >>"$FA/allow"
 for verb in create get list update delete; do echo "$R ruum-apps $verb configmaps -" >>"$FA/allow"; done
-echo "$R ruum-apps create secrets -" >>"$FA/allow"
+echo "$R * create tokenreviews.authentication.k8s.io -" >>"$FA/allow"
 O=system:serviceaccount:ruum:observer
 for ns in ruum edge ruum-deploy; do
   for resource in pods events events.events.k8s.io deployments.apps daemonsets.apps replicasets.apps jobs.batch; do
@@ -1840,8 +1860,9 @@ expect 0 "the live check passes when the deployer may only write release request
 cp "$FA/allow" "$FA/allow-runtime-secrets"
 echo "$R ruum-apps get secrets -" >>"$FA/allow-runtime-secrets"
 expect 1 "the live check fails when the runtime driver may read Secrets" livecheck "$FA/allow-runtime-secrets"
-# Kimi run 15, I6-1 finding 1: a patch (or delete) right on Secrets is a read right.
-for verb in patch delete; do
+# Kimi run 15, I6-1 finding 1: a patch (or delete) right on Secrets is a read right; S-89: no
+# Secret verb at all, create included.
+for verb in patch delete create; do
   cp "$FA/allow" "$FA/allow-runtime-$verb"
   echo "$R ruum-apps $verb secrets -" >>"$FA/allow-runtime-$verb"
   expect 1 "the live check fails when the runtime driver may $verb Secrets" livecheck "$FA/allow-runtime-$verb"
@@ -1849,6 +1870,11 @@ done
 grep -qxF "$R ruum-apps patch secrets -" "$FA/queries" && ok "the live check tries a no-op patch of a Secret as the runtime driver" || bad "the live check does not try a no-op patch of a Secret"
 grep -v "^$R ruum-apps create pods -$" "$FA/allow" >"$FA/allow-runtime-nopods"
 expect 1 "the live check fails when the runtime driver cannot make pods" livecheck "$FA/allow-runtime-nopods"
+grep -v "tokenreviews" "$FA/allow" >"$FA/allow-runtime-noreview"
+expect 1 "the live check fails when the runtime driver cannot create TokenReviews (S-89)" livecheck "$FA/allow-runtime-noreview"
+cp "$FA/allow" "$FA/allow-sandbox-pods"
+echo "system:serviceaccount:ruum-apps:ruum-sandbox ruum-apps get pods -" >>"$FA/allow-sandbox-pods"
+expect 1 "the live check fails when the sandbox account has a right (S-89)" livecheck "$FA/allow-sandbox-pods"
 # Every namespace and a no-namespace review must be requested for both accounts.
 for identity in "$O" "$D"; do
   for ns in ruum edge ruum-deploy data auth new-tenant -; do
@@ -2274,28 +2300,31 @@ al="$(grep -nF 'manifests/apps-admission.yaml' "$STG/k8s/apply.sh" | cut -d: -f1
 gc="$STG/ops/gvisor-check.sh"
 grep -qx 'CONTROL_NS=ops' "$gc" && grep -qF '[[ -n "$class" ]] || ns="$CONTROL_NS"' "$gc" && ok "the control pod without gVisor runs in ops, not in ruum-apps" || bad "gvisor-check.sh runs its control pod in ruum-apps"
 grep -qF 'kubectl create --dry-run=server' "$gc" && grep -qF 'the positive' "$gc" && ok "gvisor-check.sh proves the admission rule live, with a positive control" || bad "gvisor-check.sh does not check the admission rule"
-# Review of I6-1 change 5, Kimi I6-1 finding 1: no projected token, no other Secret, no envFrom, no
-# init or ephemeral containers, the default service account, checked live with dry runs.
-grep -qF 'resources: ["pods", "pods/ephemeralcontainers"]' "$va" && grep -qF "v.secret.secretName == variables.own" "$va" &&
-  grep -qF "e.valueFrom.secretKeyRef.name == variables.own" "$va" && grep -qF "size(c.envFrom) == 0" "$va" &&
-  grep -qF "size(object.spec.ephemeralContainers) == 0" "$va" && grep -qF "object.spec.serviceAccountName == 'default'" "$va" &&
-  ok "the admission policy of ruum-apps lets a pod reach only its own Secret (no projected token, envFrom or extra containers)" || bad "apps-admission.yaml does not bind a pod to its own Secret"
-grep -qF 'refused "with a projected service account token"' "$gc" && grep -qF "refused \"that mounts another instance's Secret\"" "$gc" &&
-  grep -qF "refused \"that takes a value of another instance's Secret\"" "$gc" && grep -qF 'refused "with envFrom"' "$gc" &&
-  ok "gvisor-check.sh proves the Secret rules live (projected token, another Secret, envFrom)" || bad "gvisor-check.sh does not check the Secret rules"
-grep -qF 'want no "$r" "$APPS_NS" "$verb" secrets' "$STG/ops/rbac-check.sh" && grep -qF 'want yes "$r" "$APPS_NS" get pods log' "$STG/ops/rbac-check.sh" &&
+# Backlog S-89 (I6-20): the sandbox supervisor's shape only: the ServiceAccount ruum-sandbox, the
+# projected token of the audience ruum-supervisor (600 s), no Secret volume, no valueFrom or envFrom,
+# one init container ruum-supervisor, a read-only supervisor volume, the termination message from
+# the file; checked live with dry runs and a positive control.
+grep -qF 'resources: ["pods", "pods/ephemeralcontainers"]' "$va" && grep -qF "object.spec.serviceAccountName == 'ruum-sandbox'" "$va" &&
+  grep -qF "v.projected.sources[0].serviceAccountToken.audience == 'ruum-supervisor'" "$va" && grep -qF "v.projected.sources[0].serviceAccountToken.expirationSeconds == 600" "$va" &&
+  grep -qF "c.env.all(e, !has(e.valueFrom))" "$va" && grep -qF "size(c.envFrom) == 0" "$va" &&
+  grep -qF "object.spec.initContainers[0].name == 'ruum-supervisor'" "$va" && grep -qF "m.name != 'ruum-bin' || (has(m.readOnly) && m.readOnly == true)" "$va" &&
+  grep -qF "c.terminationMessagePolicy == 'File'" "$va" && ! grep -qF "v.secret" "$va" &&
+  ok "the admission policy of ruum-apps admits only the supervisor's shape (no Secret, no valueFrom, the supervisor's token)" || bad "apps-admission.yaml does not hold the supervisor's shape"
+grep -qF 'refused "with a projected token of the API' "$gc" && grep -qF 'refused "that mounts a Secret"' "$gc" &&
+  grep -qF 'refused "that takes a value of a Secret"' "$gc" && grep -qF 'refused "with envFrom"' "$gc" &&
+  grep -qF 'refused "with a writable supervisor volume"' "$gc" && grep -qF 'refused "with another ServiceAccount"' "$gc" &&
+  grep -qF "in the shape of the sandbox supervisor passes the admission rules (the positive control)" "$gc" &&
+  ok "gvisor-check.sh proves the pod rules live (token, Secret, envFrom, supervisor volume, account, positive control)" || bad "gvisor-check.sh does not check the pod rules"
+grep -qF 'want yes "$r" - create tokenreviews.authentication.k8s.io' "$STG/ops/rbac-check.sh" && grep -qF 'want yes "$r" "$APPS_NS" get pods log' "$STG/ops/rbac-check.sh" &&
   ok "rbac-check.sh live checks the runtime driver's rights" || bad "rbac-check.sh does not check the runtime driver"
-grep -qF 'for verb in get list watch patch update delete deletecollection; do want no "$r" "$APPS_NS" "$verb" secrets; done' "$STG/ops/rbac-check.sh" &&
+grep -qF 'for verb in create get list watch patch update delete deletecollection; do want no "$r" "$APPS_NS" "$verb" secrets; done' "$STG/ops/rbac-check.sh" &&
   grep -qF 'patch_refused "$r" "$APPS_NS"' "$STG/ops/rbac-check.sh" &&
-  ok "rbac-check.sh live refuses every Secret verb but create to the runtime driver and tries a no-op patch (Kimi run 15 I6-1 finding 1)" || bad "rbac-check.sh does not refuse patch, update or delete of Secrets to the runtime driver"
-# Kimi run 15, I6-1 finding 4: every Secret in ruum-apps is an Opaque instance Secret owned by
-# its key; no service account token Secret, checked live.
-grep -qF 'resources: ["secrets"]' "$va" && grep -qF "object.type == 'Opaque'" "$va" && grep -qF "k.startsWith('kubernetes.io/service-account')" "$va" &&
-  grep -qF "object.metadata.name == variables.own" "$va" && grep -qF "object.metadata.ownerReferences[0].kind == 'ConfigMap'" "$va" &&
-  ok "the admission policy of ruum-apps admits only Opaque instance Secrets owned by their key (no service account token Secret)" || bad "apps-admission.yaml does not limit the Secrets of ruum-apps"
-grep -qF 'refused_secret "of the type kubernetes.io/service-account-token"' "$gc" && grep -qF 'refused_secret "with a service account annotation"' "$gc" &&
-  grep -qF 'an instance Secret owned by its key passes the Secret rules (the positive control)' "$gc" &&
-  ok "gvisor-check.sh proves the Secret rules live (token Secret, annotation, positive control)" || bad "gvisor-check.sh does not check the Secret rules of ruum-apps"
+  ok "rbac-check.sh live refuses every Secret verb to the runtime driver and tries a no-op patch (S-89)" || bad "rbac-check.sh does not refuse every Secret verb to the runtime driver"
+# S-89: no Secret in ruum-apps at all, checked live.
+grep -qF 'resources: ["secrets"]' "$va" && grep -qF 'expression: "false"' "$va" &&
+  ok "the admission policy of ruum-apps admits no Secret" || bad "apps-admission.yaml admits Secrets in ruum-apps"
+grep -qF 'refused_secret "named for an instance (Opaque)"' "$gc" && grep -qF 'refused_secret "of the type kubernetes.io/service-account-token"' "$gc" &&
+  ok "gvisor-check.sh proves the Secret rule live (an Opaque Secret, a token Secret)" || bad "gvisor-check.sh does not check the Secret rule of ruum-apps"
 # Kimi run 15, I6-1 finding 3 (S-86): the server refuses the egress control listener, and the
 # chart does not set it.
 ! grep -rqF 'RUUM_KUBE_EGRESS_CONTROL' "$STG/charts/ruum/templates/" "$STG/charts/ruum/values.yaml" &&

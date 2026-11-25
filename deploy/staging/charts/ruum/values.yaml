@@ -101,14 +101,21 @@ gateway:
 # makes one pod of the runtime class gvisor per run in ruum-apps, with its ServiceAccount
 # ruum/ruum-server and the Role of charts/platform runtime-rbac.yaml (the platform step applies
 # both, before the first deploy that sets this). Only with the app runtime (both images set).
-# OFF on staging (person's decision 2026-11-25, backlog S-89): the S-83 admission rule binds a
-# pod to "its own" Secret by the ruum.instance label, which the pod's creator sets, so a holder of
-# this ServiceAccount's token could mount another instance's Secret. Off, the server gets no
-# token of ruum/ruum-server at all. Turn it on only with an ownership binding the creator cannot
-# forge (S-89; likely the in-sandbox supervisor of I6-20). Staging has no builder or registry yet,
-# so node22 deploys are refused either way.
+# OFF on staging (person's decision 2026-11-25, decision 0008-5, backlog S-89). The binding the
+# creator cannot forge exists since card I6-20 (the sandbox supervisor, docs/STEP3.md; no Secret,
+# values sealed into the records, the pod's projected token checked by a TokenReview), but the
+# person turns the driver on, after the steps of deploy/staging/README.md "Turning the Kubernetes
+# runtime driver on". Off, the server gets no token of ruum/ruum-server at all. Staging has no
+# builder or registry yet, so node22 deploys are refused either way.
 runtime:
   kubernetes: false
+  # The sandbox supervisor's image by digest (crates/ruum-runtime/supervisor/Dockerfile; required
+  # with kubernetes on). Its init container copies the binary into each sandbox.
+  supervisorImage: ""
+  # Node-to-node traffic is encrypted and authenticated (Talos KubeSpan or the CNI's WireGuard):
+  # required with kubernetes on, since the supervisor's launch channel is plain HTTP (decision
+  # 0006 I point 4). Set it only after the README's check passed.
+  nodeNetworkEncrypted: false
   # The registry the nodes pull app images from (host:port, RUUM_REGISTRY). Empty: none yet, so
   # every app image is image_not_found (fails closed). Staging has no registry and no builder yet.
   registry: ""
