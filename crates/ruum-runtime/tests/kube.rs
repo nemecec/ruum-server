@@ -880,8 +880,10 @@ async fn the_runtime_identity_reads_no_secret_by_any_verb() {
 }
 
 /// A token rotation creates the Secret again under a new key once the garbage collector removed
-/// the old one (it may take a while); the old key goes, the pod reads the new token, and an
-/// ended instance keeps neither a key nor a Secret.
+/// the old one (it may take a while); the old key goes, the new key is owned by the record (whose
+/// uid stays the same through its replacements), the new Secret holds the new token and the
+/// secret values, and an ended instance keeps neither a key nor a Secret. (The conformance suite
+/// checks that the pod reads the new token.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rotation_waits_for_the_garbage_collector() {
     let w = world(false).await;
@@ -903,6 +905,8 @@ async fn a_rotation_waits_for_the_garbage_collector() {
     };
     let first = keys(&w);
     assert_eq!(first.len(), 1, "one key: {first:?}");
+    // Running: the record was replaced at least once since the key was made.
+    wait_state(&d, id.tenant, s.id, |x| *x == InstanceState::Running).await;
     w.fake.gc_delay_ms.store(300, Ordering::SeqCst);
     let new = format!("tok-rotated-{}", uuid::Uuid::now_v7().simple());
     let t0 = Instant::now();
@@ -916,6 +920,24 @@ async fn a_rotation_waits_for_the_garbage_collector() {
     let now = keys(&w);
     assert_eq!(now.len(), 1, "one key: {now:?}");
     assert_ne!(now, first, "the old key stayed");
+    let cms = w.fake.config_maps();
+    let uid_of = |name: &str| {
+        cms.iter()
+            .find(|c| c["metadata"]["name"] == serde_json::json!(name))
+            .and_then(|c| c.pointer("/metadata/uid").cloned())
+            .unwrap()
+    };
+    let record_uid = uid_of(&ruum_runtime::kube::object_name(s.id));
+    assert!(record_uid.as_str().is_some_and(|u| !u.is_empty()));
+    let key = cms
+        .iter()
+        .find(|c| c["metadata"]["name"] == serde_json::json!(now[0]))
+        .unwrap();
+    assert_eq!(
+        key.pointer("/metadata/ownerReferences/0/uid"),
+        Some(&record_uid),
+        "the new key is not owned by the record"
+    );
     let secrets = w.fake.secrets();
     assert_eq!(secrets.len(), 1);
     assert_eq!(secrets[0]["data"]["token"], serde_json::json!(new));
@@ -970,6 +992,33 @@ async fn one_tenant_cannot_take_every_slot() {
     for _ in 0..2 {
         d.start(w.service(b, None)).await.unwrap();
     }
+}
+
+/// Starts at the same time cannot pass a tenant's share together: the slot is taken under the
+/// lock of the check (Kimi review of the fix of finding 5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_starts_keep_the_tenant_share() {
+    let mut w = world(false).await;
+    w.cfg.max_instances = 8;
+    w.cfg.max_tenant_instances = 2;
+    let d = Arc::new(w.driver(Arc::new(MemoryUsage::new())));
+    let a = identity();
+    let specs: Vec<_> = (0..6).map(|_| w.service(a, None)).collect();
+    let tasks: Vec<_> = specs
+        .into_iter()
+        .map(|spec| {
+            let d = d.clone();
+            tokio::spawn(async move { d.start(spec).await })
+        })
+        .collect();
+    let mut ok = 0;
+    for t in tasks {
+        match t.await.unwrap() {
+            Ok(_) => ok += 1,
+            Err(e) => assert_eq!(e.code(), "runtime_unavailable", "{e}"),
+        }
+    }
+    assert_eq!(ok, 2, "{ok} starts passed a share of 2");
 }
 
 /// The logs of an instance scaled to zero count to the byte cap (Kimi run 15, I6-1 finding 5):

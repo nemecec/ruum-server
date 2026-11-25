@@ -912,7 +912,10 @@ mod tests {
             json!([{ "apiVersion": "v1", "kind": "ConfigMap", "name": key_name(id, "t1"),
                 "uid": "k" }])
         );
-        assert_eq!(secret["stringData"], json!({ "token": "tok", "env.X": "v" }));
+        assert_eq!(
+            secret["stringData"],
+            json!({ "token": "tok", "env.X": "v" })
+        );
         assert!(secret["metadata"].get("annotations").is_none());
     }
 }
