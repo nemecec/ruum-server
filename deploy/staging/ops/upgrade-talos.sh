@@ -33,11 +33,18 @@ RETRY_PAUSE="${RUUM_UPGRADE_RETRY_PAUSE:-5}"
 # The public host of the edge (hosts.public of charts/ruum).
 EDGE_HOST="$(sed -n 's/^  public: *\([a-z0-9.-]*\) *$/\1/p' "$HERE/../charts/ruum/values.yaml" | head -1)"
 
-# retry SECONDS COMMAND...: runs COMMAND until it succeeds, at most SECONDS long (backlog O-54).
+# retry SECONDS COMMAND...: runs COMMAND until it succeeds, at most SECONDS long in all (backlog
+# O-54). SECONDS is a hard limit (Kimi re-check of O-53): each try runs under timeout with what is
+# left of it, and timeout kills a try that hangs (a stalled connection, a TLS handshake that never
+# ends) with its whole process group, kubectl port-forward and openssl included. COMMAND may be a
+# function of this script: the functions are exported (see below), and bash -c runs them.
 retry() {
-  local limit="$1" start=$SECONDS
+  local limit="$1" start=$SECONDS left
   shift
-  until "$@"; do
+  while :; do
+    left=$(( limit - (SECONDS - start) ))
+    (( left > 0 )) || return 1
+    timeout -k 5 "$left" bash -o pipefail -c '"$@"' retry "$@" && return 0
     (( SECONDS - start < limit )) || return 1
     log "failed: $* (the API forward may be on the node that rebooted); again in ${RETRY_PAUSE} s"
     sleep "$RETRY_PAUSE"
@@ -47,7 +54,7 @@ retry() {
 # edge_pod NODE: the name of a running edge pod on NODE (the DaemonSet ruum-edge), or nothing.
 edge_pod() {
   kubectl -n edge get pods -l app=ruum-edge --field-selector "spec.nodeName=$1,status.phase=Running" \
-    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
+    -o jsonpath='{.items[0].metadata.name}' --request-timeout=20s 2>/dev/null
 }
 
 # edge_tls POD: the pod answers TLS on 8443 with a certificate for EDGE_HOST (kubectl
@@ -58,6 +65,8 @@ edge_tls() {
   out="$(mktemp)"
   kubectl -n edge port-forward "pod/$pod" :8443 >"$out" 2>&1 </dev/null &
   pf=$!
+  # retry's timeout ends a try that hangs with SIGTERM.
+  trap 'kill "$pf" 2>/dev/null; rm -f "$out" "$out.cert"; exit 143' TERM
   port=""
   for _ in $(seq 1 50); do
     port="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) .*/\1/p' "$out" | head -1)"
@@ -66,13 +75,14 @@ edge_tls() {
     sleep 0.2
   done
   if [[ -n "$port" ]]; then
-    openssl s_client -connect "127.0.0.1:$port" -servername "$EDGE_HOST" </dev/null 2>/dev/null |
+    timeout -k 2 20 openssl s_client -connect "127.0.0.1:$port" -servername "$EDGE_HOST" </dev/null 2>/dev/null |
       openssl x509 -noout -checkhost "$EDGE_HOST" -subject -enddate >"$out.cert" 2>/dev/null &&
       grep -q 'does match certificate' "$out.cert" && { grep -v 'match certificate' "$out.cert" >&2; rc=0; }
   fi
   kill "$pf" 2>/dev/null || true
   wait "$pf" 2>/dev/null || true
   rm -f "$out" "$out.cert"
+  trap - TERM
   return "$rc"
 }
 
@@ -85,6 +95,9 @@ edge_ok() {
   edge_tls "$pod" || return 1
   log "$1: edge pod $pod is ready and answers with a certificate for $EDGE_HOST"
 }
+# retry runs these in a new bash (bash -c under timeout).
+export -f log edge_pod edge_tls edge_ok
+export EDGE_HOST
 
 check_only=0
 [[ "${1:-}" == --check ]] && check_only=1

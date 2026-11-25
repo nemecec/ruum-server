@@ -14,8 +14,8 @@
 # - ready only with certificates (backlog O-53): after a node reboot an edge started while the
 #   API server refused connections, never loaded its certificates from the Secrets and served
 #   TLS without them, and the load balancer's TCP check kept the node in rotation. Now:
-#   - the init container waits (at most 120 s) until the API server answers, so Caddy normally
-#     starts with a reachable certificate storage;
+#   - the init container waits (at most 120 s, a hard limit) until the API server answers, so
+#     Caddy normally starts with a reachable certificate storage;
 #   - the probes ask Caddy for the ready path over HTTPS without a server name; Caddy answers
 #     with the public host's certificate (default_sni) or fails the handshake. So the readiness
 #     probe fails until the certificates are loaded, which proves that the API server was
@@ -77,6 +77,11 @@ spec:
       initContainers:
         # Waits until the API server answers (any HTTP answer: /readyz may need credentials,
         # and this sends none), at most 120 s; then Caddy starts anyway and the probes decide.
+        # The 120 s are a hard limit (Kimi re-check of O-53): each try gets what is left of
+        # them (3 s at most), and timeout kills a try that hangs. wget's -T does not limit the
+        # TLS handshake: its helper ssl_client waits for a server that accepts and never
+        # answers. A killed wget leaves ssl_client behind, so the output goes to a file, never
+        # to a pipe ($(...) would wait for ssl_client), and pkill ends the helpers.
         - name: wait-api-server
           image: {{ include "ruum.byDigest" .Values.images.edge }}
           command: [/bin/sh, -c]
@@ -90,18 +95,33 @@ spec:
           args:
             - |
               url="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/readyz"
-              i=0
-              while [ "$i" -lt 60 ]; do
-                out="$(wget -q -T 3 -O /dev/null "$url" 2>&1)" && exit 0
+              limit=120
+              end=$(( $(date +%s) + limit ))
+              out="no try"
+              while :; do
+                left=$(( end - $(date +%s) ))
+                [ "$left" -gt 0 ] || break
+                t=3
+                [ "$left" -lt 3 ] && t="$left"
+                timeout -s KILL "$t" wget -q -T "$t" -O /dev/null "$url" >/tmp/wget.out 2>&1
+                rc=$?
+                [ "$rc" -eq 0 ] && exit 0
+                pkill -KILL -x ssl_client 2>/dev/null
+                out="$(cat /tmp/wget.out)"
                 case "$out" in *"server returned error: HTTP/1.1 401"* | *"server returned error: HTTP/1.1 403"*) exit 0 ;; esac
-                i=$((i + 1))
+                [ "$rc" -eq 137 ] || [ -z "$out" ] && out="no answer in $t s"
+                left=$(( end - $(date +%s) ))
+                [ "$left" -gt 2 ] || break
                 sleep 2
               done
-              echo "the API server did not answer in 120 s: $out; Caddy starts anyway (backlog O-53)"
+              echo "the API server did not answer in $limit s: $out; Caddy starts anyway (backlog O-53)"
           resources:
             requests: { cpu: 10m, memory: 16Mi }
             limits: { memory: 32Mi }
           {{- include "ruum.restricted" . | nindent 10 }}
+          volumeMounts:
+            # wget's output (see above); the root file system is read-only.
+            - { name: init-tmp, mountPath: /tmp }
       containers:
         - name: caddy
           image: {{ include "ruum.byDigest" .Values.images.edge }}
@@ -146,6 +166,8 @@ spec:
           emptyDir: { sizeLimit: 256Mi }
         - name: config
           emptyDir: { sizeLimit: 16Mi }
+        - name: init-tmp
+          emptyDir: { sizeLimit: 1Mi }
 ---
 # NodePorts behind the load balancer (tofu/cluster: 443 -> 30443, 80 -> 30081, proxy protocol).
 # externalTrafficPolicy Local keeps the source address (the LB, 10.20.1.5), which the proxy

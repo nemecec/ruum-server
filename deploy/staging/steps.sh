@@ -12,8 +12,9 @@
 #   plan                 tofu plan of both roots, check-plan, price
 #   talos-access         how the last plan reaches the Talos API: create, bootstrap, setup, tunnel
 #                        or none (talos-access.sh kind; up.sh --apply picks its phases by it)
-#   apply [servers](rw)  image upload if missing, plan, check-plan, price, apply the exact plan,
-#                        user_data check, talosconfig; needs RUUM_STAGING_APPLY=yes. Talos
+#   apply [servers](rw)  image upload if missing, plan, check-plan, price, lb-guard.sh (no load
+#                        balancer port to a NodePort without an edge Service), apply the exact
+#                        plan, user_data check, talosconfig; needs RUUM_STAGING_APPLY=yes. Talos
 #                        changes need the admin tunnel open (backlog O-21). "servers": only the
 #                        servers and what they need (a targeted plan), for a fresh create before
 #                        ops/tunnel-setup.sh
@@ -445,6 +446,8 @@ case "$STEP" in
     plan_all apply
     report_plan || die "the plan was refused (check-plan or budget); nothing was applied"
     require_talos_access "$phase"
+    # Kimi re-check of O-53: never move a load balancer port to a NodePort that no edge Service has.
+    KUBECONFIG="$KUBECONFIG_FILE" bash "$HERE/lb-guard.sh" check "$WORK/cluster.json" || die "nothing was applied"
     (cd "$TREE/tofu/persistent" && tofu apply -input=false -no-color -lock-timeout=60s "$WORK/persistent.tfplan")
     (cd "$TREE/tofu/cluster" && tofu apply -input=false -no-color -lock-timeout=60s "$WORK/cluster.tfplan")
     check_user_data
