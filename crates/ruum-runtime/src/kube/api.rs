@@ -1,13 +1,9 @@
-//! A small client of the Kubernetes API for the driver: pods, ConfigMaps and Secrets of one
-//! namespace, and pod logs. Plain JSON over `reqwest` (no Kubernetes client crate). The verbs it
-//! uses are exactly the verbs of the driver's Role (`deploy/staging/charts/platform/templates/
-//! runtime-rbac.yaml`); the fake API server of the tests refuses every other one.
-//!
-//! On Secrets the client only creates (the Role has no other verb: `patch`, `update` and a
-//! `delete` with a finalizer answer with the Secret, Kimi run 15, I6-1 finding 1). The answer of
-//! a create holds the data the driver sent, so it is never parsed, logged or put into an error
-//! text: the client reads only its status code. Deletes always say `propagationPolicy:
-//! Background`, so the garbage collector removes what an object owns (a key's Secret).
+//! A small client of the Kubernetes API for the driver: pods and ConfigMaps of one namespace,
+//! pod logs, and `TokenReview`s. Plain JSON over `reqwest` (no Kubernetes client crate). The
+//! verbs it uses are exactly the verbs of the driver's Role and ClusterRole
+//! (`deploy/staging/charts/platform/templates/runtime-rbac.yaml`); the fake API server of the
+//! tests refuses every other one. No Secret: the driver has no verb on Secrets (backlog S-89).
+//! Deletes always say `propagationPolicy: Background`.
 
 use ruum_core::runtime::RuntimeError;
 use serde_json::Value;
@@ -19,7 +15,6 @@ use std::time::Duration;
 pub(crate) enum Kind {
     Pod,
     ConfigMap,
-    Secret,
 }
 
 impl Kind {
@@ -27,7 +22,6 @@ impl Kind {
         match self {
             Kind::Pod => "pods",
             Kind::ConfigMap => "configmaps",
-            Kind::Secret => "secrets",
         }
     }
 }
@@ -155,15 +149,10 @@ impl Api {
             .map_err(|e| unavailable(what, e.without_url()))
     }
 
-    /// An error for an answer that is not one of the expected ones. Secret answers never get
-    /// their body read.
-    async fn refused(&self, what: &str, kind: Kind, r: reqwest::Response) -> RuntimeError {
+    /// An error for an answer that is not one of the expected ones.
+    async fn refused(&self, what: &str, r: reqwest::Response) -> RuntimeError {
         let status = r.status();
-        let msg = if kind == Kind::Secret {
-            String::new()
-        } else {
-            status_message(&r.text().await.unwrap_or_default())
-        };
+        let msg = status_message(&r.text().await.unwrap_or_default());
         match status.as_u16() {
             401 | 403 => RuntimeError::Internal {
                 reason: format!(
@@ -183,9 +172,8 @@ impl Api {
             .map_err(|e| unavailable(what, e.without_url()))
     }
 
-    /// `GET` one object; `None` when it does not exist. Never called for Secrets.
+    /// `GET` one object; `None` when it does not exist.
     pub(crate) async fn get(&self, kind: Kind, name: &str) -> Result<Option<Value>, RuntimeError> {
-        debug_assert!(kind != Kind::Secret, "the driver never reads a Secret");
         let what = format!("get {} {name}", kind.plural());
         let r = self
             .send(&what, self.client.get(self.url(kind, Some(name))))
@@ -193,17 +181,16 @@ impl Api {
         match r.status().as_u16() {
             200 => Ok(Some(self.json(&what, r).await?)),
             404 => Ok(None),
-            _ => Err(self.refused(&what, kind, r).await),
+            _ => Err(self.refused(&what, r).await),
         }
     }
 
-    /// `GET` the objects with all of `labels`. Never called for Secrets.
+    /// `GET` the objects with all of `labels`.
     pub(crate) async fn list(
         &self,
         kind: Kind,
         labels: &[(&str, &str)],
     ) -> Result<Vec<Value>, RuntimeError> {
-        debug_assert!(kind != Kind::Secret, "the driver never lists Secrets");
         let what = format!("list {}", kind.plural());
         let selector: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
         let r = self
@@ -215,7 +202,7 @@ impl Api {
             )
             .await?;
         if r.status().as_u16() != 200 {
-            return Err(self.refused(&what, kind, r).await);
+            return Err(self.refused(&what, r).await);
         }
         let v = self.json(&what, r).await?;
         Ok(v.get("items")
@@ -224,29 +211,27 @@ impl Api {
             .unwrap_or_default())
     }
 
-    /// `POST` a new object. The answer of a Secret is not read: `Done(Value::Null)`.
+    /// `POST` a new object.
     pub(crate) async fn create(&self, kind: Kind, body: &Value) -> Result<Write, RuntimeError> {
         let what = format!("create {}", kind.plural());
         let r = self
             .send(&what, self.client.post(self.url(kind, None)).json(body))
             .await?;
         match r.status().as_u16() {
-            200..=202 if kind == Kind::Secret => Ok(Write::Done(Value::Null)),
             200..=202 => Ok(Write::Done(self.json(&what, r).await?)),
             409 => Ok(Write::Conflict),
-            _ => Err(self.refused(&what, kind, r).await),
+            _ => Err(self.refused(&what, r).await),
         }
     }
 
     /// `PUT` an object with its `metadata.resourceVersion`: `Conflict` when another writer was
-    /// first. Never called for Secrets.
+    /// first.
     pub(crate) async fn replace(
         &self,
         kind: Kind,
         name: &str,
         body: &Value,
     ) -> Result<Write, RuntimeError> {
-        debug_assert!(kind != Kind::Secret);
         let what = format!("update {} {name}", kind.plural());
         let r = self
             .send(
@@ -258,19 +243,17 @@ impl Api {
             200 | 201 => Ok(Write::Done(self.json(&what, r).await?)),
             409 => Ok(Write::Conflict),
             404 => Ok(Write::Gone),
-            _ => Err(self.refused(&what, kind, r).await),
+            _ => Err(self.refused(&what, r).await),
         }
     }
 
-    /// `DELETE` an object; a missing one is fine. `grace` is the pod's termination grace. Never
-    /// called for Secrets (the garbage collector removes them with their key).
+    /// `DELETE` an object; a missing one is fine. `grace` is the pod's termination grace.
     pub(crate) async fn delete(
         &self,
         kind: Kind,
         name: &str,
         grace: Option<u64>,
     ) -> Result<(), RuntimeError> {
-        debug_assert!(kind != Kind::Secret, "the driver never deletes a Secret");
         let what = format!("delete {} {name}", kind.plural());
         let mut opts = serde_json::json!({
             "apiVersion": "v1",
@@ -284,7 +267,34 @@ impl Api {
         let r = self.send(&what, req).await?;
         match r.status().as_u16() {
             200 | 202 | 404 => Ok(()),
-            _ => Err(self.refused(&what, kind, r).await),
+            _ => Err(self.refused(&what, r).await),
+        }
+    }
+
+    /// `POST /apis/authentication.k8s.io/v1/tokenreviews`: asks the API server whether `token`
+    /// is valid for `audience`, and whose it is. The answer's `status`; the token is never
+    /// logged or put into an error text.
+    pub(crate) async fn token_review(
+        &self,
+        token: &str,
+        audience: &str,
+    ) -> Result<Value, RuntimeError> {
+        let what = "create tokenreviews";
+        let body = serde_json::json!({
+            "apiVersion": "authentication.k8s.io/v1",
+            "kind": "TokenReview",
+            "spec": { "token": token, "audiences": [audience] },
+        });
+        let url = format!("{}/apis/authentication.k8s.io/v1/tokenreviews", self.base);
+        let r = self.send(what, self.client.post(url).json(&body)).await?;
+        match r.status().as_u16() {
+            200 | 201 => Ok(self
+                .json(what, r)
+                .await?
+                .get("status")
+                .cloned()
+                .unwrap_or_default()),
+            _ => Err(self.refused(what, r).await),
         }
     }
 
@@ -316,7 +326,7 @@ impl Api {
             200 => Ok(LogAnswer::Stream(r)),
             400 => Ok(LogAnswer::NotReady),
             404 => Ok(LogAnswer::Gone),
-            _ => Err(self.refused(&what, Kind::Pod, r).await),
+            _ => Err(self.refused(&what, r).await),
         }
     }
 }

@@ -4,23 +4,19 @@
 //! Per instance `ruum-i-<id>` (the ID without dashes):
 //!
 //! - **ConfigMap `ruum-i-<id>`**, key `record`: the [`Record`] (identity, kind, routes, limits,
-//!   image, command, plain environment, state, run). It is the instance's state, shared by every
-//!   server process: any of them answers `status`, `stop`, `wake` and `touch`, also after a
-//!   restart (adoption, backlog R2A-1). State changes replace it with its `resourceVersion`, so
-//!   of two processes only one makes a change (and its effects: usage, unregistration).
-//! - **Secret `ruum-i-<id>`**: the workload token (key `token`) and the secret environment values
-//!   (keys `env.<NAME>`). The driver only creates it: its Role has no other verb on Secrets
-//!   (Kimi run 15, I6-1 finding 1). `get`, `list` and `watch` read a Secret, and so do `patch`
-//!   and `update` (their answer is the changed Secret) and `delete` (with `propagationPolicy:
-//!   Foreground` or `Orphan` the API server adds a finalizer and answers with the Secret). The
-//!   pod mounts the token as a file and takes the values as environment values.
-//! - **ConfigMap `ruum-k-<id>-<tag>`** (label `ruum.role: key`, no data): the key, the only owner
-//!   (`ownerReferences`) of the Secret, itself owned by the record. The driver never deletes the
-//!   Secret: it deletes the key and the API server's garbage collector deletes the Secret. A
-//!   token rotation makes a new key, deletes the old one and creates the Secret again under the
-//!   new key once the collector removed the old Secret; an ended instance loses its key. A
-//!   removed record takes its keys and their Secret with it.
-//! - **Pod `ruum-i-<id>-<run>`**: one per run (a cold start makes a new pod).
+//!   image, command, plain environment, state, run) and its `sealed` part (backlog S-89,
+//!   [`super::seal`]): the secret values, the previous values, the workload token, the app's
+//!   command, a digest of the fixed fields, and the run and pod `uid` that may take the launch
+//!   data. It is the instance's state, shared by every server process: any of them answers
+//!   `status`, `stop`, `wake` and `touch`, also after a restart (adoption, backlog R2A-1). State
+//!   changes replace it with its `resourceVersion`, so of two processes only one makes a change
+//!   (and its effects: usage, unregistration).
+//! - **Pod `ruum-i-<id>-<run>`**: one per run (a cold start makes a new pod). The sandbox
+//!   supervisor (backlog I6-20) is its first process; it fetches the launch data from the server
+//!   with the pod's projected service account token.
+//!
+//! No Secret: the runtime identity has no verb on Secrets (`docs/STEP3.md` "The sandbox
+//! supervisor").
 
 use super::KubeConfig;
 use crate::driver::{LABEL_APP, LABEL_DEPLOYMENT, LABEL_ENV, LABEL_INSTANCE, LABEL_TENANT};
@@ -28,8 +24,12 @@ use ruum_core::runtime::{
     EnvValue, ExitReason, ExitStatus, InstanceId, InstanceState, Limits, Route, TOKEN_FILE,
     TOKEN_FILE_ENV, WorkloadIdentity, WorkloadKind, WorkloadSpec,
 };
+use ruum_supervisor::protocol::{
+    IDENTITY_DIR, IDENTITY_FILE, SUPERVISOR_DIR, SUPERVISOR_PATH, TERMINATION_LOG,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
 
@@ -40,28 +40,14 @@ pub(crate) const CONTAINER: &str = "app";
 /// The user and group every sandbox runs as (the image's `USER` is ignored).
 pub(crate) const SANDBOX_UID: i64 = 10001;
 
-/// The name of an instance's ConfigMap and Secret.
+/// The name of an instance's record (a ConfigMap).
 pub fn object_name(id: InstanceId) -> String {
     format!("ruum-i-{}", id.0.simple())
-}
-
-/// The label that marks a key ConfigMap (the owner of the instance Secret), and its value.
-pub const LABEL_ROLE: &str = "ruum.role";
-pub const ROLE_KEY: &str = "key";
-
-/// The name of one key of an instance (see the module docs); `tag` is new for each key.
-pub fn key_name(id: InstanceId, tag: &str) -> String {
-    format!("ruum-k-{}-{tag}", id.0.simple())
 }
 
 /// The name of the pod of one run.
 pub fn pod_name(id: InstanceId, run: u32) -> String {
     format!("{}-{run}", object_name(id))
-}
-
-/// The Secret key of a secret environment value.
-pub(crate) fn env_key(name: &str) -> String {
-    format!("env.{name}")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +79,7 @@ impl KindRec {
     }
 }
 
-/// One environment variable: a plain value, or (`value: None`) a key of the instance's Secret.
+/// One environment variable: a plain value, or (`value: None`) a secret value (sealed).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct EnvRec {
     pub name: String,
@@ -101,7 +87,8 @@ pub(crate) struct EnvRec {
     pub value: Option<String>,
 }
 
-/// The state of an instance, as the ConfigMap holds it. No secret value is in it.
+/// The state of an instance, as the ConfigMap holds it. No secret value is in it in the clear:
+/// the values are in [`Record::sealed`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Record {
     pub v: u32,
@@ -128,6 +115,9 @@ pub(crate) struct Record {
     /// address is not given to another pod while the proxy still names this app for it.
     #[serde(default)]
     pub registered: Option<String>,
+    /// The sealed part ([`super::seal`]); `None` until the first pod of the instance exists.
+    #[serde(default)]
+    pub sealed: Option<String>,
     /// Fields this release does not know (design 12.7, decision 42): a record that a newer
     /// release wrote keeps them when this release writes it back during a rolling update.
     #[serde(flatten)]
@@ -193,12 +183,13 @@ impl Record {
             last_touch_ms: now,
             ended_ms: None,
             registered: None,
+            sealed: None,
             extra: serde_json::Map::new(),
         }
     }
 }
 
-/// The labels of every object of an instance (the record, the Secret, each pod).
+/// The labels of every object of an instance (the record and each pod).
 pub(crate) fn labels(cfg: &KubeConfig, identity: &WorkloadIdentity, id: InstanceId) -> Value {
     let mut l: BTreeMap<String, String> = cfg.extra_labels.clone();
     l.insert(super::LABEL_MANAGED.to_owned(), super::MANAGED.to_owned());
@@ -250,67 +241,44 @@ pub(crate) fn read_record(cm: &Value) -> Option<(Record, String)> {
     (tenant_ok && inst_ok && name_ok).then_some((rec, rv))
 }
 
-/// An owner reference to a ConfigMap of the namespace (the garbage collector removes the
-/// dependent once the owner is gone).
-fn owned_by(name: &str, uid: &str) -> Value {
-    json!([{ "apiVersion": "v1", "kind": "ConfigMap", "name": name, "uid": uid }])
-}
-
-/// A key of an instance: no data, owned by the record (`record_uid`).
-pub(crate) fn key_body(
-    cfg: &KubeConfig,
-    identity: &WorkloadIdentity,
-    id: InstanceId,
-    tag: &str,
-    record_uid: &str,
-) -> Value {
-    let mut l = labels(cfg, identity, id);
-    l[LABEL_ROLE] = json!(ROLE_KEY);
-    json!({
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": {
-            "name": key_name(id, tag),
-            "labels": l,
-            "ownerReferences": owned_by(&object_name(id), record_uid),
-        },
-    })
-}
-
-/// The Secret of an instance: the token and the secret environment values (`env`: the Secret
-/// key and the value), owned by the key `key` (its name and uid).
-pub(crate) fn secret_body(
-    cfg: &KubeConfig,
-    identity: &WorkloadIdentity,
-    id: InstanceId,
-    token: &str,
-    env: &[(String, String)],
-    key: (&str, &str),
-) -> Value {
-    let mut data = serde_json::Map::new();
-    data.insert("token".to_owned(), json!(token));
-    for (k, v) in env {
-        data.insert(k.clone(), json!(v));
+/// The SHA-256 (hex) of a record's fixed fields: what the record says the instance is, which no
+/// state change alters. The sealed part carries it, so a record whose fixed fields were changed
+/// (by a writer without the record key) is refused (`docs/STEP3.md` "The sandbox supervisor").
+pub(crate) fn fixed_digest(rec: &Record) -> String {
+    #[derive(Serialize)]
+    struct Fixed<'a> {
+        v: u32,
+        instance: &'a InstanceId,
+        identity: &'a WorkloadIdentity,
+        kind: &'a KindRec,
+        routes: &'a [Route],
+        limits: &'a Limits,
+        image: &'a str,
+        command: &'a [String],
+        env: &'a [EnvRec],
+        started_at_ms: i64,
     }
-    json!({
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "type": "Opaque",
-        "metadata": {
-            "name": object_name(id),
-            "labels": labels(cfg, identity, id),
-            "ownerReferences": owned_by(key.0, key.1),
-        },
-        "stringData": Value::Object(data),
-    })
+    let f = Fixed {
+        v: rec.v,
+        instance: &rec.instance,
+        identity: &rec.identity,
+        kind: &rec.kind,
+        routes: &rec.routes,
+        limits: &rec.limits,
+        image: &rec.image,
+        command: &rec.command,
+        env: &rec.env,
+        started_at_ms: rec.started_at_ms,
+    };
+    hex::encode(Sha256::digest(serde_json::to_vec(&f).unwrap_or_default()))
 }
 
-/// The secret environment values of a spec, as Secret keys and values.
+/// The secret environment values of a spec (name, value).
 pub(crate) fn secret_env(spec: &WorkloadSpec) -> Vec<(String, String)> {
     spec.env
         .iter()
         .filter_map(|v| match &v.value {
-            EnvValue::Secret(s) => Some((env_key(&v.name), s.expose().to_owned())),
+            EnvValue::Secret(s) => Some((v.name.clone(), s.expose().to_owned())),
             EnvValue::Plain(_) => None,
         })
         .collect()
@@ -327,27 +295,54 @@ fn secs_ceil(ms: u64) -> u64 {
     ms.div_ceil(1000).max(1)
 }
 
-/// The mount folder and the file name of the token.
-fn token_mount() -> (&'static str, &'static str) {
+/// The folder of the token file (a memory `emptyDir` the supervisor writes).
+fn token_dir() -> &'static str {
     TOKEN_FILE
         .rsplit_once('/')
-        .unwrap_or(("/var/run/ruum", "token"))
+        .map(|(d, _)| d)
+        .unwrap_or("/var/run/ruum")
+}
+
+/// Where the supervisor binary is in its own image (the init container copies it from there).
+pub const SUPERVISOR_IN_IMAGE: &str = "/ruum-supervisor";
+/// The name of the init container that installs the supervisor.
+pub(crate) const INIT_CONTAINER: &str = "ruum-supervisor";
+/// The projected service account token's lifetime (the kubelet renews it at 80 %).
+pub(crate) const IDENTITY_EXPIRY_SECS: u64 = 600;
+
+/// The container security context of every container of a sandbox.
+fn container_security() -> Value {
+    json!({
+        "allowPrivilegeEscalation": false,
+        "privileged": false,
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "runAsUser": SANDBOX_UID,
+        "runAsGroup": SANDBOX_UID,
+        "capabilities": { "drop": ["ALL"] },
+        "seccompProfile": { "type": "RuntimeDefault" },
+    })
 }
 
 /// The pod of one run: the sandbox of STEP3 "How an app runs" rule 1 as a restricted pod in
-/// gVisor (see the crate README "Kubernetes driver").
-pub(crate) fn pod_body(cfg: &KubeConfig, rec: &Record, hosts: &[HostAlias]) -> Value {
+/// gVisor, with the sandbox supervisor as its first process (see the crate README "Kubernetes
+/// driver" and `docs/STEP3.md` "The sandbox supervisor"). `launch_url` is the server's
+/// supervisor listener as `http://<ip>:<port>`.
+pub(crate) fn pod_body(
+    cfg: &KubeConfig,
+    rec: &Record,
+    hosts: &[HostAlias],
+    launch_url: &str,
+) -> Value {
     let id = rec.instance;
-    let secret = object_name(id);
+    // Plain values only: the secret values come from the supervisor's launch data.
     let mut env: Vec<Value> = rec
         .env
         .iter()
-        .map(|e| match &e.value {
-            Some(v) => json!({ "name": e.name, "value": v }),
-            None => json!({
-                "name": e.name,
-                "valueFrom": { "secretKeyRef": { "name": secret, "key": env_key(&e.name) } },
-            }),
+        .filter_map(|e| {
+            e.value
+                .as_ref()
+                .map(|v| json!({ "name": e.name, "value": v }))
         })
         .collect();
     env.push(json!({ "name": TOKEN_FILE_ENV, "value": TOKEN_FILE }));
@@ -372,37 +367,33 @@ pub(crate) fn pod_body(cfg: &KubeConfig, rec: &Record, hosts: &[HostAlias]) -> V
     }
     let mut labels = labels(cfg, &rec.identity, id);
     labels[LABEL_RUN] = json!(rec.run.to_string());
-    let (mount, file) = token_mount();
     let mut container = json!({
         "name": CONTAINER,
         "image": rec.image,
         "imagePullPolicy": "IfNotPresent",
+        "command": [
+            SUPERVISOR_PATH, "run",
+            "--launch-url", launch_url,
+            "--identity-file", IDENTITY_FILE,
+            "--token-file", TOKEN_FILE,
+        ],
         "env": env,
         "resources": {
             "limits": { "cpu": format!("{}m", rec.limits.cpu_millis), "memory": rec.limits.memory_bytes.to_string() },
             "requests": { "cpu": format!("{}m", rec.limits.cpu_millis), "memory": rec.limits.memory_bytes.to_string() },
         },
-        "securityContext": {
-            "allowPrivilegeEscalation": false,
-            "privileged": false,
-            "readOnlyRootFilesystem": true,
-            "runAsNonRoot": true,
-            "runAsUser": SANDBOX_UID,
-            "runAsGroup": SANDBOX_UID,
-            "capabilities": { "drop": ["ALL"] },
-            "seccompProfile": { "type": "RuntimeDefault" },
-        },
+        "securityContext": container_security(),
         "volumeMounts": [
             { "name": "tmp", "mountPath": "/tmp" },
-            { "name": "token", "mountPath": mount, "readOnly": true },
+            { "name": "run", "mountPath": token_dir() },
+            { "name": "ruum-bin", "mountPath": SUPERVISOR_DIR, "readOnly": true },
+            { "name": "ruum-id", "mountPath": IDENTITY_DIR, "readOnly": true },
         ],
         "stdin": false,
         "tty": false,
+        "terminationMessagePath": TERMINATION_LOG,
         "terminationMessagePolicy": "File",
     });
-    if !rec.command.is_empty() {
-        container["args"] = json!(rec.command);
-    }
     if let KindRec::Service { port, health, .. } = &rec.kind {
         container["ports"] = json!([{ "name": "app", "containerPort": port }]);
         if let Some(h) = health {
@@ -419,8 +410,26 @@ pub(crate) fn pod_body(cfg: &KubeConfig, rec: &Record, hosts: &[HostAlias]) -> V
             });
         }
     }
+    // Copies the supervisor into the read-only volume of the app container.
+    let init = json!({
+        "name": INIT_CONTAINER,
+        "image": cfg.supervisor_image,
+        "imagePullPolicy": "IfNotPresent",
+        "command": [SUPERVISOR_IN_IMAGE, "install", SUPERVISOR_PATH],
+        "resources": {
+            "limits": { "cpu": "100m", "memory": "32Mi" },
+            "requests": { "cpu": "100m", "memory": "32Mi" },
+        },
+        "securityContext": container_security(),
+        "volumeMounts": [{ "name": "ruum-bin", "mountPath": SUPERVISOR_DIR }],
+        "stdin": false,
+        "tty": false,
+        "terminationMessagePath": TERMINATION_LOG,
+        "terminationMessagePolicy": "File",
+    });
     let mut spec = json!({
         "runtimeClassName": cfg.runtime_class,
+        "serviceAccountName": cfg.sandbox_service_account,
         "automountServiceAccountToken": false,
         "enableServiceLinks": false,
         "hostNetwork": false,
@@ -430,7 +439,7 @@ pub(crate) fn pod_body(cfg: &KubeConfig, rec: &Record, hosts: &[HostAlias]) -> V
         "restartPolicy": "Never",
         "terminationGracePeriodSeconds": cfg.stop_timeout.as_secs(),
         // No DNS: the sandbox finds the shared services by /etc/hosts (the network policy lets it
-        // reach only the egress proxy, which resolves names itself).
+        // reach only the egress proxy and the supervisor listener).
         "dnsPolicy": "None",
         "dnsConfig": { "nameservers": ["127.0.0.1"] },
         "securityContext": {
@@ -440,13 +449,19 @@ pub(crate) fn pod_body(cfg: &KubeConfig, rec: &Record, hosts: &[HostAlias]) -> V
             "fsGroup": SANDBOX_UID,
             "seccompProfile": { "type": "RuntimeDefault" },
         },
+        "initContainers": [init],
         "containers": [container],
         "volumes": [
             { "name": "tmp", "emptyDir": { "medium": "Memory", "sizeLimit": rec.limits.disk_bytes.to_string() } },
-            { "name": "token", "secret": {
-                "secretName": secret,
-                "items": [{ "key": "token", "path": file }],
+            { "name": "run", "emptyDir": { "medium": "Memory", "sizeLimit": "1Mi" } },
+            { "name": "ruum-bin", "emptyDir": { "medium": "Memory", "sizeLimit": "16Mi" } },
+            { "name": "ruum-id", "projected": {
                 "defaultMode": 0o440,
+                "sources": [{ "serviceAccountToken": {
+                    "audience": cfg.supervisor_audience,
+                    "expirationSeconds": IDENTITY_EXPIRY_SECS,
+                    "path": "token",
+                } }],
             } },
         ],
     });
@@ -509,236 +524,161 @@ fn cpu_millis(q: &str) -> Option<u128> {
     }
 }
 
-/// Reads the pod back as the API server stored it (`pod`) and checks every sandbox setting
-/// against the pod the driver sent (`sent`): a pod that an admission step changed is refused
-/// (the driver deletes it). Allowed differences are only the API server's defaults (canonical
-/// quantities, the default service account, defaulted probe and port fields). `Err` names the
-/// first setting that differs.
-pub(crate) fn verify(
-    cfg: &KubeConfig,
-    rec: &Record,
-    sent: &Value,
-    pod: &Value,
-) -> Result<(), String> {
+/// Whether `path` holds a Kubernetes quantity (compared by value: the API server writes them in
+/// its canonical form).
+fn is_quantity(path: &str) -> bool {
+    path.ends_with("/sizeLimit")
+        || [
+            "/limits/cpu",
+            "/limits/memory",
+            "/requests/cpu",
+            "/requests/memory",
+        ]
+        .iter()
+        .any(|s| path.ends_with(s))
+}
+
+fn same_quantity(path: &str, a: &Value, b: &Value) -> bool {
+    let q = |v: &Value| {
+        let s = match v {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            _ => return None,
+        };
+        if path.ends_with("/cpu") {
+            cpu_millis(&s)
+        } else {
+            quantity(&s)
+        }
+    };
+    q(a).is_some() && q(a) == q(b)
+}
+
+/// The fields that the API server adds to a pod the driver sent (its defaults), with the values
+/// it adds; nothing else may be in a stored pod that the driver did not send.
+fn api_default(cfg: &KubeConfig, path: &str, v: &Value) -> bool {
+    match path {
+        "/spec/schedulerName" => v == &json!("default-scheduler"),
+        // Set by the scheduler after the pod was stored.
+        "/spec/nodeName" => v.is_string(),
+        "/spec/serviceAccount" => v == &json!(cfg.sandbox_service_account),
+        "/spec/priority" => v == &json!(0),
+        "/spec/preemptionPolicy" => v == &json!("PreemptLowerPriority"),
+        // The DefaultTolerationSeconds admission plugin: the not-ready and unreachable taints.
+        "/spec/tolerations" => v.as_array().is_some_and(|a| {
+            a.iter().all(|t| {
+                matches!(
+                    t.get("key").and_then(Value::as_str),
+                    Some("node.kubernetes.io/not-ready" | "node.kubernetes.io/unreachable")
+                ) && t.get("operator") == Some(&json!("Exists"))
+                    && t.get("effect") == Some(&json!("NoExecute"))
+                    && t.as_object().is_some_and(|o| {
+                        o.keys().all(|k| {
+                            matches!(
+                                k.as_str(),
+                                "key" | "operator" | "effect" | "tolerationSeconds"
+                            )
+                        })
+                    })
+            })
+        }),
+        _ if path.starts_with("/spec/containers/") || path.starts_with("/spec/initContainers/") => {
+            path.ends_with("/protocol") && path.contains("/ports/") && v == &json!("TCP")
+        }
+        _ => false,
+    }
+}
+
+/// Go's zero values: a field the driver sent with one of them may be missing from the stored
+/// object (the API server omits empty fields).
+fn zero(v: &Value) -> bool {
+    match v {
+        Value::Bool(b) => !b,
+        Value::Number(n) => n.as_i64() == Some(0),
+        Value::String(s) => s.is_empty(),
+        Value::Array(a) => a.is_empty(),
+        Value::Object(o) => o.is_empty(),
+        Value::Null => true,
+    }
+}
+
+/// Compares what the API server stored (`got`) with what the driver sent, exhaustively: every
+/// key of `got` must be one the driver sent (or an [`api_default`]), every value the driver sent
+/// must be equal (quantities by value), and a sent key may be missing only with a zero value.
+/// `Err` names the first path that differs.
+fn compare(cfg: &KubeConfig, path: &str, sent: &Value, got: &Value) -> Result<(), String> {
+    match (sent, got) {
+        (Value::Object(a), Value::Object(b)) => {
+            for (k, gv) in b {
+                let p = format!("{path}/{k}");
+                match a.get(k) {
+                    Some(sv) => compare(cfg, &p, sv, gv)?,
+                    None if api_default(cfg, &p, gv) => {}
+                    None => return Err(p),
+                }
+            }
+            for (k, sv) in a {
+                if !b.contains_key(k) && !zero(sv) {
+                    return Err(format!("{path}/{k}"));
+                }
+            }
+            Ok(())
+        }
+        (Value::Array(a), Value::Array(b)) => {
+            if a.len() != b.len() {
+                return Err(path.to_owned());
+            }
+            for (i, (x, y)) in a.iter().zip(b).enumerate() {
+                compare(cfg, &format!("{path}/{i}"), x, y)?;
+            }
+            Ok(())
+        }
+        _ if is_quantity(path) => {
+            if same_quantity(path, sent, got) {
+                Ok(())
+            } else {
+                Err(path.to_owned())
+            }
+        }
+        _ if sent == got => Ok(()),
+        _ => Err(path.to_owned()),
+    }
+}
+
+/// Reads the pod back as the API server stored it (`pod`) and checks it against the pod the
+/// driver made for the record (`sent`): the whole spec exhaustively ([`compare`]: every key of
+/// the stored spec must be one the driver sent or an API server default, and every value equal),
+/// the labels exactly and no annotation (gVisor reads pod annotations). The server runs it after
+/// each create and before it gives a pod its launch data (backlog S-89). `Err` names the first
+/// setting that differs.
+pub(crate) fn verify(cfg: &KubeConfig, sent: &Value, pod: &Value) -> Result<(), String> {
     let spec = pod.get("spec").ok_or("no spec")?;
-    let s = |p: &str| spec.pointer(p);
-    let is = |p: &str, want: &Value| s(p) == Some(want);
-    let not_true = |p: &str| s(p).and_then(Value::as_bool) != Some(true);
-    // The same as sent: absent when the driver sent none.
-    let same = |p: &str| spec.pointer(p) == sent.pointer(&format!("/spec{p}"));
-    if !is("/runtimeClassName", &json!(cfg.runtime_class)) {
-        return Err("runtimeClassName".into());
+    let want = sent.get("spec").ok_or("no spec sent")?;
+    compare(cfg, "/spec", want, spec)?;
+    if pod.pointer("/metadata/labels") != sent.pointer("/metadata/labels") {
+        return Err("labels".into());
     }
-    for p in [
-        "/dnsPolicy",
-        "/dnsConfig",
-        "/hostAliases",
-        "/activeDeadlineSeconds",
-        "/nodeSelector",
-        "/nodeName",
-        "/enableServiceLinks",
-        "/terminationGracePeriodSeconds",
-    ] {
-        if !same(p) {
-            return Err(p[1..].to_owned());
-        }
-    }
-    for p in ["/serviceAccountName", "/serviceAccount"] {
-        if s(p).is_some_and(|v| v != &json!("default")) {
-            return Err(p[1..].to_owned());
-        }
-    }
-    if let Some(want) = sent.pointer("/metadata/labels").and_then(Value::as_object) {
-        let got = pod.pointer("/metadata/labels").and_then(Value::as_object);
-        if want
-            .iter()
-            .any(|(k, v)| got.and_then(|g| g.get(k)) != Some(v))
-        {
-            return Err("labels".into());
-        }
-    }
-    if !is("/automountServiceAccountToken", &json!(false)) {
-        return Err("automountServiceAccountToken".into());
-    }
-    for p in [
-        "/hostNetwork",
-        "/hostPID",
-        "/hostIPC",
-        "/shareProcessNamespace",
-    ] {
-        if !not_true(p) {
-            return Err(p[1..].to_owned());
-        }
-    }
-    if !is("/restartPolicy", &json!("Never")) {
-        return Err("restartPolicy".into());
-    }
-    if !is("/securityContext/runAsNonRoot", &json!(true))
-        || !is("/securityContext/runAsUser", &json!(SANDBOX_UID))
-    {
-        return Err("the pod's securityContext".into());
-    }
-    if spec
-        .get("initContainers")
-        .and_then(Value::as_array)
+    if pod
+        .pointer("/metadata/annotations")
+        .and_then(Value::as_object)
         .is_some_and(|a| !a.is_empty())
+    {
+        return Err("annotations".into());
+    }
+    if pod.pointer("/metadata/name") != sent.pointer("/metadata/name") {
+        return Err("name".into());
+    }
+    // Belt and braces: the settings of rule 1 by name (the comparison already holds them).
+    let s = |p: &str| spec.pointer(p);
+    if s("/runtimeClassName") != Some(&json!(cfg.runtime_class))
+        || s("/automountServiceAccountToken") != Some(&json!(false))
+        || s("/serviceAccountName") != Some(&json!(cfg.sandbox_service_account))
         || spec
             .get("ephemeralContainers")
             .and_then(Value::as_array)
             .is_some_and(|a| !a.is_empty())
     {
-        return Err("other containers".into());
-    }
-    let containers = spec
-        .get("containers")
-        .and_then(Value::as_array)
-        .ok_or("no containers")?;
-    let [c] = containers.as_slice() else {
-        return Err("not exactly one container".into());
-    };
-    let c_is = |p: &str, want: &Value| c.pointer(p) == Some(want);
-    if !c_is("/image", &json!(rec.image)) {
-        return Err("image".into());
-    }
-    // The container as sent: environment (no other Secret, no injected value), arguments, no
-    // command or envFrom, the probe's command, the user and seccomp profile.
-    let c_same = |p: &str| c.pointer(p) == sent.pointer(&format!("/spec/containers/0{p}"));
-    for p in [
-        "/env",
-        "/envFrom",
-        "/args",
-        "/command",
-        "/readinessProbe/exec",
-        "/livenessProbe",
-        "/startupProbe",
-        "/lifecycle",
-        "/securityContext/runAsUser",
-        "/securityContext/runAsGroup",
-        "/securityContext/runAsNonRoot",
-        "/securityContext/seccompProfile",
-        "/securityContext/appArmorProfile",
-        "/securityContext/seLinuxOptions",
-    ] {
-        if !c_same(p) {
-            return Err(format!("the container's {}", &p[1..]));
-        }
-    }
-    // Booleans that the API server omits when false.
-    for p in ["/stdin", "/stdinOnce", "/tty"] {
-        if c.pointer(p).and_then(Value::as_bool) == Some(true) {
-            return Err(format!("the container's {}", &p[1..]));
-        }
-    }
-    let ports: Vec<(Option<&Value>, bool)> = c
-        .get("ports")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .map(|p| {
-                    (
-                        p.get("containerPort"),
-                        p.get("hostPort")
-                            .and_then(Value::as_i64)
-                            .is_some_and(|h| h != 0)
-                            || p.get("hostIP").is_some(),
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let want_ports: Vec<Option<&Value>> = sent
-        .pointer("/spec/containers/0/ports")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().map(|p| p.get("containerPort")).collect())
-        .unwrap_or_default();
-    if ports.iter().any(|(_, host)| *host)
-        || ports.iter().map(|(p, _)| *p).collect::<Vec<_>>() != want_ports
-    {
-        return Err("the container's ports".into());
-    }
-    if !c_is("/securityContext/allowPrivilegeEscalation", &json!(false))
-        || !c_is("/securityContext/readOnlyRootFilesystem", &json!(true))
-        || c.pointer("/securityContext/privileged")
-            .and_then(Value::as_bool)
-            == Some(true)
-        || !c_is("/securityContext/capabilities/drop", &json!(["ALL"]))
-        || c.pointer("/securityContext/capabilities/add")
-            .and_then(Value::as_array)
-            .is_some_and(|a| !a.is_empty())
-    {
-        return Err("the container's securityContext".into());
-    }
-    for kind in ["limits", "requests"] {
-        let cpu = c
-            .pointer(&format!("/resources/{kind}/cpu"))
-            .and_then(Value::as_str)
-            .and_then(cpu_millis);
-        let mem = c
-            .pointer(&format!("/resources/{kind}/memory"))
-            .and_then(Value::as_str)
-            .and_then(quantity);
-        if cpu != Some(u128::from(rec.limits.cpu_millis))
-            || mem != Some(u128::from(rec.limits.memory_bytes))
-        {
-            return Err(format!("resources.{kind}"));
-        }
-    }
-    let volumes = spec
-        .get("volumes")
-        .and_then(Value::as_array)
-        .ok_or("no volumes")?;
-    if volumes.len() != 2 {
-        return Err("volumes".into());
-    }
-    for v in volumes {
-        match v.get("name").and_then(Value::as_str) {
-            Some("tmp") => {
-                let size = v
-                    .pointer("/emptyDir/sizeLimit")
-                    .and_then(Value::as_str)
-                    .and_then(quantity);
-                if v.pointer("/emptyDir/medium") != Some(&json!("Memory"))
-                    || size != Some(u128::from(rec.limits.disk_bytes))
-                    || v.as_object().is_some_and(|o| o.len() != 2)
-                {
-                    return Err("the tmp volume".into());
-                }
-            }
-            Some("token") => {
-                let want = sent
-                    .pointer("/spec/volumes")
-                    .and_then(Value::as_array)
-                    .and_then(|a| a.iter().find(|w| w.get("name") == v.get("name")));
-                if v.pointer("/secret/secretName") != Some(&json!(object_name(rec.instance)))
-                    || v.pointer("/secret/items") != want.and_then(|w| w.pointer("/secret/items"))
-                    || v.as_object().is_some_and(|o| o.len() != 2)
-                {
-                    return Err("the token volume".into());
-                }
-            }
-            _ => return Err("an unknown volume".into()),
-        }
-    }
-    let mounts = c
-        .get("volumeMounts")
-        .and_then(Value::as_array)
-        .ok_or("no volume mounts")?;
-    let (mount, _) = token_mount();
-    let ok = mounts.len() == 2
-        && mounts.iter().all(|m| {
-            match (
-                m.get("name").and_then(Value::as_str),
-                m.get("mountPath").and_then(Value::as_str),
-            ) {
-                (Some("tmp"), Some("/tmp")) => true,
-                (Some("token"), Some(p)) => {
-                    p == mount && m.get("readOnly").and_then(Value::as_bool) == Some(true)
-                }
-                _ => false,
-            }
-        });
-    if !ok {
-        return Err("volume mounts".into());
+        return Err("the sandbox settings".into());
     }
     Ok(())
 }
@@ -879,43 +819,205 @@ mod tests {
         let id = InstanceId::new();
         assert!(object_name(id).len() <= 63);
         assert!(pod_name(id, u32::MAX).len() <= 63);
-        let tag = uuid::Uuid::now_v7().simple().to_string();
-        assert!(key_name(id, &tag).len() <= 253);
     }
 
-    /// The Secret is owned by its key and the key by the record, so the garbage collector removes
-    /// the Secret with its key (the driver may not delete a Secret: Kimi run 15, I6-1 finding 1).
+    fn record() -> Record {
+        let mut rec: Record = serde_json::from_value(json!({
+            "v": 1, "instance": InstanceId::new(),
+            "identity": { "tenant": uuid::Uuid::now_v7(), "app": uuid::Uuid::now_v7(),
+                "deployment": uuid::Uuid::now_v7(), "environment": "live" },
+            "kind": { "kind": "service", "port": 8080, "health": null, "idle_timeout_ms": null },
+            "routes": [], "limits": { "cpu_millis": 250, "memory_bytes": 67108864, "disk_bytes": 1048576 },
+            "image": "r/ruum/t/a@sha256:00", "command": ["serve"],
+            "env": [{ "name": "MODE", "value": "x" }, { "name": "API_KEY" }],
+            "started_at_ms": 1, "state": { "state": "starting" }, "run": 1,
+            "run_started_ms": 1, "last_touch_ms": 1,
+        }))
+        .unwrap();
+        rec.run = 1;
+        rec
+    }
+
+    fn config() -> KubeConfig {
+        let mut c = KubeConfig::new("https://k", "ruum-apps", "gvisor");
+        c.supervisor_image = "r/ruum-supervisor@sha256:11".into();
+        c
+    }
+
+    /// The exhaustive read-back (S-89): API server defaults pass; any other added or changed key
+    /// fails, also deep in a container, a volume or a mount.
     #[test]
-    fn the_secret_is_owned_by_its_key_and_the_key_by_the_record() {
-        let cfg = KubeConfig::new("https://k", "ruum-apps", "gvisor");
-        let id = InstanceId::new();
-        let identity = WorkloadIdentity {
-            tenant: ruum_core::ids::TenantId::new(),
-            app: ruum_core::ids::NodeId::new(),
-            deployment: uuid::Uuid::now_v7(),
-            environment: ruum_core::runtime::Environment::Live,
-        };
-        let key = key_body(&cfg, &identity, id, "t1", "uid-of-the-record");
-        assert_eq!(key["metadata"]["labels"][LABEL_ROLE], json!(ROLE_KEY));
-        assert_eq!(
-            key["metadata"]["ownerReferences"],
-            json!([{ "apiVersion": "v1", "kind": "ConfigMap", "name": object_name(id),
-                "uid": "uid-of-the-record" }])
+    fn the_read_back_is_exhaustive() {
+        let cfg = config();
+        let rec = record();
+        let sent = pod_body(&cfg, &rec, &[], "http://10.0.0.5:8091");
+        assert_eq!(verify(&cfg, &sent, &sent), Ok(()));
+        // The defaults of a real API server, and quantities in canonical form.
+        let mut stored = sent.clone();
+        stored["spec"]["schedulerName"] = json!("default-scheduler");
+        stored["spec"]["serviceAccount"] = json!("ruum-sandbox");
+        stored["spec"]["priority"] = json!(0);
+        stored["spec"]["nodeName"] = json!("node-1");
+        stored["spec"]["tolerations"] = json!([{ "key": "node.kubernetes.io/not-ready",
+            "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300 }]);
+        stored["spec"]["containers"][0]["ports"][0]["protocol"] = json!("TCP");
+        stored["spec"]["containers"][0]["resources"]["limits"]["memory"] = json!("64Mi");
+        stored["spec"]["volumes"][0]["emptyDir"]["sizeLimit"] = json!("1Mi");
+        stored["spec"]["containers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("stdin");
+        assert_eq!(verify(&cfg, &sent, &stored), Ok(()));
+        // Each of these must be refused.
+        let cases: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
+            (
+                "a capability",
+                Box::new(|p| {
+                    p["spec"]["containers"][0]["securityContext"]["capabilities"]["add"] =
+                        json!(["NET_RAW"])
+                }),
+            ),
+            (
+                "a writable supervisor",
+                Box::new(|p| {
+                    p["spec"]["containers"][0]["volumeMounts"][2]["readOnly"] = json!(false)
+                }),
+            ),
+            (
+                "a mount option",
+                Box::new(|p| p["spec"]["containers"][0]["volumeMounts"][1]["subPath"] = json!("x")),
+            ),
+            (
+                "another init image",
+                Box::new(|p| p["spec"]["initContainers"][0]["image"] = json!("evil@sha256:22")),
+            ),
+            (
+                "another audience",
+                Box::new(|p| {
+                    p["spec"]["volumes"][3]["projected"]["sources"][0]["serviceAccountToken"]["audience"] =
+                        json!("kubernetes")
+                }),
+            ),
+            (
+                "a longer token",
+                Box::new(|p| {
+                    p["spec"]["volumes"][3]["projected"]["sources"][0]["serviceAccountToken"]["expirationSeconds"] =
+                        json!(86400)
+                }),
+            ),
+            (
+                "a workingDir",
+                Box::new(|p| p["spec"]["containers"][0]["workingDir"] = json!("/etc")),
+            ),
+            (
+                "a lifecycle hook",
+                Box::new(|p| {
+                    p["spec"]["containers"][0]["lifecycle"] =
+                        json!({ "preStop": { "exec": { "command": ["sh"] } } })
+                }),
+            ),
+            (
+                "another termination path",
+                Box::new(|p| {
+                    p["spec"]["containers"][0]["terminationMessagePath"] = json!("/etc/passwd")
+                }),
+            ),
+            (
+                "a fallback policy",
+                Box::new(|p| {
+                    p["spec"]["containers"][0]["terminationMessagePolicy"] =
+                        json!("FallbackToLogsOnError")
+                }),
+            ),
+            (
+                "another command",
+                Box::new(|p| {
+                    p["spec"]["containers"][0]["command"][3] = json!("http://10.9.9.9:8091")
+                }),
+            ),
+            (
+                "a host volume",
+                Box::new(|p| {
+                    p["spec"]["volumes"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({ "name": "h", "hostPath": { "path": "/" } }))
+                }),
+            ),
+            (
+                "a toleration",
+                Box::new(
+                    |p| p["spec"]["tolerations"] = json!([{ "key": "node-role.kubernetes.io/control-plane", "operator": "Exists", "effect": "NoSchedule" }]),
+                ),
+            ),
+            (
+                "a priority class",
+                Box::new(|p| p["spec"]["priorityClassName"] = json!("system-node-critical")),
+            ),
+            (
+                "an annotation",
+                Box::new(|p| {
+                    p["metadata"]["annotations"] = json!({ "dev.gvisor.internal.nvproxy": "true" })
+                }),
+            ),
+            (
+                "another label",
+                Box::new(|p| p["metadata"]["labels"]["app"] = json!("ruum-gateway")),
+            ),
+            (
+                "an ephemeral container",
+                Box::new(|p| p["spec"]["ephemeralContainers"] = json!([{ "name": "x" }])),
+            ),
+            (
+                "a host port",
+                Box::new(|p| p["spec"]["containers"][0]["ports"][0]["hostPort"] = json!(80)),
+            ),
+            (
+                "an env value from elsewhere",
+                Box::new(
+                    |p| p["spec"]["containers"][0]["env"][0] = json!({ "name": "MODE", "valueFrom": { "secretKeyRef": { "name": "x", "key": "y" } } }),
+                ),
+            ),
+        ];
+        for (what, change) in cases {
+            let mut p = stored.clone();
+            change(&mut p);
+            assert!(verify(&cfg, &sent, &p).is_err(), "{what} was accepted");
+        }
+    }
+
+    /// The pod holds no secret value, takes values from no Secret, and the digest of the fixed
+    /// fields changes with each of them.
+    #[test]
+    fn the_pod_holds_no_secret_and_the_digest_covers_the_fixed_fields() {
+        let cfg = config();
+        let rec = record();
+        let pod = pod_body(&cfg, &rec, &[], "http://10.0.0.5:8091");
+        let text = pod.to_string();
+        assert!(
+            !text.contains("secretKeyRef") && !text.contains("\"secret\""),
+            "{text}"
         );
-        assert!(key.get("data").is_none());
-        let env = vec![("env.X".to_owned(), "v".to_owned())];
-        let secret = secret_body(&cfg, &identity, id, "tok", &env, (&key_name(id, "t1"), "k"));
-        assert_eq!(secret["type"], json!("Opaque"));
-        assert_eq!(secret["metadata"]["name"], json!(object_name(id)));
-        assert_eq!(
-            secret["metadata"]["ownerReferences"],
-            json!([{ "apiVersion": "v1", "kind": "ConfigMap", "name": key_name(id, "t1"),
-                "uid": "k" }])
+        assert!(
+            !text.contains("API_KEY"),
+            "a secret name in the pod: {text}"
         );
-        assert_eq!(
-            secret["stringData"],
-            json!({ "token": "tok", "env.X": "v" })
-        );
-        assert!(secret["metadata"].get("annotations").is_none());
+        let d = fixed_digest(&rec);
+        for change in [
+            |r: &mut Record| r.image = "r/ruum/t/a@sha256:ff".into(),
+            |r: &mut Record| r.command = vec!["other".into()],
+            |r: &mut Record| r.env[0].value = Some("y".into()),
+            |r: &mut Record| r.limits.memory_bytes += 1,
+            |r: &mut Record| r.routes = vec![Route::EgressProxy],
+        ] {
+            let mut r = rec.clone();
+            change(&mut r);
+            assert_ne!(fixed_digest(&r), d);
+        }
+        let mut r = rec.clone();
+        r.state = InstanceState::Running;
+        r.run = 7;
+        r.last_touch_ms = 99;
+        assert_eq!(fixed_digest(&r), d, "a state change is not a fixed field");
     }
 }

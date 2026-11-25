@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "crates/ruum-runtime/supervisor"]
 exclude = ["third_party/sqlx-sqlite-stub"]
 
 [workspace.package]
@@ -32,6 +32,8 @@ ruum-dbengine = { path = "crates/ruum-dbengine" }
 ruum-egress = { path = "crates/ruum-egress" }
 # The runtime drivers (R-2a Docker, I6-1 Kubernetes); ruum-server wires the Kubernetes one.
 ruum-runtime = { path = "crates/ruum-runtime" }
+# The sandbox supervisor (backlog I6-20): its launch data types are shared with the drivers.
+ruum-supervisor = { path = "crates/ruum-runtime/supervisor" }
 
 # Async runtime and HTTP
 tokio = { version = "1.54", features = ["full"] }
@@ -127,6 +129,11 @@ bollard = { version = "0.21.1", default-features = false, features = ["http", "p
 opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic", "logs", "metrics", "trace"] }
 prost = "0.14.4"
 tonic = { version = "0.14.6", default-features = false, features = ["transport", "router", "codegen"] }
+
+# The sandbox supervisor (backlog I6-20; decision 0006 I point 6): safe wrappers of the process
+# calls a PID 1 needs (prctl PR_SET_DUMPABLE, setrlimit RLIMIT_NPROC, waitpid, kill, sigwait), so
+# the workspace keeps `unsafe_code = "forbid"`. Already in the tree (0.31.3 through other crates).
+nix = { version = "0.31.3", default-features = false, features = ["process", "signal", "resource"] }
 
 # Tests
 proptest = "1.12.0"

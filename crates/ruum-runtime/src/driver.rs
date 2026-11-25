@@ -2,7 +2,7 @@
 
 use crate::config::{DockerConfig, RuntimeKind};
 use crate::egress::{EgressNetwork, EgressRegistry};
-use crate::logs::{Redactors, Ring};
+use crate::logs::{LogBudget, Redactors, Ring};
 use async_trait::async_trait;
 use bollard::Docker;
 use bollard::container::LogOutput;
@@ -24,6 +24,7 @@ use ruum_core::runtime::{
     RuntimeError, RuntimeUsage, RuntimeUsageSink, SecretValue, TOKEN_FILE, TOKEN_FILE_ENV,
     WorkloadIdentity, WorkloadKind, WorkloadSpec,
 };
+use ruum_supervisor::protocol::{LAUNCH_VERSION, Launch, SUPERVISOR_PATH};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -128,6 +129,9 @@ struct Instance {
     started_at: OffsetDateTime,
     container: Option<String>,
     token_dir: Option<PathBuf>,
+    /// The launch data for the sandbox supervisor (backlog I6-20), given on standard input at
+    /// each start; `None` without a supervisor.
+    launch: Option<Launch>,
     op: tokio::sync::Mutex<()>,
     st: Mutex<St>,
 }
@@ -161,6 +165,8 @@ impl St {
     fn mark_ended(&mut self, has_container: bool) {
         if self.ended.is_none() && self.is_ended(has_container) {
             self.ended = Some(Instant::now());
+            // Its logs leave the live budget and count to the ended cap (S-91).
+            self.ring.leave_budget();
         }
     }
 }
@@ -211,6 +217,8 @@ struct Inner {
     egress: Arc<dyn EgressRegistry>,
     http: reqwest::Client,
     instances: Mutex<HashMap<InstanceId, Arc<Instance>>>,
+    /// The byte budget of the live instances' log rings (backlog S-91).
+    live: Arc<LogBudget>,
     networks: tokio::sync::Mutex<HashMap<String, NetState>>,
     /// Networks whose egress unregistration failed: kept (so their subnet stays taken and no
     /// new network gets an overlapping one) and tried again at the next network creation.
@@ -321,6 +329,14 @@ impl DockerDriver {
                 );
             }
         }
+        if let Some(p) = &cfg.supervisor {
+            let ok = std::fs::metadata(p).is_ok_and(|m| m.is_file());
+            if !ok {
+                return Err(RuntimeError::Internal {
+                    reason: format!("the supervisor binary {} is not a file", p.display()),
+                });
+            }
+        }
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -335,6 +351,7 @@ impl DockerDriver {
             .map_err(|e| RuntimeError::Internal {
                 reason: format!("the registry client: {e}"),
             })?;
+        let live = LogBudget::new(cfg.max_live_log_bytes, cfg.max_tenant_live_log_bytes);
         Ok(Self {
             inner: Arc::new(Inner {
                 docker,
@@ -343,6 +360,7 @@ impl DockerDriver {
                 egress,
                 http,
                 instances: Mutex::new(HashMap::new()),
+                live,
                 networks: tokio::sync::Mutex::new(HashMap::new()),
                 stale: Mutex::new(Vec::new()),
             }),
@@ -527,14 +545,21 @@ impl Inner {
 
     /// Refuses an image that declares volumes: Docker would give each `VOLUME` path an
     /// anonymous, writable volume on the engine's disk, with no size limit, also under a
-    /// read-only root. [`Inner::verify`] checks the container's mounts too.
-    async fn check_image(&self, reference: &str) -> Result<(), RuntimeError> {
+    /// read-only root. [`Inner::verify`] checks the container's mounts too. Returns the image's
+    /// `Entrypoint` and `Cmd` (the supervisor runs them, I6-20).
+    async fn check_image(
+        &self,
+        reference: &str,
+    ) -> Result<(Vec<String>, Vec<String>), RuntimeError> {
         let image = self
             .docker
             .inspect_image(reference)
             .await
             .map_err(|e| self.docker_err("inspecting the image", &e, &[]))?;
-        let volumes = image.config.and_then(|c| c.volumes).unwrap_or_default();
+        let config = image.config.unwrap_or_default();
+        let entrypoint = config.entrypoint.clone().unwrap_or_default();
+        let cmd = config.cmd.clone().unwrap_or_default();
+        let volumes = config.volumes.unwrap_or_default();
         if !volumes.is_empty() {
             return Err(RuntimeError::UnsupportedImage {
                 reason: format!(
@@ -543,7 +568,7 @@ impl Inner {
                 ),
             });
         }
-        Ok(())
+        Ok((entrypoint, cmd))
     }
 
     /// Joins the instance to the network of its app and environment, creating it (and attaching
@@ -899,6 +924,29 @@ impl Inner {
         f.sync_all()
     }
 
+    /// The binds of a sandbox: the token file, and with a supervisor its binary (both read-only).
+    fn binds(&self, token_file: &std::path::Path) -> Vec<String> {
+        let mut b = vec![format!("{}:{TOKEN_FILE}:ro", token_file.display())];
+        if let Some(sup) = &self.cfg.supervisor {
+            b.push(format!("{}:{SUPERVISOR_PATH}:ro", sup.display()));
+        }
+        b
+    }
+
+    /// The entrypoint with a supervisor: it reads the launch data on standard input.
+    fn supervisor_entrypoint() -> Vec<String> {
+        [
+            SUPERVISOR_PATH,
+            "run",
+            "--launch-stdin",
+            "--token-file",
+            TOKEN_FILE,
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect()
+    }
+
     fn container_body(
         &self,
         spec: &WorkloadSpec,
@@ -908,12 +956,15 @@ impl Inner {
         token_file: &std::path::Path,
         id: InstanceId,
     ) -> ContainerCreateBody {
+        let supervised = self.cfg.supervisor.is_some();
+        // With a supervisor the secret values come on standard input, never in Config.Env.
         let mut env: Vec<String> = spec
             .env
             .iter()
-            .map(|v| match &v.value {
-                EnvValue::Plain(p) => format!("{}={p}", v.name),
-                EnvValue::Secret(s) => format!("{}={}", v.name, s.expose()),
+            .filter_map(|v| match &v.value {
+                EnvValue::Plain(p) => Some(format!("{}={p}", v.name)),
+                EnvValue::Secret(_) if supervised => None,
+                EnvValue::Secret(s) => Some(format!("{}={}", v.name, s.expose())),
             })
             .collect();
         env.push(format!("{TOKEN_FILE_ENV}={TOKEN_FILE}"));
@@ -977,7 +1028,7 @@ impl Inner {
                 "/tmp".to_owned(),
                 format!("rw,noexec,nosuid,nodev,size={}", spec.limits.disk_bytes),
             )])),
-            binds: Some(vec![format!("{}:{TOKEN_FILE}:ro", token_file.display())]),
+            binds: Some(self.binds(token_file)),
             network_mode: Some(network.to_owned()),
             extra_hosts: if hosts.is_empty() {
                 None
@@ -994,13 +1045,18 @@ impl Inner {
             runtime: Some(self.cfg.runtime.docker_name().to_owned()),
             ..Default::default()
         };
+        let (entrypoint, cmd) = if supervised {
+            // The supervisor runs the app's command from the launch data.
+            (Some(Self::supervisor_entrypoint()), None)
+        } else if spec.command.is_empty() {
+            (None, None)
+        } else {
+            (None, Some(spec.command.clone()))
+        };
         ContainerCreateBody {
             image: Some(image.to_owned()),
-            cmd: if spec.command.is_empty() {
-                None
-            } else {
-                Some(spec.command.clone())
-            },
+            entrypoint,
+            cmd,
             env: Some(env),
             user: Some(SANDBOX_USER.to_owned()),
             labels: Some(labels),
@@ -1008,8 +1064,10 @@ impl Inner {
             stop_timeout: Some(self.cfg.stop_timeout.as_secs() as i64),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
+            attach_stdin: Some(supervised),
             tty: Some(false),
-            open_stdin: Some(false),
+            open_stdin: Some(supervised),
+            stdin_once: Some(supervised),
             network_disabled: Some(false),
             host_config: Some(host),
             ..Default::default()
@@ -1087,19 +1145,45 @@ impl Inner {
         );
         want(h.mounts.as_ref().is_none_or(|m| m.is_empty()), "no mounts");
         want(
-            h.binds.as_deref() == Some(&[format!("{}:{TOKEN_FILE}:ro", token_file.display())][..]),
-            "only the token file bound",
+            h.binds.as_deref() == Some(&self.binds(token_file)[..]),
+            "only the token file (and the supervisor) bound",
         );
-        // The mounts the engine made: the token bind only. An anonymous volume (an image
-        // `VOLUME`) shows only here, not in `HostConfig.Mounts` or `Binds`; tmpfs is not here.
+        // The mounts the engine made: the token bind (and the supervisor's) only. An anonymous
+        // volume (an image `VOLUME`) shows only here, not in `HostConfig.Mounts` or `Binds`;
+        // tmpfs is not here.
+        let supervised = self.cfg.supervisor.is_some();
+        let mut dests = vec![TOKEN_FILE];
+        if supervised {
+            dests.push(SUPERVISOR_PATH);
+        }
         let mounts = c.mounts.as_deref().unwrap_or_default();
-        let mounts_ok = mounts.len() == 1
+        let mounts_ok = mounts.len() == dests.len()
             && mounts.iter().all(|m| {
                 m.typ.as_deref() == Some("bind")
-                    && m.destination.as_deref() == Some(TOKEN_FILE)
+                    && m.destination.as_deref().is_some_and(|d| dests.contains(&d))
                     && m.rw == Some(false)
             });
-        want(mounts_ok, "only the token file mounted (no volume)");
+        want(
+            mounts_ok,
+            "only the token file (and the supervisor) mounted (no volume)",
+        );
+        if supervised {
+            want(
+                cfg.entrypoint.as_deref() == Some(&Self::supervisor_entrypoint()[..]),
+                "the supervisor as the entrypoint",
+            );
+            want(
+                cfg.open_stdin == Some(true) && cfg.stdin_once == Some(true),
+                "standard input open once (the launch data)",
+            );
+            // No secret value in Config.Env.
+            let env = cfg.env.clone().unwrap_or_default();
+            let leaked = spec.env.iter().any(|v| match &v.value {
+                EnvValue::Secret(s) => env.contains(&format!("{}={}", v.name, s.expose())),
+                EnvValue::Plain(_) => false,
+            });
+            want(!leaked, "no secret value in the container's environment");
+        }
         want(h.pids_limit == Some(self.cfg.pids_limit), "pids limit");
         want(h.memory_swap == h.memory, "swap equals memory");
         want(
@@ -1174,6 +1258,7 @@ impl Inner {
         let secrets = inst.secrets();
         let opts = AttachContainerOptionsBuilder::new()
             .stream(true)
+            .stdin(inst.launch.is_some())
             .stdout(true)
             .stderr(true)
             .logs(false)
@@ -1183,6 +1268,7 @@ impl Inner {
             .attach_container(&name, Some(opts))
             .await
             .map_err(|e| self.docker_err("attaching to the container", &e, &secrets))?;
+        let mut input = attached.input;
         let redactors = Arc::new(Mutex::new(Redactors::new(
             &secrets,
             self.cfg.max_line_bytes,
@@ -1191,6 +1277,29 @@ impl Inner {
         if let Err(e) = self.docker.start_container(&name, None).await {
             pump.abort();
             return Err(self.docker_err("starting the container", &e, &secrets));
+        }
+        // The launch data on standard input, then its end (StdinOnce closes the container's
+        // standard input): the supervisor reads it before the app starts (I6-20).
+        if let Some(launch) = &inst.launch {
+            use tokio::io::AsyncWriteExt;
+            let data = serde_json::to_vec(launch).map_err(|_| RuntimeError::Internal {
+                reason: "the launch data does not serialize".to_owned(),
+            })?;
+            let sent = tokio::time::timeout(self.cfg.api_timeout, async {
+                input.write_all(&data).await?;
+                input.flush().await?;
+                input.shutdown().await
+            })
+            .await;
+            if !matches!(sent, Ok(Ok(()))) {
+                pump.abort();
+                self.kill(&name).await;
+                return Err(RuntimeError::Unavailable {
+                    reason: "the launch data did not reach the sandbox supervisor".to_owned(),
+                });
+            }
+        } else {
+            drop(input);
         }
         {
             let mut st = inst.lock();
@@ -1321,6 +1430,38 @@ impl Inner {
         }
         for id in evict {
             map.remove(&id);
+        }
+        self.shed_live(map);
+    }
+
+    /// Brings the live log budget back under its bound (S-91): the oldest lines of the tenant
+    /// with the most live log bytes go first, from its largest ring.
+    fn shed_live(&self, map: &HashMap<InstanceId, Arc<Instance>>) {
+        for _ in 0..map.len().max(1) {
+            let Some((excess, top)) = self.live.over_total() else {
+                return;
+            };
+            let largest = map
+                .values()
+                .filter(|i| i.identity.tenant == top)
+                .map(|i| {
+                    let st = i.lock();
+                    (
+                        if st.ring.counted() {
+                            st.ring.memory()
+                        } else {
+                            0
+                        },
+                        i.clone(),
+                    )
+                })
+                .max_by_key(|(b, _)| *b);
+            match largest {
+                Some((b, inst)) if b > 0 => {
+                    inst.lock().ring.shed(excess);
+                }
+                _ => return,
+            }
         }
     }
 
@@ -1696,7 +1837,8 @@ impl RuntimeDriver for DockerDriver {
             intent_at: Instant::now(),
             last_touch: Instant::now(),
             run_started: Instant::now(),
-            ring: Ring::new(inner.cfg.log_lines, MAX_LOG_BYTES, inner.cfg.max_line_bytes),
+            ring: Ring::new(inner.cfg.log_lines, MAX_LOG_BYTES, inner.cfg.max_line_bytes)
+                .with_budget(inner.live.clone(), spec.identity.tenant),
             base: base.clone(),
             tokens: VecDeque::from([token.clone()]),
             redactors: None,
@@ -1718,6 +1860,7 @@ impl RuntimeDriver for DockerDriver {
                     started_at: OffsetDateTime::now_utc(),
                     container: None,
                     token_dir: None,
+                    launch: None,
                     op: tokio::sync::Mutex::new(()),
                     st: Mutex::new(new_st(InstanceState::Running)),
                 });
@@ -1739,7 +1882,50 @@ impl RuntimeDriver for DockerDriver {
             digest
         );
         inner.ensure_image(&reference, &digest).await?;
-        inner.check_image(&reference).await?;
+        let (entrypoint, cmd) = inner.check_image(&reference).await?;
+        // The supervisor's launch data (I6-20): the command as the engine would run it, the
+        // secret values, and the previous values to redact.
+        let launch = match &inner.cfg.supervisor {
+            None => None,
+            Some(_) => {
+                let mut argv = entrypoint;
+                argv.extend(if spec.command.is_empty() {
+                    cmd
+                } else {
+                    spec.command.clone()
+                });
+                if argv.is_empty() {
+                    return Err(RuntimeError::UnsupportedImage {
+                        reason: "the image has no command and the spec gives none".to_owned(),
+                    });
+                }
+                let launch = Launch {
+                    v: LAUNCH_VERSION,
+                    argv,
+                    env: spec
+                        .env
+                        .iter()
+                        .filter_map(|v| match &v.value {
+                            EnvValue::Secret(s) => Some((v.name.clone(), s.expose().to_owned())),
+                            EnvValue::Plain(_) => None,
+                        })
+                        .collect(),
+                    redact: spec
+                        .previous_secrets
+                        .iter()
+                        .map(|s| s.expose().to_owned())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                    token: None,
+                    pids_limit: None,
+                    token_poll_secs: None,
+                };
+                launch
+                    .check()
+                    .map_err(|why| RuntimeError::invalid("spec", why))?;
+                Some(launch)
+            }
+        };
 
         let token_dir = inner.cfg.state_dir.join(id.0.simple().to_string());
         std::fs::DirBuilder::new()
@@ -1773,6 +1959,7 @@ impl RuntimeDriver for DockerDriver {
             started_at: OffsetDateTime::now_utc(),
             container: Some(name.clone()),
             token_dir: Some(token_dir),
+            launch,
             op: tokio::sync::Mutex::new(()),
             st: Mutex::new(new_st(InstanceState::Starting)),
         });
@@ -2048,6 +2235,7 @@ mod tests {
     use ruum_core::runtime::{Environment, MemoryUsage, ServiceSpec, StaticFile, StaticImage};
 
     fn offline(cfg: DockerConfig) -> DockerDriver {
+        let cfg_live = (cfg.max_live_log_bytes, cfg.max_tenant_live_log_bytes);
         let docker =
             Docker::connect_with_http("http://127.0.0.1:9", 1, bollard::API_DEFAULT_VERSION)
                 .expect("a client (it never connects here)");
@@ -2059,6 +2247,7 @@ mod tests {
                 egress: Arc::new(NoEgress),
                 http: reqwest::Client::new(),
                 instances: Mutex::new(HashMap::new()),
+                live: LogBudget::new(cfg_live.0, cfg_live.1),
                 networks: tokio::sync::Mutex::new(HashMap::new()),
                 stale: Mutex::new(Vec::new()),
             }),
@@ -2314,6 +2503,45 @@ mod tests {
         d.start(spec(c)).await.expect("room from A");
         assert!(gone(d.status(a, a_ended).await), "A keeps the most");
         assert!(!gone(d.status(b, b_ended).await), "B keeps one");
+    }
+
+    /// S-91: the live rings of many noisy instances stay within the live budget and each
+    /// tenant's share; a quiet tenant keeps its lines.
+    #[tokio::test]
+    async fn live_logs_stay_within_the_budget() {
+        let mut cfg = config();
+        cfg.max_live_log_bytes = 2 * 1024 * 1024;
+        cfg.max_tenant_live_log_bytes = 512 * 1024;
+        let d = offline(cfg);
+        let (noisy, quiet) = (TenantId::new(), TenantId::new());
+        let q = d.start(spec(quiet)).await.expect("start").id;
+        fill(&d, q, 100);
+        let quiet_lines = d.logs(quiet, q, None, 10_000).await.unwrap().len();
+        let mut ids = Vec::new();
+        for _ in 0..32 {
+            ids.push(d.start(spec(noisy)).await.expect("start").id);
+        }
+        for _ in 0..4 {
+            for id in &ids {
+                fill(&d, *id, 64);
+            }
+        }
+        let live = &d.inner.live;
+        assert!(
+            live.used(Some(noisy)) <= 512 * 1024,
+            "{}",
+            live.used(Some(noisy))
+        );
+        assert!(live.used(None) <= 2 * 1024 * 1024 + 512 * 1024);
+        assert!(
+            d.kept_log_bytes() <= 2 * 1024 * 1024 + 512 * 1024,
+            "{}",
+            d.kept_log_bytes()
+        );
+        assert_eq!(
+            d.logs(quiet, q, None, 10_000).await.unwrap().len(),
+            quiet_lines
+        );
     }
 
     #[tokio::test]

@@ -227,15 +227,22 @@ through Kubernetes objects and files that the platform does not control.
 
 **The design.** A small static program, `ruum-supervisor`, is the first process of every app
 sandbox (PID 1 on Kubernetes; the child of Docker's `init` on the Docker driver). It gets the
-run's secret values through a per-run channel that is not a Kubernetes Secret, starts the app as
-its child, and redacts the app's standard output and standard error **before** they reach the
-container runtime. The app never holds the container's own output streams.
+run's secret values once, through a per-run channel that is not a Kubernetes Secret, starts the
+app as its child, and redacts the app's standard output and standard error **before** they reach
+the container runtime. The app never holds the container's own output streams.
 
-1. **The binary.** Rust, built for `*-unknown-linux-musl` (static, no libc in the image needed),
-   std and `libc` only, no async runtime, no TLS. Source: `crates/ruum-runtime/supervisor`
-   (package `ruum-supervisor`). The redactor is the one of `ruum-core`
-   (`runtime::redact::LineRedactor`, compiled into the supervisor from the same file, not a copy),
-   so the sandbox and the driver redact with the same code.
+What redaction protects: an honest app that prints a value by mistake (a stack trace, a debug
+line). A compromised app holds its own values and can send them out through the egress proxy
+anyway (rule 7 "honestly"), so the supervisor's defenses against a hostile app (below) keep the
+node's files clean and stop cross-tenant harm; they do not make a hostile app's own values
+secret.
+
+1. **The binary.** Rust, built for `*-unknown-linux-musl` (static: no C library needed in the
+   image), with std, `nix` (safe wrappers of the process calls) and `serde_json` only: no async
+   runtime, no TLS, no C code, no `unsafe`. Source: `crates/ruum-runtime/supervisor` (package
+   `ruum-supervisor`, about 1 MiB). The redactor is the one of `ruum-core`
+   (`runtime::redact::LineRedactor`, compiled into the supervisor from the same file, not a
+   copy), so the sandbox and the driver redact with the same code.
    - Kubernetes: a pinned image (by digest) holds only the binary. An init container
      `ruum-supervisor` runs `ruum-supervisor install /ruum/bin/ruum-supervisor`, which copies the
      binary into a memory `emptyDir` (`ruum-bin`). The app container mounts that volume
@@ -244,122 +251,179 @@ container runtime. The app never holds the container's own output streams.
      read-only at `/ruum/bin/ruum-supervisor` and sets it as the entrypoint.
    - The app's command is the image's `Entrypoint` followed by the spec's command (or the image's
      `Cmd` when the spec has none), as the runtime would run it. The driver reads the image
-     config (Docker: the engine's image inspect; Kubernetes: the manifest and config blob from
-     the registry, checked by digest) and puts the command into the run's launch data.
+     config (Docker: the engine's image inspect; Kubernetes: the manifest and the config blob from
+     the registry, each checked against its digest) and puts the command into the launch data.
 2. **What the supervisor does**, in order:
    1. `prctl(PR_SET_DUMPABLE, 0)`: its `/proc/<pid>` files belong to root, so the app (same
-      user, no `CAP_SYS_PTRACE`) cannot open `/proc/1/fd/1` (the raw output stream) or
-      `/proc/1/mem`, and cannot trace it.
-   2. Reads the launch data (below) and checks it: at most 256 values, 16 KiB per value,
-      256 KiB in all (the limits of `ruum-core`'s redactor), environment names as the spec's.
-   3. With a PID limit in the launch data: `setrlimit(RLIMIT_NPROC)` for itself and its children.
-      Linux counts the threads of the user in the user namespace; gVisor counts in its own
-      kernel, one per sandbox. The Docker driver keeps the engine's `pids-limit` and sends none
-      (under runc the user's count spans every container of uid 10001). The kubelet's
-      `podPidsLimit` (I6-19) stays the hard bound on staging; the supervisor's limit is a second
-      bound, proven live by `ops/gvisor-check.sh` (a fork check) before it counts.
+      user, no `CAP_SYS_PTRACE`) cannot open `/proc/1/fd/1` (the raw output stream),
+      `/proc/1/mem` or `/proc/1/environ`, and cannot trace it. As PID 1 of its PID namespace it
+      also ignores `SIGKILL` and `SIGSTOP` from the app. The supervisor's tests prove both on
+      Linux; `ops/gvisor-check.sh` must prove them under gVisor before the driver is turned on
+      (see "Turning the Kubernetes driver on").
+   2. Empties `/dev/termination-log`, then reads the launch data **once** (below) and checks it:
+      at most 256 values, 16 KiB per value, 256 KiB in all (the limits of `ruum-core`'s
+      redactor), environment names as the spec's, a command.
+   3. With a PID limit in the launch data: `setrlimit(RLIMIT_NPROC)` for itself and its children
+      (a failure ends the run). Linux counts every thread of the user in the user namespace;
+      gVisor counts in its own kernel, one per sandbox. The Docker driver keeps the engine's
+      `pids-limit` and sends none (under runc the count spans every container of uid 10001). The
+      kubelet's `podPidsLimit` (I6-19) stays the hard bound on staging; the supervisor's limit is
+      a second bound, proven live (a fork and a thread check) before it counts.
    4. Starts the app with the merged environment (the container's plain environment, then the
       secret values), standard input from `/dev/null`, standard output and standard error as two
       pipes. No other file descriptor is inherited.
    5. Reads both pipes, redacts each stream with its own `LineRedactor` (the values: the secret
-      values, the previous values, the newest 16 workload tokens), cuts lines at 16 KiB, and
+      values, the previous values, the workload tokens it has seen), cuts lines at 16 KiB, and
       writes the redacted lines to its own standard output and standard error. A rotated token
-      joins the set before the app can read it from the token file (Kubernetes: the supervisor
-      writes the file itself; Docker: the supervisor watches the driver's token file and adds a
-      new value before the next line goes out; the driver's own redactor still holds it too).
+      joins the set before the app can read it (Kubernetes: the supervisor adds it, then writes
+      the token file itself; Docker: the driver writes the file first, and the supervisor reads
+      the file again before it lets out any output that came after the change).
    6. Forwards `SIGTERM`, `SIGINT`, `SIGHUP`, `SIGQUIT`, `SIGUSR1`, `SIGUSR2` to the app, reaps
-      every child that ends (PID 1's duty), and when the app ends: flushes the redactors, empties
-      `/dev/termination-log` (the app could have written a value there, see the threat model),
-      and exits with the app's exit code (128 + signal for a signal).
+      every child that ends (PID 1's duty), and when the app ends: reads what its children still
+      write for 2 s, flushes the redactors, empties `/dev/termination-log` again, and exits with
+      the app's exit code (128 + signal for a signal).
    7. A broken launch (no data, a refused credential, data over the limits) exits with code 125
       and one line on standard error that names no value. The driver reports the run as exited.
-3. **The launch channel, Docker.** The driver writes the launch data as a file next to the token
-   file (the instance's 0700 folder on the engine's host) and binds it read-only at
-   `/ruum/launch.json`. The secret values leave `Config.Env` (so `GET /containers/{id}/json` no
-   longer shows them). The Docker driver is the laptop's and CI's; the engine API is a root
-   boundary anyway (crate README).
+3. **The launch channel, Docker.** The driver attaches to the container's standard input
+   (`OpenStdin`, `StdinOnce`) before each start, writes the launch data as JSON and closes it. The
+   supervisor reads standard input to its end before the app exists; the app gets `/dev/null`.
+   The secret values leave `Config.Env` (so `GET /containers/{id}/json` no longer shows them)
+   and never rest on the engine's disk. The token file stays the driver's (a read-only bind),
+   and the Docker driver keeps the log driver `none`, so no runtime log file exists there at
+   all. The Docker driver is the laptop's and CI's; the engine API is a root boundary anyway.
 4. **The launch channel, Kubernetes** (S-89). No Kubernetes Secret holds a value any more.
-   - **The values at rest.** The record ConfigMap of the instance carries a `sealed` field:
-     AES-256-GCM under the **record key** (32 random bytes, a Secret in the namespace `ruum`
-     mounted only into the server pods; the runtime ServiceAccount has no right in `ruum`). The
-     sealed data: the secret environment values, the previous values, the newest 16 workload
-     tokens, the app's command, and a SHA-256 digest of the record's fixed fields (identity,
-     kind, routes, limits, image, command, plain environment, secret names). The associated data
-     is `ruum-record-v1:<object name>`, so a sealed value cannot move to another record. Any
-     server process can unseal it: a wake on another replica or after a restart works. A record
-     whose fixed fields do not match the digest is refused (no launch, and the driver ends the
-     run as killed).
+   - **The values at rest: the seal.** The record ConfigMap of the instance carries a field
+     `sealed`: `v1.<key id>.<nonce>.<ciphertext and tag>` (base64url), AES-256-GCM under the
+     **record key** (32 random bytes, a Secret in the namespace `ruum` mounted only into the
+     server pods; the runtime ServiceAccount has no right in `ruum`; the key id is the first 8
+     bytes of the key's SHA-256). Every seal takes a fresh 96-bit nonce from the operating
+     system's random source, also on a retry. A record is sealed a few times in its life (its
+     run, each token rotation, each launch), far below the 2^32 messages of random nonces under
+     one key; the key changes with a key rotation (a second key id, read for one release).
+     - The associated data: `ruum-record-v1`, the record's name, the record's `metadata.uid` and
+       the seal's generation. So a seal does not move to another record, and a record deleted
+       and made again under the same name (a new uid) does not take an old seal.
+     - The sealed data: the secret environment values, the previous values, the current workload
+       token, the app's command, a SHA-256 digest of the record's fixed fields (identity, kind,
+       routes, limits, image, command, plain environment, secret names; serialized as one JSON
+       object in a fixed order), the **authorized run and the `uid` of its pod**, the uids of pods
+       that already took their launch data, and the generation (one more at each seal).
+     - Any server process can unseal it, so a wake on another replica or after a restart works.
+       A record whose fixed fields do not match the digest is refused: no launch, and the run
+       ends as killed.
+     - **The pod's provenance.** The driver creates the pod first, then seals its `uid` into the
+       record (a `resourceVersion` replace; a conflict reads the record again and seals again
+       while the run is the same). Only a server process can write that seal, and a pod's `uid`
+       is never reused, so the seal names the one pod a server process made for the run. The
+       mutable fields of the record (state, run counter, touches, registration) are not trusted
+       for a launch: the sealed run and pod `uid` decide.
+     - **Rollback.** An attacker who writes ConfigMaps can put an older `sealed` value of the same
+       record back. It names an earlier run's pod (gone; `uid`s are never reused) or, within one
+       run, an older token: a launch it allows goes only to that run's own pod, and the server
+       refuses a generation below the highest it has seen for the instance (kept in memory per
+       process). The values of an instance never change (a new deployment is a new instance).
    - **The pod's identity.** Sandbox pods run as the ServiceAccount `ruum-sandbox` of
      `ruum-apps`, which has no RoleBinding. The pod mounts one projected service account token
-     with the audience `ruum-supervisor` (expiry 600 s, refreshed by the kubelet) at
-     `/ruum/id/token`. The API server rejects a token of that audience, so it is no credential
-     for the Kubernetes API. The kubelet issues it for exactly that pod: the token names the pod
-     and its `uid`, and the pod's creator cannot make a token for a pod it did not make, nor a
-     pod with another pod's `uid`. **That is the binding the creator cannot forge.**
-   - **The fetch.** The supervisor `POST`s to the server's supervisor listener
+     with the audience `ruum-supervisor`, `expirationSeconds: 600` (refreshed by the kubelet), at
+     `/ruum/id/token`. The API server does not accept a token of that audience, so it is no
+     credential for the Kubernetes API. The kubelet issues it for exactly that pod: it names the
+     pod and its `uid`, and the pod's creator can get such a token only for a pod it made, whose
+     `uid` is not the sealed one.
+   - **The fetch, once.** The supervisor `POST`s to the server's supervisor listener
      (`RUUM_KUBE_SUPERVISOR_LISTEN`, its own port, reached through a Service at an address the
      driver resolves and passes as an argument, because the sandbox has no DNS) with
-     `Authorization: Bearer <projected token>`. `/v1/launch` answers the launch data; `/v1/token`
-     answers the current workload token, which the supervisor asks for every 30 s and writes to
-     the token file (`TOKEN_FILE`, in a memory `emptyDir`, readable by the app).
-   - **The checks of the server**, for each request, all of them, before any value is read:
-     a `TokenReview` with the audience `ruum-supervisor` (authenticated, the audience granted,
-     the user `system:serviceaccount:ruum-apps:ruum-sandbox`, a pod name and a pod `uid` in its
-     extra fields); the pod of that name exists, has that `uid`, is not being deleted, and its
-     address is the request's source address; the pod name is `ruum-i-<id>-<run>` of a record
-     whose run is `<run>` and whose state is starting or running; the record unseals and its
-     digest matches; and the stored pod is the pod the driver would make for that record now
-     (`pod::verify`: image, command, plain environment, volumes, mounts, service account,
-     runtime class, limits, host aliases, every sandbox flag). Any failure is `403` with no
-     detail (the server logs the reason, never a value). Results of a `TokenReview` are kept
-     60 s per token hash; requests are limited per source address.
-   - **Transport.** Plain HTTP inside the cluster. A request's source address must be the pod's;
-     restricted Pod Security (no `NET_RAW`) and gVisor's network stack stop a sandbox from
-     sending as another address. Before a real tenant's secret runs on Kubernetes, node-to-node
-     traffic must be encrypted (Talos KubeSpan or the CNI's WireGuard), or the listener gets TLS
-     with a certificate the supervisor pins (an enable step, decision 0006 I).
+     `Authorization: Bearer <projected token>`. `/v1/launch` answers the launch data once per pod
+     `uid`: the server seals the pod's `uid` into the list of launched pods before it answers, and
+     refuses a second launch for that `uid` (the app, which can read the projected token, starts
+     only after the supervisor's launch). `/v1/token` answers only the current workload token; the
+     supervisor asks every 30 s, adds a new token to its redactors, then writes the token file
+     (`TOKEN_FILE`, a memory `emptyDir`, readable by the app).
+   - **The checks of the server**, for each request, all of them, before any value is read: a
+     `TokenReview` with `spec.audiences: ["ruum-supervisor"]`, and its answer has
+     `authenticated: true`, no error, `ruum-supervisor` in `status.audiences`, the user exactly
+     `system:serviceaccount:ruum-apps:ruum-sandbox`, and exactly one value in each of the extra
+     fields `authentication.kubernetes.io/pod-name` and `authentication.kubernetes.io/pod-uid`;
+     the pod of that name exists now, has that `uid`, is not being deleted, and one of its
+     `status.podIPs` equals the connection's peer address (the socket's, never a header; IPv4
+     mapped forms canonicalized); the record unseals, its digest matches, its sealed run and pod
+     `uid` are this pod's, and its generation is not below the highest this process saw; and the
+     stored pod is the pod the driver makes for that record (`pod::verify`, an exhaustive check:
+     every key of the pod spec and of each container must be one the driver sets or one of a
+     fixed list of API server defaults, and every value the driver sets must be equal: images by
+     digest, the init container's image, command and security context, the supervisor command,
+     the mounts with every option, the projected volume's audience, expiry, path and mode, the
+     service account, the runtime class, the limits, the host aliases, the termination message
+     path and policy, no lifecycle hooks or other probes). Any failure is `403` with no detail
+     (the server logs the reason, never a value); a pod whose seal is not written yet gets `503`
+     and the supervisor tries again for 60 s. A positive `TokenReview` is kept for at most 60 s
+     and never past the token's `exp`, 4096 entries at most; the pod, record and run checks run
+     on every request. Requests are limited per peer address.
+   - **Transport.** Plain HTTP between a sandbox and a server pod. A pod's traffic to another
+     node crosses the network between the nodes, so the driver refuses to start unless the
+     setting `RUUM_KUBE_SUPERVISOR_NETWORK=encrypted` says that node-to-node traffic is
+     encrypted and authenticated (Talos KubeSpan or the CNI's WireGuard: every hop off a node).
+     An enable step checks it (`talosctl get kubespanpeerstatuses`). TLS with a certificate the
+     supervisor pins is the alternative (a follow-up card). Within a node, pod traffic does not
+     leave the node; a sandbox cannot send as another address (restricted Pod Security: no
+     `NET_RAW`; gVisor's network stack).
+   - **Network policies.** One ingress rule on the server pods (from `ruum-apps`, only the
+     supervisor port) and one egress rule for the sandboxes (to the server pods, only that port).
+     kube-proxy does not translate the source address of pod-to-Service traffic, so the peer
+     address is the pod's.
    - **Rights.** The runtime Role loses every verb on Secrets and the key ConfigMaps go (the
      record holds what the Secret held). It gains one ClusterRole rule:
      `authentication.k8s.io` `tokenreviews` `create`. The admission policy of `ruum-apps` now
      admits: the service account `ruum-sandbox` only; `automountServiceAccountToken: false`;
      volumes `emptyDir` and one `projected` volume whose only source is a service account token
-     with the audience `ruum-supervisor` (no Secret volume at all); no `valueFrom` and no
-     `envFrom`; exactly one init container named `ruum-supervisor` that mounts only `ruum-bin`;
-     no ephemeral containers; gVisor.
+     with the audience `ruum-supervisor` and `expirationSeconds: 600` (no Secret volume at all);
+     no `valueFrom` and no `envFrom`; exactly one init container named `ruum-supervisor` that
+     mounts only `ruum-bin`; no ephemeral containers; gVisor; for every container the
+     termination message path `/dev/termination-log` and the policy `File`.
 5. **Rotation and wake.** `rotate_token` runs in the process that follows the instance's log (as
-   before): it adds the new token to that process's redactors, then writes it into the sealed
-   record (a `resourceVersion` replace). The supervisor gets it at its next `/v1/token`, adds it
-   to its redactors and then writes the file. `wake` makes the next pod from the record; its
-   supervisor fetches the same sealed values.
+   before): it adds the new token to that process's redactors, then seals it into the record. The
+   supervisor gets it at its next `/v1/token`. `wake` makes the next pod, then seals the new run
+   and its pod `uid`; the new supervisor fetches the launch data once.
 6. **Logs in the driver.** The driver keeps its own redactor on what it reads (defense in depth;
    the conformance suite checks the driver's output). The kubelet's files now hold the
    supervisor's output only.
+7. **Known limits.** Exact match only (hex, base64 and other forms pass, rule 7's known limit).
+   Each stream has its own redactor: an app that prints the first lines of a multiline value to
+   standard output and the rest to standard error can have a reader rebuild it (as in the
+   driver, `ruum-core` redact.rs); an honest app prints a value to one stream. A hostile app can
+   write its own value into `/dev/termination-log` (4 KiB, kept in the pod's status, which the
+   runtime identity reads) and avoid the supervisor's cleanup by ignoring `SIGTERM` until the
+   kubelet's `SIGKILL`; it holds the value anyway.
 
-**Live log rings (S-91).** Each server process keeps the running instances' rings within one
-byte budget (`max_live_log_bytes`, 64 MiB on Kubernetes) and each tenant within a share of it
-(`max_tenant_live_log_bytes`, 16 MiB). A line that would pass either bound first drops the
-oldest lines of the same ring (the noisy instance pays first, never another tenant's ring); if
-the ring is empty and the bound still holds, the line is dropped. Ended and scaled-to-zero rings
-leave the live budget and count to `max_ended_log_bytes` (128 MiB on Kubernetes) as before, so
-the logs of one process stay below 192 MiB in all, well under the server container's 512 MiB.
-The Docker driver uses the same budget.
+**Live log rings (S-91).** Each server process keeps the running instances' rings within a byte
+budget (`max_live_log_bytes`, 64 MiB on Kubernetes) and each tenant within a share of it
+(`max_tenant_live_log_bytes`, 16 MiB). A line counts its text allocation and its line record.
+As a line arrives, a ring whose tenant is past its share drops its own oldest lines (the new line
+too when the ring is empty); when the budget in all is past its bound plus one share, the
+arriving ring drops its own oldest lines too, so the budget never passes `max_live_log_bytes +
+max_tenant_live_log_bytes`. Each sweep brings the budget back under `max_live_log_bytes` by
+dropping the oldest lines of the tenant with the most bytes first (its largest ring first), so a
+quiet tenant keeps its lines. Ended and scaled-to-zero rings leave the live budget and count to
+`max_ended_log_bytes` (128 MiB on Kubernetes) as before: the logs of one process stay below
+208 MiB, under the server container's 512 MiB. Redactor memory per instance is bounded by the
+secret limits but not part of this budget (backlog row). The Docker driver uses the same budget.
 
 **Threat model.**
 
 | Attacker | Can | Cannot (and why) |
 |---|---|---|
-| **Holder of the runtime ServiceAccount's token** (stolen from the server pod, or a bug that leaks it) | Create, read, list and delete pods and records in `ruum-apps`; read pod logs; create `TokenReview`s. End or restart runs (denial of service), read plain environment values and image names in records (as before). | Read a secret value or token: no Secret exists, records hold sealed data, the record key is not in `ruum-apps`. Get values into a pod it controls: the launch needs a kubelet-issued token of the pod named in the record's run, from the pod's own address, and the stored pod must be exactly the driver's pod for the sealed record (image, command, mounts, sandbox flags); a pod that passes runs the tenant's own image under the platform's rules, which gains it nothing. Change what a run gets: the fixed fields are bound by the sealed digest, the sealed data by the associated data; an older sealed blob of the same instance only gives that instance its own older values. Read values from logs: the supervisor redacted them before the kubelet wrote them. |
-| **Compromised app** (code in the sandbox) | Read its own values and token (rule 7 "honestly"), read its projected identity token and fetch its own launch data, kill the supervisor (the container ends), write encoded values (hex, base64) to its output (exact match only, rule 7's known limit), fill its PID limit. | Write raw output to the container runtime: its output is a pipe to the supervisor, which is non-dumpable (no `/proc/1/fd/1`, no ptrace). Change the supervisor: read-only mount, root-owned `/proc` files. Get another pod's values: its token names its own pod. Keep a value in `/dev/termination-log` (the pod status, 4 KiB): the supervisor empties the file when the app ends; if the app kills the supervisor first, the value stays in the pod's status, which only the runtime identity and admins read (residual risk, backlog row). |
-| **Node admin** (root on a node; Talos API) | Everything on that node: process memory, environment, projected tokens, kubelet files. | Read a value from `/var/log/pods`: only the supervisor's redacted output is there (exact matches; encoded forms pass). Out of scope otherwise: admins are the person (decision 0006 E-3); short kubelet log rotation is still good hygiene. |
+| **Holder of the runtime ServiceAccount's token** (stolen from the server pod, or a bug that leaks it) | Create, read, list and delete pods and records in `ruum-apps`; read pod logs and pod status; create `TokenReview`s. End or restart runs and put back older seals (denial of service), read plain environment values and image names in records (as before). | Read a secret value or token: no Secret exists, records hold sealed data, the record key is not in `ruum-apps`. Get values into a pod it made: the launch needs the kubelet's token of the pod whose `uid` a server process sealed for the run, from that pod's address; a pod it makes (also one deleted and made again under the same name) has another `uid`. Change what a run gets: the fixed fields are bound by the sealed digest, the seal by its associated data (record name, record `uid`, generation). Get a second launch of a pod: the launched `uid`s are sealed. Read values from logs: the supervisor redacted them before the kubelet wrote them. |
+| **Compromised app** (code in the sandbox) | Read its own values and token (rule 7 "honestly"); send them out through the egress proxy; read its projected identity token and fetch the current token; write encoded values to its output; write its own value to `/dev/termination-log` (see Known limits); fill its PID limit. | Fetch the launch data again (previous values): the launch is once per pod. Write raw output to the container runtime: its output is a pipe to the supervisor, which is non-dumpable (no `/proc/1/fd/1`, no ptrace). Kill or stop the supervisor: PID 1 ignores `SIGKILL` and `SIGSTOP` from its own namespace, and the forwarded signals go to the app. Change the supervisor: read-only mount. Get another pod's values: its token names its own pod. |
+| **Node admin** (root on a node; Talos API) | Everything on that node: process memory, environment, projected tokens, kubelet files. | Read a value from `/var/log/pods`: only the supervisor's redacted output is there (exact matches). Out of scope otherwise: admins are the person (decision 0006 E-3); a short kubelet log rotation is still good hygiene. |
 | **Compromised server process** | Everything (record key, secret store, token issuer), as before. | Out of scope of this design. |
-| **Observer of node-to-node traffic** | Read the plain HTTP launch answers between nodes, and replay a projected token for its lifetime (600 s). | Use a replayed token from another address (source check); before real tenants' secrets, an enable step encrypts node-to-node traffic or adds TLS. |
+| **Observer or attacker on the network between nodes** | Nothing while node-to-node traffic is encrypted and authenticated (the driver refuses to start without the setting that says so). | Read or change launch answers, or replay a projected token: WireGuard (KubeSpan or the CNI's) authenticates and encrypts every hop off a node; a replayed token from another address fails the peer check. |
 
 **Turning the Kubernetes driver on again** (decision 0008-5 keeps it off) needs, in order: the
-supervisor image built and pinned, the record key Secret, the chart and platform changes
-applied, the live checks of `ops/gvisor-check.sh` and `ops/rbac-check.sh live` (the new
-negatives: no Secret verb, a forged pod refused by the server), node-to-node encryption or TLS,
-I6-19's kubelet PID limit, and the person's decision. The exact steps are in
-`deploy/staging/README.md` "Turning the Kubernetes runtime driver on".
+supervisor image built and pinned, the record key Secret, node-to-node encryption, the chart and
+platform changes applied, I6-19's kubelet PID limit, the live checks of `ops/gvisor-check.sh`
+(gVisor, non-dumpable `/proc`, PID 1 signals, the PID limit, a CRI log canary) and
+`ops/rbac-check.sh live` (no Secret verb, a forged pod refused by the server), and the person's
+decision. The exact steps are in `deploy/staging/README.md` "Turning the Kubernetes runtime
+driver on".
 
 ### Host names and slugs (review R10, RC-5)
 

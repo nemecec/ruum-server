@@ -13,11 +13,12 @@
 //!   `networkpolicies.yaml`) let a sandbox reach only the egress proxy and be reached only by the
 //!   app gateway; the driver sets the proxy variables and `/etc/hosts` lines for the spec's
 //!   routes and registers the pod's address at the egress proxy ([`EgressRegistry`]).
-//! - **Secrets** (rule 7): the token and the secret values go into a Secret of the instance,
-//!   which the pod mounts (token file) and reads (environment values). The driver only creates
-//!   it (no other verb: each of them can read a Secret, [`pod`]); the Secret is owned by a key
-//!   ConfigMap, and the API server's garbage collector removes it when the driver deletes the
-//!   key. Logs stream through the redactor of `ruum-core` inside the driver.
+//! - **Secrets** (rule 7; backlog S-89 and I6-20, `docs/STEP3.md` "The sandbox supervisor"): no
+//!   Kubernetes Secret. The token and the secret values are sealed into the instance's record
+//!   under the record key ([`seal`]); the sandbox supervisor, the pod's first process, fetches
+//!   them once from the server's supervisor listener ([`KubeDriver::supervisor_launch`]) with the
+//!   pod's projected service account token, and redacts the app's output before the kubelet
+//!   writes it. The driver redacts what it reads again (`ruum-core`'s redactor).
 //! - **State in the API**: the record of each instance is a ConfigMap, so every server process
 //!   answers for every instance, and a restarted server adopts what runs ([`pod`]).
 //! - **Readiness** is an exec probe inside the sandbox (decision 0006 G point 1: never from the
@@ -25,14 +26,15 @@
 
 mod api;
 pub mod pod;
+mod seal;
 
 use crate::driver::{RESERVED_ENV, repository};
 use crate::egress::{EgressNetwork, EgressRegistry};
-use crate::logs::{Redactors, Ring};
+use crate::logs::{LogBudget, Redactors, Ring};
 use api::{Api, Kind, LogAnswer, Write};
 use async_trait::async_trait;
 use futures::StreamExt;
-use pod::{HostAlias, KindRec, LABEL_ROLE, PodView, ROLE_KEY, Record};
+use pod::{HostAlias, KindRec, PodView, Record};
 use ruum_core::ids::TenantId;
 use ruum_core::runtime::redact::{MAX_KEPT_TOKENS, check_secret_set, check_secret_value};
 use ruum_core::runtime::{
@@ -41,15 +43,19 @@ use ruum_core::runtime::{
     RuntimeError, RuntimeUsage, RuntimeUsageSink, SecretValue, WorkloadIdentity, WorkloadKind,
     WorkloadSpec,
 };
+use ruum_supervisor::protocol::{LAUNCH_VERSION, Launch, TokenAnswer};
+use seal::{MAX_LAUNCHED, Sealed};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tokio::task::JoinHandle;
 
-pub use pod::{LABEL_RUN, object_name, pod_name};
+pub use pod::{LABEL_RUN, SUPERVISOR_IN_IMAGE, object_name, pod_name};
+pub use seal::RecordKey;
 
 /// The label that marks every object of the driver, and its value.
 pub const LABEL_MANAGED: &str = crate::driver::LABEL_MANAGED;
@@ -67,9 +73,16 @@ const START_GRACE: Duration = Duration::from_secs(60);
 const FOLLOWER_DRAIN: Duration = Duration::from_secs(3);
 /// How long the pod of an exited run stays, so the log followers read its end.
 const EXITED_POD_KEEP: Duration = Duration::from_secs(60);
-/// The tries of a Secret create while the garbage collector removes the old Secret (a token
-/// rotation), with the wait before each next try (doubling up to 1 s): about 9 s in all.
-const SECRET_CREATE_TRIES: u32 = 12;
+/// The tries of a sealed record write that loses a race.
+const SEAL_TRIES: u32 = 6;
+/// How often the supervisor asks for the current workload token.
+const TOKEN_POLL_SECS: u64 = 30;
+/// How long a positive `TokenReview` is kept at most (never past the token's `exp`), and how many.
+const REVIEW_TTL: Duration = Duration::from_secs(60);
+const REVIEW_CACHE_MAX: usize = 4096;
+/// The supervisor requests one peer address may make per window.
+const PEER_REQUESTS: u32 = 30;
+const PEER_WINDOW: Duration = Duration::from_secs(10);
 
 /// A shared service of a route (the egress proxy, the internal gateway, the pooler), as the
 /// platform deploys it. The spec cannot name one.
@@ -145,6 +158,30 @@ pub struct KubeConfig {
     /// log lines and keeps the rest (its redaction values, for a wake and a token rotation).
     pub max_ended_instances: usize,
     pub max_ended_log_bytes: usize,
+    /// The byte budget of the running instances' log rings in this process, and each tenant's
+    /// share of it (backlog S-91; `crate::logs::LogBudget`).
+    pub max_live_log_bytes: usize,
+    pub max_tenant_live_log_bytes: usize,
+    /// The record key (backlog S-89): seals the values in each instance record. Required.
+    pub record_key: Option<RecordKey>,
+    /// The sandbox supervisor's image, by digest (the init container copies the binary from
+    /// [`SUPERVISOR_IN_IMAGE`]). Required.
+    pub supervisor_image: String,
+    /// The server's supervisor listener as the sandboxes reach it: an IP address or a DNS name
+    /// that the driver resolves (the sandbox has no DNS), and its port.
+    pub supervisor_address: String,
+    pub supervisor_port: u16,
+    /// The ServiceAccount of the sandbox pods (no rights) and the audience of their projected
+    /// token.
+    pub sandbox_service_account: String,
+    pub supervisor_audience: String,
+    /// `RLIMIT_NPROC` the supervisor sets for the app (gVisor counts per sandbox); `None`: none.
+    pub pids_limit: Option<u64>,
+    /// Node-to-node traffic is encrypted and authenticated (`RUUM_KUBE_SUPERVISOR_NETWORK=
+    /// encrypted`): the launch channel is plain HTTP, so the driver refuses to start without it.
+    pub network_encrypted: bool,
+    /// The CPU architecture of the nodes (`amd64`): the platform of a multi-arch image index.
+    pub node_arch: String,
 }
 
 impl KubeConfig {
@@ -181,7 +218,18 @@ impl KubeConfig {
             max_instances: 4096,
             max_tenant_instances: 512,
             max_ended_instances: 1024,
-            max_ended_log_bytes: 256 * 1024 * 1024,
+            max_ended_log_bytes: 128 * 1024 * 1024,
+            max_live_log_bytes: 64 * 1024 * 1024,
+            max_tenant_live_log_bytes: 16 * 1024 * 1024,
+            record_key: None,
+            supervisor_image: String::new(),
+            supervisor_address: String::new(),
+            supervisor_port: 8091,
+            sandbox_service_account: "ruum-sandbox".to_owned(),
+            supervisor_audience: "ruum-supervisor".to_owned(),
+            pids_limit: Some(512),
+            network_encrypted: false,
+            node_arch: "amd64".to_owned(),
         }
     }
 
@@ -214,6 +262,31 @@ impl KubeConfig {
         if self.health_command.is_empty() || self.sweep_every.is_zero() {
             return bad("the health command and the sweep interval must be set");
         }
+        if self.max_tenant_live_log_bytes == 0
+            || self.max_tenant_live_log_bytes > self.max_live_log_bytes
+        {
+            return bad("a tenant's live log share is above zero and at most the live log budget");
+        }
+        if self.record_key.is_none() {
+            return bad("the Kubernetes driver needs the record key (backlog S-89)");
+        }
+        if !self.supervisor_image.contains("@sha256:") {
+            return bad("the supervisor image is pinned by digest (name@sha256:...)");
+        }
+        if self.supervisor_address.is_empty() || self.supervisor_port == 0 {
+            return bad("the Kubernetes driver needs the supervisor listener's address and port");
+        }
+        if self.sandbox_service_account.is_empty() || self.supervisor_audience.is_empty() {
+            return bad("the sandbox ServiceAccount and the supervisor audience must be set");
+        }
+        if !self.network_encrypted {
+            return bad(
+                "the launch channel is plain HTTP: node-to-node traffic must be encrypted (RUUM_KUBE_SUPERVISOR_NETWORK=encrypted, decision 0006 I point 4)",
+            );
+        }
+        if self.pids_limit.is_some_and(|p| p < 64) {
+            return bad("the PID limit is at least 64");
+        }
         for (r, s) in &self.routes {
             if s.address.is_empty() || s.alias.is_empty() || s.port == 0 {
                 return Err(RuntimeError::Internal {
@@ -226,16 +299,13 @@ impl KubeConfig {
 }
 
 /// What this process keeps of an instance it started or woke: the log ring and the redaction
-/// values (the driver never reads the Secret back, so only this process knows them).
+/// values of the log followers.
 struct Local {
     id: InstanceId,
     identity: WorkloadIdentity,
     /// When this process made it (a start in progress has a record only after this).
     made: Instant,
-    /// The secret environment values as Secret keys and values: a token rotation creates the
-    /// Secret again with them (the driver cannot read it).
-    secret_env: Vec<(String, String)>,
-    /// One token rotation at a time: two at once could each delete the other's new key.
+    /// One token rotation at a time.
     rotating: tokio::sync::Mutex<()>,
     redactors: Mutex<Option<Arc<Mutex<Redactors>>>>,
     st: Mutex<LocalSt>,
@@ -260,6 +330,23 @@ impl LocalSt {
         v.extend(self.tokens.iter().cloned());
         v
     }
+
+    /// The instance ended: its logs leave the live budget (S-91) and start their retention.
+    fn set_ended(&mut self) {
+        self.parked_at = None;
+        if self.ended_at.is_none() {
+            self.ended_at = Some(Instant::now());
+        }
+        self.ring.leave_budget();
+    }
+
+    /// The instance scaled to zero: its logs leave the live budget and count to the ended cap.
+    fn set_parked(&mut self) {
+        if self.parked_at.is_none() {
+            self.parked_at = Some(Instant::now());
+        }
+        self.ring.leave_budget();
+    }
 }
 
 struct StaticInst {
@@ -283,6 +370,14 @@ struct Inner {
     /// gets the address of an earlier run (which can be another pod by now).
     addrs: Mutex<HashMap<InstanceId, (u32, String, u16)>>,
     last_register: Mutex<HashMap<String, Instant>>,
+    /// The byte budget of the running instances' log rings (S-91).
+    live: Arc<LogBudget>,
+    /// Positive `TokenReview`s: the token's SHA-256, the pod name and uid, and until when.
+    reviews: Mutex<HashMap<[u8; 32], (String, String, Instant)>>,
+    /// The highest seal generation this process saw per instance (a rollback is refused).
+    gens: Mutex<HashMap<InstanceId, u64>>,
+    /// Supervisor requests per peer address in the current window.
+    peers: Mutex<HashMap<IpAddr, (Instant, u32)>>,
 }
 
 /// The Kubernetes driver (see the module docs).
@@ -337,6 +432,7 @@ impl KubeDriver {
             .map_err(|e| RuntimeError::Internal {
                 reason: format!("the registry client: {e}"),
             })?;
+        let live = LogBudget::new(cfg.max_live_log_bytes, cfg.max_tenant_live_log_bytes);
         let inner = Arc::new(Inner {
             cfg,
             api,
@@ -347,6 +443,10 @@ impl KubeDriver {
             locals: Mutex::new(HashMap::new()),
             addrs: Mutex::new(HashMap::new()),
             last_register: Mutex::new(HashMap::new()),
+            live,
+            reviews: Mutex::new(HashMap::new()),
+            gens: Mutex::new(HashMap::new()),
+            peers: Mutex::new(HashMap::new()),
         });
         let sweeper = tokio::runtime::Handle::try_current()
             .ok()
@@ -376,6 +476,46 @@ impl KubeDriver {
     pub async fn sweep(&self) {
         self.inner.sweep().await;
     }
+
+    /// The bytes of the running instances' log rings, in all or of one tenant (the tests).
+    #[doc(hidden)]
+    pub fn live_log_bytes(&self, tenant: Option<TenantId>) -> usize {
+        self.inner.live.used(tenant)
+    }
+
+    /// `POST /v1/launch` of the supervisor listener (backlog S-89; `docs/STEP3.md` "The sandbox
+    /// supervisor" 4): the launch data, as JSON, for the pod whose projected token is `bearer`,
+    /// from the connection's peer address `peer`, once per pod. Every refusal names no value.
+    pub async fn supervisor_launch(
+        &self,
+        bearer: &str,
+        peer: IpAddr,
+    ) -> Result<Vec<u8>, LaunchRefusal> {
+        self.inner.supervisor(bearer, peer, true).await
+    }
+
+    /// `POST /v1/token` of the supervisor listener: the current workload token, as JSON, for a
+    /// pod that took its launch data.
+    pub async fn supervisor_token(
+        &self,
+        bearer: &str,
+        peer: IpAddr,
+    ) -> Result<Vec<u8>, LaunchRefusal> {
+        self.inner.supervisor(bearer, peer, false).await
+    }
+}
+
+/// Why the supervisor listener refuses a request. The server answers `403`, `503` or `429`
+/// without a detail; the driver logs the reason (never a value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchRefusal {
+    /// Not this pod's, not now, not again: `403`.
+    Forbidden,
+    /// The pod's run is not sealed yet, or the API server cannot be asked: `503` (the supervisor
+    /// tries again).
+    NotReady,
+    /// Too many requests from the peer address: `429`.
+    TooMany,
 }
 
 impl Inner {
@@ -468,6 +608,123 @@ impl Inner {
                 reason: format!("the registry answered {s}"),
             }),
         }
+    }
+
+    /// `GET` a registry object under a cap, checked against its digest (`sha256:<hex>`).
+    async fn registry_get(
+        &self,
+        url: &str,
+        accept: &str,
+        digest: &str,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        const MAX: usize = 4 * 1024 * 1024;
+        let mut r = self
+            .registry_http
+            .get(url)
+            .header(reqwest::header::ACCEPT, accept)
+            .send()
+            .await
+            .map_err(|e| RuntimeError::Unavailable {
+                reason: format!("the registry: {}", e.without_url()),
+            })?;
+        if r.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(RuntimeError::ImageNotFound {
+                image: digest.to_owned(),
+            });
+        }
+        if !r.status().is_success() {
+            return Err(RuntimeError::Unavailable {
+                reason: format!("the registry answered {}", r.status()),
+            });
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = r.chunk().await.map_err(|e| RuntimeError::Unavailable {
+            reason: format!("the registry: {}", e.without_url()),
+        })? {
+            body.extend_from_slice(&chunk);
+            if body.len() > MAX {
+                return Err(RuntimeError::UnsupportedImage {
+                    reason: "an image manifest or config is over 4 MiB".to_owned(),
+                });
+            }
+        }
+        if OciDigest::of(&body).as_str() != digest {
+            return Err(RuntimeError::UnsupportedImage {
+                reason: "an image object does not match its digest".to_owned(),
+            });
+        }
+        Ok(body)
+    }
+
+    /// The image's `Entrypoint` and `Cmd` (from its config at the registry, each object checked
+    /// against its digest; for a multi-arch index the nodes' platform), for the supervisor's
+    /// launch data (I6-20).
+    async fn image_command(
+        &self,
+        identity: &WorkloadIdentity,
+        digest: &OciDigest,
+    ) -> Result<(Vec<String>, Vec<String>), RuntimeError> {
+        let Some(registry) = &self.cfg.registry else {
+            return Err(RuntimeError::ImageNotFound {
+                image: digest.to_string(),
+            });
+        };
+        let base = self
+            .cfg
+            .registry_url
+            .clone()
+            .unwrap_or_else(|| format!("http://{registry}"));
+        let base = base.trim_end_matches('/');
+        let repo = repository(identity);
+        let accept = "application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json";
+        let bad = |what: &str| RuntimeError::UnsupportedImage {
+            reason: format!("the image {what}"),
+        };
+        let raw = self
+            .registry_get(
+                &format!("{base}/v2/{repo}/manifests/{digest}"),
+                accept,
+                digest.as_str(),
+            )
+            .await?;
+        let mut manifest: Value =
+            serde_json::from_slice(&raw).map_err(|_| bad("manifest is not JSON"))?;
+        if let Some(list) = manifest.get("manifests").and_then(Value::as_array) {
+            let pick = list
+                .iter()
+                .find(|m| {
+                    m.pointer("/platform/os").and_then(Value::as_str) == Some("linux")
+                        && m.pointer("/platform/architecture").and_then(Value::as_str)
+                            == Some(self.cfg.node_arch.as_str())
+                })
+                .and_then(|m| m.get("digest").and_then(Value::as_str))
+                .ok_or_else(|| bad("has no manifest for the nodes' platform"))?
+                .to_owned();
+            let raw = self
+                .registry_get(&format!("{base}/v2/{repo}/manifests/{pick}"), accept, &pick)
+                .await?;
+            manifest = serde_json::from_slice(&raw).map_err(|_| bad("manifest is not JSON"))?;
+        }
+        let config = manifest
+            .pointer("/config/digest")
+            .and_then(Value::as_str)
+            .ok_or_else(|| bad("manifest names no config"))?
+            .to_owned();
+        let raw = self
+            .registry_get(&format!("{base}/v2/{repo}/blobs/{config}"), "*/*", &config)
+            .await?;
+        let cfg: Value = serde_json::from_slice(&raw).map_err(|_| bad("config is not JSON"))?;
+        let strings = |p: &str| -> Vec<String> {
+            cfg.pointer(p)
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Ok((strings("/config/Entrypoint"), strings("/config/Cmd")))
     }
 
     /// The `/etc/hosts` lines of the record's routes: each shared service's address, resolved
@@ -589,9 +846,8 @@ impl Inner {
     }
 
     /// Ends the current run: the record moves to `to` (only if nobody changed it), and the
-    /// process that made the change does the rest: usage, the unregistration, then the pod
-    /// (and for an ended instance the keys, so the Secret goes). `Ok(None)`: another process was
-    /// first.
+    /// process that made the change does the rest: usage, the unregistration, then the pod.
+    /// `Ok(None)`: another process was first.
     async fn end_run(
         &self,
         mut rec: Record,
@@ -617,111 +873,111 @@ impl Inner {
         let delete_pod = !matches!(to, InstanceState::Exited(_));
         self.finish_cleanup(rec.clone(), registered, delete_pod.then_some(pod.as_str()))
             .await;
-        if matches!(to, InstanceState::Stopped | InstanceState::Exited(_)) {
-            if let Some(l) = self.local(rec.instance) {
-                let mut st = l.st.lock().expect("local lock");
-                st.ended_at = Some(Instant::now());
-                st.parked_at = None;
+        if let Some(l) = self.local(rec.instance) {
+            let mut st = l.st.lock().expect("local lock");
+            match to {
+                InstanceState::Stopped | InstanceState::Exited(_) => st.set_ended(),
+                InstanceState::ScaledToZero => st.set_parked(),
+                _ => {}
             }
-            self.drop_keys(rec.instance, None).await;
-        } else if to == InstanceState::ScaledToZero
-            && let Some(l) = self.local(rec.instance)
-        {
-            l.st.lock().expect("local lock").parked_at = Some(Instant::now());
         }
         Ok(Some(rec))
     }
 
-    /// The labels that select the keys of an instance.
-    fn key_selector(&self, id: InstanceId) -> Vec<(String, String)> {
-        let mut sel: Vec<(String, String)> = vec![
-            (LABEL_MANAGED.to_owned(), MANAGED.to_owned()),
-            (LABEL_ROLE.to_owned(), ROLE_KEY.to_owned()),
-            (crate::driver::LABEL_INSTANCE.to_owned(), id.0.to_string()),
-        ];
-        for (k, v) in &self.cfg.extra_labels {
-            sel.push((k.clone(), v.clone()));
-        }
-        sel
-    }
-
-    /// Deletes every key of an instance but `keep`, so the garbage collector removes the Secret
-    /// they own. `false`: a list or a delete failed (the sweep tries again for an ended instance;
-    /// a removed record takes its keys with it).
-    async fn drop_keys(&self, id: InstanceId, keep: Option<&str>) -> bool {
-        let sel = self.key_selector(id);
-        let sel: Vec<(&str, &str)> = sel.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        let keys = match self.api.list(Kind::ConfigMap, &sel).await {
-            Ok(k) => k,
-            Err(e) => {
-                tracing::warn!(target: "ruum::runtime", code = e.code(), "listing the keys of an instance failed");
-                return false;
-            }
-        };
-        let mut ok = true;
-        for k in keys {
-            let Some(name) = k.pointer("/metadata/name").and_then(Value::as_str) else {
-                continue;
-            };
-            if Some(name) == keep {
-                continue;
-            }
-            if let Err(e) = self.api.delete(Kind::ConfigMap, name, None).await {
-                tracing::warn!(target: "ruum::runtime", code = e.code(), "deleting a key of an instance failed");
-                ok = false;
-            }
-        }
-        ok
-    }
-
-    /// Makes a new key of an instance, owned by its record (`record_uid`): its name and uid.
-    async fn new_key(
+    /// The record of `id` with its ConfigMap's uid (the seal's associated data).
+    async fn record_with_uid(
         &self,
-        identity: &WorkloadIdentity,
         id: InstanceId,
-        record_uid: &str,
-    ) -> Result<(String, String), RuntimeError> {
-        let tag = uuid::Uuid::now_v7().simple().to_string();
-        let body = pod::key_body(&self.cfg, identity, id, &tag, record_uid);
-        let name = pod::key_name(id, &tag);
-        match self.api.create(Kind::ConfigMap, &body).await? {
-            Write::Done(v) => match v.pointer("/metadata/uid").and_then(Value::as_str) {
-                Some(uid) if !uid.is_empty() => Ok((name, uid.to_owned())),
-                _ => Err(RuntimeError::Internal {
-                    reason: format!("the API server gave the key {name} no uid"),
-                }),
-            },
-            _ => Err(RuntimeError::Internal {
-                reason: format!("the key {name} exists already"),
-            }),
-        }
+    ) -> Result<(Record, String, String), RuntimeError> {
+        let cm = self.reload(id).await?;
+        let uid = cm
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| RuntimeError::Internal {
+                reason: "an instance record has no uid".to_owned(),
+            })?
+            .to_owned();
+        let (rec, rv) = pod::read_record(&cm).ok_or_else(|| RuntimeError::Internal {
+            reason: "an instance record does not read".to_owned(),
+        })?;
+        Ok((rec, rv, uid))
     }
 
-    /// Creates the instance Secret under the key `key` (name, uid). `tries` above 1: an old
-    /// Secret that the garbage collector has not removed yet is waited for.
-    async fn create_secret(
+    fn key(&self) -> &RecordKey {
+        // `KubeConfig::check` refuses a configuration without it.
+        self.cfg.record_key.as_ref().expect("the record key")
+    }
+
+    /// The sealed part of a record, opened and checked against the record's fixed fields.
+    /// `None`: no seal yet, or one that does not open or does not match (a writer without the
+    /// record key changed the record).
+    fn unsealed(&self, rec: &Record, record_uid: &str) -> Option<Sealed> {
+        let s = seal::unseal(
+            self.key(),
+            &object_name(rec.instance),
+            record_uid,
+            rec.sealed.as_deref()?,
+        )?;
+        (s.digest == pod::fixed_digest(rec)).then_some(s)
+    }
+
+    /// Notes the generation of a seal this process read or wrote; `false` for a generation
+    /// below the highest it saw (a seal put back: refused).
+    fn fresh_gen(&self, id: InstanceId, generation: u64) -> bool {
+        let mut g = self.gens.lock().expect("gens lock");
+        let seen = g.entry(id).or_insert(0);
+        if generation < *seen {
+            return false;
+        }
+        *seen = generation;
+        true
+    }
+
+    /// Changes the sealed part of the record of `id` with `change` (given the opened seal, or
+    /// `fresh` for a record without one), one generation up, and writes it with the record's
+    /// `resourceVersion`; a lost race reads the record again. `change` returns `false` to stop
+    /// (the record moved on).
+    async fn reseal(
         &self,
-        identity: &WorkloadIdentity,
         id: InstanceId,
-        token: &str,
-        env: &[(String, String)],
-        key: (&str, &str),
-        tries: u32,
+        fresh: Option<&Sealed>,
+        change: impl Fn(&Record, &mut Sealed) -> bool,
     ) -> Result<(), RuntimeError> {
-        let body = pod::secret_body(&self.cfg, identity, id, token, env, key);
-        let mut wait = Duration::from_millis(50);
-        for i in 0..tries {
-            match self.api.create(Kind::Secret, &body).await? {
-                Write::Done(_) => return Ok(()),
-                _ if i + 1 < tries => {
-                    tokio::time::sleep(wait).await;
-                    wait = (wait * 2).min(Duration::from_secs(1));
+        for _ in 0..SEAL_TRIES {
+            let (mut rec, rv, uid) = self.record_with_uid(id).await?;
+            let mut s = match (rec.sealed.is_some(), fresh) {
+                (true, _) => self
+                    .unsealed(&rec, &uid)
+                    .ok_or_else(|| RuntimeError::Internal {
+                        reason: "an instance record's seal does not open or does not match it"
+                            .to_owned(),
+                    })?,
+                (false, Some(f)) => f.clone(),
+                (false, None) => {
+                    return Err(RuntimeError::Internal {
+                        reason: "an instance record has no seal".to_owned(),
+                    });
                 }
-                _ => {}
+            };
+            if !change(&rec, &mut s) {
+                return Err(RuntimeError::Unavailable {
+                    reason: "the instance changed while its seal was written".to_owned(),
+                });
+            }
+            s.generation += 1;
+            s.digest = pod::fixed_digest(&rec);
+            rec.sealed = Some(
+                seal::seal(self.key(), &object_name(id), &uid, &s)
+                    .map_err(|reason| RuntimeError::Internal { reason })?,
+            );
+            if self.put(&rec, &rv).await? {
+                self.fresh_gen(id, s.generation);
+                return Ok(());
             }
         }
         Err(RuntimeError::Unavailable {
-            reason: format!("the instance Secret {} exists already", object_name(id)),
+            reason: "the instance record changes too often".to_owned(),
         })
     }
 
@@ -1020,11 +1276,43 @@ impl Inner {
         Ok(())
     }
 
-    /// Creates the pod of the record's run, checks what the API server stored, and starts the
-    /// log followers of this process.
-    async fn begin_run(self: &Arc<Self>, rec: &Record) -> Result<(), RuntimeError> {
+    /// The supervisor listener as the sandboxes reach it: `http://<ip>:<port>` (the address is
+    /// resolved in this process; the sandbox has no DNS).
+    async fn launch_url(&self) -> Result<String, RuntimeError> {
+        let a = &self.cfg.supervisor_address;
+        let ip = match a.parse::<IpAddr>() {
+            Ok(ip) => ip,
+            Err(_) => tokio::net::lookup_host((a.as_str(), self.cfg.supervisor_port))
+                .await
+                .ok()
+                .and_then(|mut x| x.next())
+                .map(|x| x.ip())
+                .ok_or_else(|| RuntimeError::Unavailable {
+                    reason: "the supervisor listener's address does not resolve".to_owned(),
+                })?,
+        };
+        Ok(format!(
+            "http://{}",
+            std::net::SocketAddr::new(ip, self.cfg.supervisor_port)
+        ))
+    }
+
+    /// The pod the driver makes for the record's run (also the reference of the read-back).
+    async fn expected_pod(&self, rec: &Record) -> Result<Value, RuntimeError> {
         let hosts = self.hosts(rec).await?;
-        let body = pod::pod_body(&self.cfg, rec, &hosts);
+        let url = self.launch_url().await?;
+        Ok(pod::pod_body(&self.cfg, rec, &hosts, &url))
+    }
+
+    /// Creates the pod of the record's run, checks what the API server stored, seals the pod's
+    /// uid as the one that may take the run's launch data (`fresh`: the first seal of a new
+    /// instance), and starts the log followers of this process.
+    async fn begin_run(
+        self: &Arc<Self>,
+        rec: &Record,
+        fresh: Option<&Sealed>,
+    ) -> Result<(), RuntimeError> {
+        let body = self.expected_pod(rec).await?;
         let name = pod_name(rec.instance, rec.run);
         let stored = match self.api.create(Kind::Pod, &body).await? {
             Write::Done(v) => v,
@@ -1034,11 +1322,41 @@ impl Inner {
                 });
             }
         };
-        if let Err(what) = pod::verify(&self.cfg, rec, &body, &stored) {
+        if let Err(what) = pod::verify(&self.cfg, &body, &stored) {
             let _ = self.api.delete(Kind::Pod, &name, Some(0)).await;
             return Err(RuntimeError::Internal {
                 reason: format!("the API server did not keep the sandbox: {what}"),
             });
+        }
+        let Some(pod_uid) = stored
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .filter(|u| !u.is_empty())
+            .map(str::to_owned)
+        else {
+            let _ = self.api.delete(Kind::Pod, &name, Some(0)).await;
+            return Err(RuntimeError::Internal {
+                reason: format!("the API server gave the pod {name} no uid"),
+            });
+        };
+        // The provenance of the pod (S-89): only a server process can write the seal, and a
+        // pod's uid is never reused. The supervisor's launch waits for it (503 until then).
+        let run = rec.run;
+        let sealed = self
+            .reseal(rec.instance, fresh, |now, s| {
+                if now.run != run
+                    || !matches!(now.state, InstanceState::Starting | InstanceState::Running)
+                {
+                    return false;
+                }
+                s.run = run;
+                s.pod_uid = Some(pod_uid.clone());
+                true
+            })
+            .await;
+        if let Err(e) = sealed {
+            let _ = self.api.delete(Kind::Pod, &name, Some(0)).await;
+            return Err(e);
         }
         if let Some(local) = self.local(rec.instance) {
             self.follow(&local, rec.run);
@@ -1054,6 +1372,7 @@ impl Inner {
         }
         st.followed_run = run;
         st.parked_at = None;
+        st.ring.join_budget();
         let redactors = Arc::new(Mutex::new(Redactors::new(
             &st.values(),
             self.cfg.max_line_bytes,
@@ -1098,30 +1417,11 @@ impl Inner {
         };
         let mut live_pods: HashMap<String, bool> = HashMap::new();
         let mut seen: std::collections::HashSet<InstanceId> = std::collections::HashSet::new();
-        // The keys in the list, and the instances whose keys must go (ended).
-        let mut keys: Vec<(String, String)> = Vec::new();
-        let mut keep_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
         let now = pod::now_ms();
         for cm in records {
             let Some((rec, _)) = pod::read_record(&cm) else {
-                let label = |k: &str| {
-                    cm.pointer(&format!("/metadata/labels/{k}"))
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                };
-                if label(LABEL_ROLE).as_deref() == Some(ROLE_KEY)
-                    && let (Some(name), Some(inst)) = (
-                        cm.pointer("/metadata/name").and_then(Value::as_str),
-                        label(crate::driver::LABEL_INSTANCE),
-                    )
-                {
-                    keys.push((name.to_owned(), inst));
-                }
                 continue;
             };
-            if !matches!(rec.state, InstanceState::Stopped | InstanceState::Exited(_)) {
-                keep_keys.insert(rec.instance.0.to_string());
-            }
             let id = rec.instance;
             seen.insert(id);
             match rec.state {
@@ -1157,13 +1457,9 @@ impl Inner {
                     if let Some(l) = self.local(id) {
                         let mut st = l.st.lock().expect("local lock");
                         if matches!(rec.state, InstanceState::Stopped | InstanceState::Exited(_)) {
-                            st.parked_at = None;
-                            if st.ended_at.is_none() {
-                                st.ended_at = Some(Instant::now());
-                            }
-                        } else if rec.state == InstanceState::ScaledToZero && st.parked_at.is_none()
-                        {
-                            st.parked_at = Some(Instant::now());
+                            st.set_ended();
+                        } else if rec.state == InstanceState::ScaledToZero {
+                            st.set_parked();
                         }
                     }
                     // A registration or a pod that a failed step left.
@@ -1183,7 +1479,6 @@ impl Inner {
                         .ended_ms
                         .is_some_and(|t| now - t > ms(self.cfg.ended_retention));
                     if expired && rec.registered.is_none() {
-                        // The record takes its keys, and they the Secret (garbage collector).
                         let _ = self
                             .api
                             .delete(Kind::ConfigMap, &object_name(id), None)
@@ -1191,16 +1486,6 @@ impl Inner {
                         self.drop_local(id);
                     }
                 }
-            }
-        }
-        // The keys of ended instances, and keys left without a record (their Secret goes with
-        // them). A start or a rotation since the list made its record before its key, so a key
-        // in the list has its record in the list unless the record is gone.
-        for (name, inst) in keys {
-            if !keep_keys.contains(&inst)
-                && let Err(e) = self.api.delete(Kind::ConfigMap, &name, None).await
-            {
-                tracing::debug!(target: "ruum::runtime", code = e.code(), "deleting a key failed");
             }
         }
         // Pods without a running record (a crash between the record and the delete).
@@ -1238,6 +1523,315 @@ impl Inner {
         }
         // Logs of ended instances after the retention, and within the caps.
         let _ = self.trim_locals(None);
+        self.shed_live();
+    }
+
+    /// Brings the live log budget back under its bound (S-91): the oldest lines of the tenant
+    /// with the most live log bytes go first, from its largest ring.
+    fn shed_live(&self) {
+        let locals: Vec<Arc<Local>> = self
+            .locals
+            .lock()
+            .expect("locals lock")
+            .values()
+            .cloned()
+            .collect();
+        for _ in 0..locals.len().max(1) {
+            let Some((excess, top)) = self.live.over_total() else {
+                return;
+            };
+            let largest = locals
+                .iter()
+                .filter(|l| l.identity.tenant == top)
+                .map(|l| {
+                    let st = l.st.lock().expect("local lock");
+                    (
+                        if st.ring.counted() {
+                            st.ring.memory()
+                        } else {
+                            0
+                        },
+                        l.clone(),
+                    )
+                })
+                .max_by_key(|(b, _)| *b);
+            match largest {
+                Some((b, l)) if b > 0 => {
+                    l.st.lock().expect("local lock").ring.shed(excess);
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// One more supervisor request of `peer` in the current window; `false` past the limit.
+    fn peer_ok(&self, peer: IpAddr) -> bool {
+        let mut m = self.peers.lock().expect("peers lock");
+        if m.len() > 65_536 {
+            m.retain(|_, (at, _)| at.elapsed() < PEER_WINDOW);
+        }
+        let e = m.entry(peer).or_insert((Instant::now(), 0));
+        if e.0.elapsed() >= PEER_WINDOW {
+            *e = (Instant::now(), 0);
+        }
+        e.1 += 1;
+        e.1 <= PEER_REQUESTS
+    }
+
+    /// The pod (name, uid) of a projected token, by a `TokenReview` (kept a short time), with
+    /// every field of the answer checked (`docs/STEP3.md` "The sandbox supervisor" 4).
+    async fn review(&self, bearer: &str) -> Result<(String, String), LaunchRefusal> {
+        use sha2::{Digest, Sha256};
+        let refuse = |why: &str| {
+            tracing::warn!(target: "ruum::runtime", reason = why, "a supervisor token was refused");
+            LaunchRefusal::Forbidden
+        };
+        if bearer.is_empty() || bearer.len() > 16 * 1024 {
+            return Err(refuse("no token or an oversized one"));
+        }
+        let hash: [u8; 32] = Sha256::digest(bearer.as_bytes()).into();
+        if let Some((name, uid, until)) = self.reviews.lock().expect("reviews lock").get(&hash)
+            && Instant::now() < *until
+        {
+            return Ok((name.clone(), uid.clone()));
+        }
+        let status = self
+            .api
+            .token_review(bearer, &self.cfg.supervisor_audience)
+            .await
+            .map_err(|e| {
+                tracing::warn!(target: "ruum::runtime", code = e.code(), "a TokenReview failed");
+                LaunchRefusal::NotReady
+            })?;
+        if status.get("authenticated") != Some(&Value::Bool(true)) {
+            return Err(refuse("not authenticated"));
+        }
+        if status
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|e| !e.is_empty())
+        {
+            return Err(refuse("the review has an error"));
+        }
+        let aud_ok = status
+            .get("audiences")
+            .and_then(Value::as_array)
+            .is_some_and(|a| {
+                a.iter()
+                    .any(|x| x.as_str() == Some(self.cfg.supervisor_audience.as_str()))
+            });
+        if !aud_ok {
+            return Err(refuse("the audience was not granted"));
+        }
+        let user = format!(
+            "system:serviceaccount:{}:{}",
+            self.cfg.namespace, self.cfg.sandbox_service_account
+        );
+        if status.pointer("/user/username").and_then(Value::as_str) != Some(user.as_str()) {
+            return Err(refuse("not the sandbox ServiceAccount"));
+        }
+        let one = |k: &str| -> Option<String> {
+            let a = status.pointer("/user/extra")?.get(k)?.as_array()?;
+            match a.as_slice() {
+                [Value::String(v)] if !v.is_empty() => Some(v.clone()),
+                _ => None,
+            }
+        };
+        let (Some(name), Some(uid)) = (
+            one("authentication.kubernetes.io/pod-name"),
+            one("authentication.kubernetes.io/pod-uid"),
+        ) else {
+            return Err(refuse("not exactly one pod name and pod uid"));
+        };
+        // Kept at most REVIEW_TTL and never past the token's own expiry.
+        let left = jwt_exp(bearer)
+            .map(|exp| exp - pod::now_ms() / 1000)
+            .unwrap_or(0);
+        if left <= 0 {
+            return Err(refuse("the token has no future expiry"));
+        }
+        let keep = REVIEW_TTL.min(Duration::from_secs(left as u64));
+        let mut cache = self.reviews.lock().expect("reviews lock");
+        if cache.len() >= REVIEW_CACHE_MAX {
+            let now = Instant::now();
+            cache.retain(|_, (_, _, until)| *until > now);
+            if cache.len() >= REVIEW_CACHE_MAX {
+                cache.clear();
+            }
+        }
+        cache.insert(hash, (name.clone(), uid.clone(), Instant::now() + keep));
+        Ok((name, uid))
+    }
+
+    /// The checks of one supervisor request after the token review: the pod exists now with
+    /// that uid, is not being deleted and has the peer address; its record unseals and matches;
+    /// the sealed run and pod uid are this pod's; the generation is not old; and the stored pod
+    /// is exactly the driver's pod for the sealed record. Returns the opened seal and the record.
+    async fn authorize(
+        &self,
+        pod_n: &str,
+        pod_uid: &str,
+        peer: IpAddr,
+    ) -> Result<(Sealed, Record, String, String), LaunchRefusal> {
+        let refuse = |why: &str| {
+            tracing::warn!(target: "ruum::runtime", pod = pod_n, reason = why, "a supervisor request was refused");
+            LaunchRefusal::Forbidden
+        };
+        let not_ready = |why: &str| {
+            tracing::info!(target: "ruum::runtime", pod = pod_n, reason = why, "a supervisor request must wait");
+            LaunchRefusal::NotReady
+        };
+        let (object, run) = pod_n
+            .rsplit_once('-')
+            .ok_or_else(|| refuse("not a sandbox pod name"))?;
+        let run: u32 = run.parse().map_err(|_| refuse("not a sandbox pod name"))?;
+        let id = object
+            .strip_prefix("ruum-i-")
+            .filter(|h| h.len() == 32)
+            .and_then(|h| uuid::Uuid::parse_str(h).ok())
+            .map(InstanceId)
+            .ok_or_else(|| refuse("not a sandbox pod name"))?;
+        let pod = self
+            .api
+            .get(Kind::Pod, pod_n)
+            .await
+            .map_err(|_| not_ready("the pod cannot be read"))?
+            .ok_or_else(|| refuse("the pod does not exist"))?;
+        if pod.pointer("/metadata/uid").and_then(Value::as_str) != Some(pod_uid) {
+            return Err(refuse("the pod has another uid"));
+        }
+        if pod.pointer("/metadata/deletionTimestamp").is_some() {
+            return Err(refuse("the pod is being deleted"));
+        }
+        let mut ips: Vec<IpAddr> = pod
+            .pointer("/status/podIPs")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.get("ip").and_then(Value::as_str))
+                    .filter_map(|x| x.parse::<IpAddr>().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(ip) = pod
+            .pointer("/status/podIP")
+            .and_then(Value::as_str)
+            .and_then(|x| x.parse::<IpAddr>().ok())
+        {
+            ips.push(ip);
+        }
+        if !ips.iter().any(|ip| canonical(*ip) == peer) {
+            return Err(refuse("the request does not come from the pod's address"));
+        }
+        let (rec, rv, rec_uid) = match self.record_with_uid(id).await {
+            Ok(r) => r,
+            Err(RuntimeError::NotFound { .. }) => return Err(refuse("the instance has no record")),
+            Err(_) => return Err(not_ready("the record cannot be read")),
+        };
+        if rec.instance != id {
+            return Err(refuse("the record is another instance's"));
+        }
+        if rec.sealed.is_none() {
+            return Err(not_ready("the record is not sealed yet"));
+        }
+        let s = self
+            .unsealed(&rec, &rec_uid)
+            .ok_or_else(|| refuse("the seal does not open or does not match the record"))?;
+        if !self.fresh_gen(id, s.generation) {
+            return Err(refuse("an older seal was put back"));
+        }
+        if s.pod_uid.as_deref() != Some(pod_uid) {
+            // The record's run counter names this pod's run, whose seal comes right after the
+            // pod: wait. (A writer of the record can make that so for a pod of its own; it then
+            // waits for nothing.)
+            let pending = rec.run == run && (s.run < run || s.pod_uid.is_none());
+            return Err(if pending {
+                not_ready("the pod's run is not sealed yet")
+            } else {
+                refuse("the seal names another pod")
+            });
+        }
+        if s.run != run {
+            return Err(refuse("the seal names another run"));
+        }
+        if !matches!(rec.state, InstanceState::Starting | InstanceState::Running) {
+            return Err(refuse("the instance does not run"));
+        }
+        let mut sealed_rec = rec.clone();
+        sealed_rec.run = s.run;
+        let want = self
+            .expected_pod(&sealed_rec)
+            .await
+            .map_err(|_| not_ready("the expected pod cannot be made"))?;
+        if let Err(what) = pod::verify(&self.cfg, &want, &pod) {
+            tracing::warn!(target: "ruum::runtime", pod = pod_n, differs = %what, "a supervisor request was refused: the pod is not the driver's");
+            return Err(LaunchRefusal::Forbidden);
+        }
+        Ok((s, rec, rv, rec_uid))
+    }
+
+    /// The supervisor listener (`launch`: `/v1/launch`, else `/v1/token`).
+    async fn supervisor(
+        &self,
+        bearer: &str,
+        peer: IpAddr,
+        launch: bool,
+    ) -> Result<Vec<u8>, LaunchRefusal> {
+        let peer = canonical(peer);
+        if !self.peer_ok(peer) {
+            tracing::warn!(target: "ruum::runtime", %peer, "too many supervisor requests from one address");
+            return Err(LaunchRefusal::TooMany);
+        }
+        let (pod_n, pod_uid) = self.review(bearer).await?;
+        for _ in 0..SEAL_TRIES {
+            let (s, mut rec, rv, rec_uid) = self.authorize(&pod_n, &pod_uid, peer).await?;
+            let launched = s.launched.iter().any(|u| *u == pod_uid);
+            if !launch {
+                if !launched {
+                    tracing::warn!(target: "ruum::runtime", pod = %pod_n, "a token request before the launch was refused");
+                    return Err(LaunchRefusal::Forbidden);
+                }
+                return serde_json::to_vec(&TokenAnswer {
+                    v: LAUNCH_VERSION,
+                    token: s.token,
+                })
+                .map_err(|_| LaunchRefusal::NotReady);
+            }
+            if launched {
+                tracing::warn!(target: "ruum::runtime", pod = %pod_n, "a second launch of a pod was refused");
+                return Err(LaunchRefusal::Forbidden);
+            }
+            // Once per pod: the pod's uid is sealed into the launched list before the answer.
+            let mut next = s.clone();
+            next.launched.push(pod_uid.clone());
+            while next.launched.len() > MAX_LAUNCHED {
+                next.launched.remove(0);
+            }
+            next.generation += 1;
+            let Ok(text) = seal::seal(self.key(), &object_name(rec.instance), &rec_uid, &next)
+            else {
+                return Err(LaunchRefusal::NotReady);
+            };
+            rec.sealed = Some(text);
+            match self.put(&rec, &rv).await {
+                Ok(true) => {
+                    self.fresh_gen(rec.instance, next.generation);
+                    let answer = Launch {
+                        v: LAUNCH_VERSION,
+                        argv: s.argv,
+                        env: s.env,
+                        redact: s.previous,
+                        token: Some(s.token),
+                        pids_limit: self.cfg.pids_limit,
+                        token_poll_secs: Some(TOKEN_POLL_SECS),
+                    };
+                    return serde_json::to_vec(&answer).map_err(|_| LaunchRefusal::NotReady);
+                }
+                Ok(false) => continue,
+                Err(_) => return Err(LaunchRefusal::NotReady),
+            }
+        }
+        Err(LaunchRefusal::NotReady)
     }
 
     /// Forgets the logs of ended instances past the retention; then, while more than
@@ -1598,10 +2192,50 @@ impl RuntimeDriver for KubeDriver {
             }
         };
         let image = inner.image(&spec.identity, &digest).await?;
+        // The supervisor's launch data (I6-20): the command as the runtime would run it.
+        let (entrypoint, cmd) = inner.image_command(&spec.identity, &digest).await?;
+        let mut argv = entrypoint;
+        argv.extend(if spec.command.is_empty() {
+            cmd
+        } else {
+            spec.command.clone()
+        });
+        if argv.is_empty() {
+            return Err(RuntimeError::UnsupportedImage {
+                reason: "the image has no command and the spec gives none".to_owned(),
+            });
+        }
         let rec = Record::new(&spec, id, image);
         let name = object_name(id);
-        let secret_env = pod::secret_env(&spec);
         let token = spec.workload_token.expose().to_owned();
+        let fresh = Sealed {
+            generation: 0,
+            digest: pod::fixed_digest(&rec),
+            argv,
+            env: pod::secret_env(&spec),
+            previous: spec
+                .previous_secrets
+                .iter()
+                .map(|v| v.expose().to_owned())
+                .filter(|v| !v.is_empty())
+                .collect(),
+            token: token.clone(),
+            run: rec.run,
+            pod_uid: None,
+            launched: Vec::new(),
+        };
+        // The launch data must pass the supervisor's own checks.
+        Launch {
+            v: LAUNCH_VERSION,
+            argv: fresh.argv.clone(),
+            env: fresh.env.clone(),
+            redact: fresh.previous.clone(),
+            token: Some(token.clone()),
+            pids_limit: inner.cfg.pids_limit,
+            token_poll_secs: Some(TOKEN_POLL_SECS),
+        }
+        .check()
+        .map_err(|why| RuntimeError::invalid("spec", why))?;
         let base: Vec<String> = spec
             .redacted_values()
             .into_iter()
@@ -1612,11 +2246,11 @@ impl RuntimeDriver for KubeDriver {
             id,
             identity: spec.identity,
             made: Instant::now(),
-            secret_env,
             rotating: tokio::sync::Mutex::new(()),
             redactors: Mutex::new(None),
             st: Mutex::new(LocalSt {
-                ring: Ring::new(inner.cfg.log_lines, MAX_LOG_BYTES, inner.cfg.max_line_bytes),
+                ring: Ring::new(inner.cfg.log_lines, MAX_LOG_BYTES, inner.cfg.max_line_bytes)
+                    .with_budget(inner.live.clone(), spec.identity.tenant),
                 base,
                 tokens: VecDeque::from([token]),
                 followed_run: 0,
@@ -1628,62 +2262,29 @@ impl RuntimeDriver for KubeDriver {
         });
         // Room for its logs in this process, before anything is made (the Local is added).
         inner.trim_locals(Some(&local))?;
-        // The record first: a crash after it leaves a record that the sweep ends and removes
-        // (with its keys and their Secret, by the garbage collector), never a Secret nobody
-        // knows.
+        // The record first (unsealed): a crash after it leaves a record that the sweep ends and
+        // removes. The pod comes next, then the seal that names the pod (`begin_run`).
         let made = inner
             .api
             .create(Kind::ConfigMap, &pod::record_body(&inner.cfg, &rec, None))
             .await;
-        let record_uid = match made {
-            Ok(Write::Done(v)) => v
-                .pointer("/metadata/uid")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
+        match made {
+            Ok(Write::Done(_)) => {}
             other => {
                 inner.locals.lock().expect("locals lock").remove(&id);
                 return Err(other.err().unwrap_or_else(|| RuntimeError::Internal {
                     reason: format!("the instance record {name} exists already"),
                 }));
             }
-        };
-        let undo = |e: RuntimeError| async move {
+        }
+        if let Err(e) = inner.begin_run(&rec, Some(&fresh)).await {
             let _ = inner.api.delete(Kind::Pod, &pod_name(id, 1), Some(0)).await;
-            inner.drop_keys(id, None).await;
             let _ = inner
                 .api
                 .delete(Kind::ConfigMap, &object_name(id), None)
                 .await;
             inner.locals.lock().expect("locals lock").remove(&id);
-            e
-        };
-        if record_uid.is_empty() {
-            return Err(undo(RuntimeError::Internal {
-                reason: format!("the API server gave the instance record {name} no uid"),
-            })
-            .await);
-        }
-        let made = match inner.new_key(&spec.identity, id, &record_uid).await {
-            Ok(key) => {
-                inner
-                    .create_secret(
-                        &spec.identity,
-                        id,
-                        spec.workload_token.expose(),
-                        &local.secret_env,
-                        (&key.0, &key.1),
-                        1,
-                    )
-                    .await
-            }
-            Err(e) => Err(e),
-        };
-        if let Err(e) = made {
-            return Err(undo(e).await);
-        }
-        if let Err(e) = inner.begin_run(&rec).await {
-            return Err(undo(e).await);
+            return Err(e);
         }
         Ok(inner.status_of(&rec, Health::Unknown))
     }
@@ -1857,7 +2458,7 @@ impl RuntimeDriver for KubeDriver {
             if let Some(l) = inner.local(instance) {
                 l.st.lock().expect("local lock").touched_ms = now;
             }
-            if let Err(e) = inner.begin_run(&rec).await {
+            if let Err(e) = inner.begin_run(&rec, None).await {
                 // The run did not start: the instance ended (a wake does not leave a record
                 // that says starting with no pod; the sweep would end it anyway).
                 if let Ok((r, rv)) = inner.record(tenant, instance).await {
@@ -1941,29 +2542,17 @@ impl RuntimeDriver for KubeDriver {
             };
         }
         let inner = &self.inner;
-        let cm = inner
-            .api
-            .get(Kind::ConfigMap, &object_name(instance))
-            .await?
-            .ok_or_else(|| not_found(instance))?;
-        let rec = match pod::read_record(&cm) {
-            Some((rec, _)) if rec.identity.tenant == tenant && rec.instance == instance => rec,
-            _ => return Err(not_found(instance)),
-        };
+        let (rec, _) = inner.record(tenant, instance).await?;
         if !matches!(
             rec.state,
             InstanceState::Starting | InstanceState::Running | InstanceState::ScaledToZero
         ) {
             return Err(state_err("rotate the token of", &rec.state));
         }
-        let record_uid = cm
-            .pointer("/metadata/uid")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
         // Redact the new value before the process can read it. Only the process that follows the
         // log can (it holds the values): another one refuses, so a new token never reaches a
-        // log that does not redact it (fails closed; the renewal tries again).
+        // log that does not redact it (fails closed; the renewal tries again). The supervisor
+        // redacts it in the sandbox too, before it writes the token file.
         let Some(l) = inner.local(instance) else {
             return Err(RuntimeError::Unavailable {
                 reason:
@@ -1971,6 +2560,7 @@ impl RuntimeDriver for KubeDriver {
                         .to_owned(),
             });
         };
+        let _one = l.rotating.lock().await;
         {
             let all = {
                 let mut st = l.st.lock().expect("local lock");
@@ -1984,35 +2574,43 @@ impl RuntimeDriver for KubeDriver {
                 r.lock().unwrap_or_else(|p| p.into_inner()).set(&all);
             }
         }
-        // No write verb but create on Secrets (each other one can read one, see `pod`): a new
-        // key, the old keys deleted (the garbage collector removes the old Secret), then the
-        // Secret again under the new key. Meanwhile a running pod keeps its token file (the
-        // kubelet keeps the last content) and a cold start waits for the Secret.
-        let _one = l.rotating.lock().await;
-        let key = inner.new_key(&rec.identity, instance, &record_uid).await?;
-        if !inner.drop_keys(instance, Some(&key.0)).await {
-            return Err(RuntimeError::Unavailable {
-                reason: "the old key of the instance Secret is not removed yet".to_owned(),
-            });
-        }
+        // The new token into the seal; the supervisor fetches it at its next token request.
+        let new = token.expose().to_owned();
         inner
-            .create_secret(
-                &rec.identity,
-                instance,
-                token.expose(),
-                &l.secret_env,
-                (&key.0, &key.1),
-                SECRET_CREATE_TRIES,
-            )
-            .await?;
-        // A stop since the record read dropped the keys before this one: the Secret goes now.
-        if let Ok((now, _)) = inner.record(tenant, instance).await
-            && matches!(now.state, InstanceState::Stopped | InstanceState::Exited(_))
-        {
-            inner.drop_keys(instance, None).await;
-        }
-        Ok(())
+            .reseal(instance, None, |now, s| {
+                if !matches!(
+                    now.state,
+                    InstanceState::Starting | InstanceState::Running | InstanceState::ScaledToZero
+                ) {
+                    return false;
+                }
+                s.token = new.clone();
+                true
+            })
+            .await
     }
+}
+
+/// An address in one form: an IPv4-mapped IPv6 address as IPv4.
+fn canonical(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    }
+}
+
+/// The `exp` claim of a JWT (seconds), read without checking the signature: the `TokenReview`
+/// checked the token; this only bounds how long its answer is kept.
+fn jwt_exp(token: &str) -> Option<i64> {
+    use base64::Engine;
+    let payload = token.split('.').nth(1)?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    serde_json::from_slice::<Value>(&raw)
+        .ok()?
+        .get("exp")?
+        .as_i64()
 }
 
 fn static_status(id: InstanceId, s: &StaticInst) -> InstanceStatus {
