@@ -55,6 +55,10 @@ spec:
       # The runtime driver's account (charts/platform runtime-rbac.yaml): its token only in the
       # projected volume kube-api below, for the Role in ruum-apps.
       serviceAccountName: ruum-server
+      {{- else }}
+      # Named, not left out: Kubernetes keeps the deprecated serviceAccount field of an earlier
+      # release, so a pod spec without the name still runs as ruum-server (backlog S-93).
+      serviceAccountName: default
       {{- end }}
       # The preStop pause, the drain and a margin (design 12.7).
       terminationGracePeriodSeconds: {{ add $pause $grace 10 }}
