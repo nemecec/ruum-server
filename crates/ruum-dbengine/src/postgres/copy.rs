@@ -478,7 +478,7 @@ async fn hand_over(
     result?;
     revoked?;
     // 2. The copy's owner empties or masks its tables, in a session of its own.
-    let mut left_out = Vec::new();
+    let mut masked_out = MaskOutcome::default();
     if !matches!(data, Data::Keep) {
         let owner = new_roles
             .iter()
@@ -486,7 +486,7 @@ async fn hand_over(
             .cloned()
             .expect("an owner role");
         setup::grant_connect(engine, name, std::slice::from_ref(&owner)).await?;
-        left_out = change_data(engine, name, new, new_roles, &data).await?;
+        masked_out = change_data(engine, name, new, new_roles, &data).await?;
     }
     // 3. ruum_dbhost makes the objects of mask again with the copy's key and builds the lens.
     // It refuses the copy when tenant code of step 2 left an object that depends on an object
@@ -505,8 +505,61 @@ async fn hand_over(
     .await;
     let _ = conn.close().await;
     result?;
+    // 4. The copy's owner fills the materialized views that step 2 made again, now that the
+    // `ruum_copy` functions (the pseudonyms of the SOURCE key) are gone (Kimi re-check of D-3b).
+    if !masked_out.refresh.is_empty() {
+        refresh_views(engine, name, new, new_roles, &masked_out.refresh).await?;
+    }
     setup::grant_connect(engine, name, new_roles).await?;
-    Ok(left_out)
+    Ok(masked_out.left_out)
+}
+
+/// What a masked copy's step 2 hands on ([`mask_columns`]).
+#[derive(Default)]
+struct MaskOutcome {
+    /// The keys and foreign keys left out (`table.name`), for [`CreatedDatabase::left_out`].
+    left_out: Vec<String>,
+    /// The materialized views made again unpopulated, in the order they can be filled.
+    refresh: Vec<String>,
+}
+
+/// Step 4 of a masked copy, in a session of the copy's `owner`: fills each materialized view
+/// that the masking made again (`refresh`), from the masked tables. A view whose query fails
+/// stays unpopulated; it never holds a value of the source. This runs after step 3 has dropped
+/// the `ruum_copy` entry points, so tenant code in a view's query or in an index of it can no
+/// longer compute pseudonyms of the source's key (a dictionary attack on the masked values,
+/// Kimi re-check of D-3b).
+async fn refresh_views(
+    engine: &PostgresEngine,
+    name: &str,
+    new: &NewDatabase,
+    new_roles: &[EngineRole],
+    refresh: &[String],
+) -> Result<(), EngineError> {
+    let state = DbState::new(
+        name.to_string(),
+        Meta {
+            tenant_id: new.tenant_id,
+            node_id: new.node_id,
+            roles: new_roles.to_vec(),
+        },
+    );
+    let (mut conn, _) = engine.pool(&state, RoleKind::Owner).open(engine).await?;
+    let result = async {
+        run(&mut conn, "begin", "begin".to_string()).await?;
+        for view in refresh {
+            build_again(
+                &mut conn,
+                "fill a materialized view again",
+                format!("refresh materialized view {view}"),
+            )
+            .await?;
+        }
+        run(&mut conn, "commit", "commit".to_string()).await
+    }
+    .await;
+    let _ = conn.close().await;
+    result
 }
 
 /// Refuses a copy that holds an enabled event trigger (review FU-1-2 of Kimi). The hand-over
@@ -629,14 +682,14 @@ async fn drop_copy_entry_points(conn: &mut PgConnection) -> Result<(), EngineErr
 /// Step 2 of a hand-over, in a session of the copy's `owner` (it owns every table and holds
 /// none of `ruum_dbhost`'s rights): parks the tenant's triggers, rules and forced row-level
 /// security, empties or masks the tables, and puts the tenant code back as it was. Returns what
-/// a masked copy left out ([`mask_columns`]).
+/// a masked copy left out and the materialized views it made again ([`mask_columns`]).
 async fn change_data(
     engine: &PostgresEngine,
     name: &str,
     new: &NewDatabase,
     new_roles: &[EngineRole],
     data: &Data<'_>,
-) -> Result<Vec<String>, EngineError> {
+) -> Result<MaskOutcome, EngineError> {
     let state = DbState::new(
         name.to_string(),
         Meta {
@@ -649,11 +702,11 @@ async fn change_data(
     let result = async {
         run(&mut conn, "begin", "begin".to_string()).await?;
         let parked = park_tenant_code(&mut conn).await?;
-        let left_out = match data {
-            Data::Keep => Vec::new(),
+        let out = match data {
+            Data::Keep => MaskOutcome::default(),
             Data::SchemaOnly => {
                 empty_tables(&mut conn).await?;
-                Vec::new()
+                MaskOutcome::default()
             }
             Data::Masked(plan, _) => mask_columns(&mut conn, plan).await?,
         };
@@ -661,7 +714,7 @@ async fn change_data(
             run(&mut conn, "put the tenant code back", sql).await?;
         }
         run(&mut conn, "commit", "commit".to_string()).await?;
-        Ok(left_out)
+        Ok(out)
     }
     .await;
     let _ = conn.close().await;
@@ -776,10 +829,10 @@ async fn empty_tables(conn: &mut PgConnection) -> Result<(), EngineError> {
 async fn mask_columns(
     conn: &mut PgConnection,
     plan: &MaskPlan,
-) -> Result<Vec<String>, EngineError> {
+) -> Result<MaskOutcome, EngineError> {
     check_planned_from(conn, plan).await?;
     if plan.columns.is_empty() {
-        return Ok(Vec::new());
+        return Ok(MaskOutcome::default());
     }
     let types = lens::pseudonym_types(conn).await?;
     // The views and materialized views of the tenant that read a masked column, also through
@@ -988,8 +1041,12 @@ async fn mask_columns(
             }
         }
     }
+    let mut refresh = Vec::new();
     for v in &views {
         v.make_again(conn).await?;
+        if v.materialized {
+            refresh.push(v.name.clone());
+        }
     }
     // The keys first: a foreign key needs the key it references.
     let mut left_out = Vec::new();
@@ -1029,7 +1086,7 @@ async fn mask_columns(
     }
     left_out.sort();
     left_out.dedup();
-    Ok(left_out)
+    Ok(MaskOutcome { left_out, refresh })
 }
 
 /// A key, a `UNIQUE` or exclusion constraint or a unique index that [`mask_columns`] dropped
@@ -1413,8 +1470,10 @@ impl DependentView {
 
     /// Makes the view again over the masked tables. A view whose definition does not fit the
     /// masked columns (for example arithmetic on a personal number, which is now a pseudonym)
-    /// refuses the copy. A materialized view is filled from the masked tables, or left
-    /// unpopulated when its query fails on them: it never keeps a value of the source.
+    /// refuses the copy. A materialized view is made again unpopulated: step 4 of the hand-over
+    /// fills it from the masked tables after the `ruum_copy` functions are gone
+    /// ([`refresh_views`]), or leaves it unpopulated when its query fails on them. It never
+    /// keeps a value of the source.
     async fn make_again(&self, conn: &mut PgConnection) -> Result<(), EngineError> {
         let with = if self.options.is_empty() {
             String::new()
@@ -1423,41 +1482,16 @@ impl DependentView {
         };
         let definition = self.definition.trim().trim_end_matches(';');
         if self.materialized {
-            run(conn, "savepoint", "savepoint ruum_view".to_string()).await?;
-            let filled = run(
+            run(
                 conn,
-                "make a materialized view again",
+                "make a materialized view again, unpopulated",
                 format!(
-                    "create materialized view {}{with} as {definition} with data",
+                    "create materialized view {}{with} as {definition} with no data",
                     self.name
                 ),
             )
-            .await;
-            if filled.is_ok() {
-                run(
-                    conn,
-                    "end the savepoint",
-                    "release savepoint ruum_view".into(),
-                )
-                .await?;
-            } else {
-                run(
-                    conn,
-                    "end the savepoint",
-                    "rollback to savepoint ruum_view".into(),
-                )
-                .await?;
-                run(
-                    conn,
-                    "make a materialized view again, unpopulated",
-                    format!(
-                        "create materialized view {}{with} as {definition} with no data",
-                        self.name
-                    ),
-                )
-                .await
-                .map_err(|e| self.refusal(e))?;
-            }
+            .await
+            .map_err(|e| self.refusal(e))?;
             for index in &self.indexes {
                 run(
                     conn,

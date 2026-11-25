@@ -716,10 +716,12 @@ async fn step_2_of_a_masked_copy_has_no_right_on_ruum_mask() {
     close(host).await;
 }
 
-/// Tenant code in step 2 of a masked copy may call the pseudonym functions through the entry
-/// points of `ruum_copy`. An object it makes there that points at an entry point would keep a
-/// reference into the platform's schemas, so step 3 refuses the copy instead (review-masking-1
-/// F2).
+/// Tenant code of a materialized view that a masked copy makes again runs only in step 4, after
+/// step 3 dropped the entry points of `ruum_copy` (Kimi re-check of D-3b): it can no longer call
+/// the pseudonym functions of the source's key, nor make an object that points at them. Before,
+/// the view was filled in step 2 and step 3 refused such an object (review-masking-1 F2); that
+/// refusal stays as a second line. The copy goes through, the view is filled, and no object
+/// points into the platform's schemas.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_masked_copy_refuses_an_object_that_points_into_the_lens_schemas() {
     let Some(engine) = engine().await else { return };
@@ -728,12 +730,34 @@ async fn a_masked_copy_refuses_an_object_that_points_into_the_lens_schemas() {
         "CREATE VIEW public.k AS SELECT ruum_copy.pseudonym('x'::text) AS p",
     )
     .await;
-    let err = masked_copy_of_planting(&engine, &f)
+    let copy = masked_copy_of_planting(&engine, &f)
         .await
-        .expect_err("the copy is refused");
-    let err = format!("{err:?}");
-    assert!(err.contains("depend on the lens schemas"), "{err}");
-    assert!(err.contains("_RETURN"), "{err}");
+        .expect("the copy goes through: the entry points are gone when the view is filled");
+    let mut owner = session(&engine, &copy.database, RoleKind::Owner).await;
+    assert_eq!(
+        psql(
+            &mut owner,
+            "select string_agg(distinct what, ',') || '/' || (to_regclass('public.k') is null)::text \
+               from public.seen",
+        )
+        .await
+        .unwrap(),
+        "false|denied/true",
+        "the view's code ran, could not reach ruum_copy, and made no object pointing at it"
+    );
+    close(owner).await;
+    let mut host = dbhost(&engine, &copy.database).await;
+    assert_eq!(
+        psql(
+            &mut host,
+            "select (to_regnamespace('ruum_copy') is null)::text",
+        )
+        .await
+        .unwrap(),
+        "true",
+        "the entry points are gone"
+    );
+    close(host).await;
     let mut host = dbhost(&engine, f.db()).await;
     assert_eq!(
         psql(&mut host, "select (to_regclass('public.k') is null)::text")
