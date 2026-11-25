@@ -1834,17 +1834,29 @@ pub(crate) async fn drop_database(
     engine: &PostgresEngine,
     db: &DatabaseRef,
 ) -> Result<(), EngineError> {
-    let state = engine.resolve(db).await?;
+    let state = match engine.resolve(db).await {
+        Ok(state) => state,
+        Err(EngineError::NotFound) => return drop_gone(engine, db).await,
+        Err(e) => return Err(e),
+    };
     let _ops = state.ops.lock().await;
     if state.dropped.load(Ordering::SeqCst) {
-        return Err(EngineError::NotFound);
+        return drop_gone(engine, db).await;
     }
     let points = restore_points(engine, &state.name).await?;
     // Its app roles go with it (card D-5): no login from now on, their sessions end, and after
-    // the database they leave every other database that names them.
+    // the database they leave every other database that names them. The mark on each role
+    // outlives the database, so a retry finishes what this call leaves (`drop_gone`).
     let apps = app_roles::names(engine, &state.name).await;
     app_roles::refuse_logins(engine, &apps).await?;
-    let guard = drain(engine, &state).await?;
+    app_roles::mark_for_drop(engine, &state.name, &apps).await?;
+    let guard = match drain(engine, &state).await {
+        Ok(guard) => guard,
+        Err(e) => {
+            app_roles::unmark(engine, &apps).await;
+            return Err(e);
+        }
+    };
     state.dropped.store(true, Ordering::SeqCst);
     engine.forget(&state.name);
     let dropped = async {
@@ -1861,13 +1873,27 @@ pub(crate) async fn drop_database(
         state.dropped.store(false, Ordering::SeqCst);
         let _ = resume(engine, &state.name).await;
         drop(guard);
+        app_roles::unmark(engine, &apps).await;
         return Err(e);
     }
     drop(guard);
     for (_, _, snapshot) in points {
         drop_snapshot(engine, &snapshot).await;
     }
+    // Out of the app budget before the drop: a role that another database holds back (the
+    // drop fails) counts for nothing until a retry drops it.
+    let _ = app_roles::release_connections(engine, &apps).await;
     let apps_dropped = app_roles::drop_orphans(engine, &apps).await;
     setup::drop_roles(engine, &state.meta.roles).await?;
     apps_dropped
+}
+
+/// `drop_database` of a database that is gone: the app roles that an earlier try marked and
+/// could not drop are dropped now ([`app_roles::drop_marked`]), and only then `NotFound`. So a
+/// retried purge never takes the missing database for a finished drop (Kimi run 15 on D-5).
+async fn drop_gone(engine: &PostgresEngine, db: &DatabaseRef) -> Result<(), EngineError> {
+    if db.cluster == engine.config.cluster && super::is_db_name(&db.engine_name) {
+        app_roles::drop_marked(engine, &db.engine_name).await?;
+    }
+    Err(EngineError::NotFound)
 }

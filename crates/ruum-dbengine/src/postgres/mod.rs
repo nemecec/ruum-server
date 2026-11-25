@@ -267,6 +267,11 @@ pub struct PostgresEngine {
     /// statement (the race of decision 0004-38 b).
     #[cfg(test)]
     pub(crate) between_checks: crate::lock::Mutex<Option<String>>,
+    /// Tests only: a script that the `owner` of a database runs and commits in a session of its
+    /// own right before each of the next `n` `DROP ROLE` statements of an app role (a grant made
+    /// again between the strip and the drop, Kimi run 15 on D-5).
+    #[cfg(test)]
+    pub(crate) before_role_drop: crate::lock::Mutex<Option<(DatabaseRef, String, usize)>>,
 }
 
 /// Whether a name is a neutral database name (`d_` + 16 hex).
@@ -306,6 +311,8 @@ impl PostgresEngine {
             allow_transaction_control: AtomicBool::new(false),
             #[cfg(test)]
             between_checks: Default::default(),
+            #[cfg(test)]
+            before_role_drop: Default::default(),
         })
     }
 
