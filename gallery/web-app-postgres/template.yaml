@@ -1,0 +1,25 @@
+# A gallery template (contracts/manifests/template.schema.json). docs: gallery/README.md
+manifest_version: 1
+kind: project
+name: Web app + Postgres + sign-in
+description: >-
+  A Node web app with a Postgres database. People sign in through Ruum: the app needs no
+  password, no session secret and no sign-in code of its own. Start here for a small
+  internal app with a list of records.
+version: 1.0.0
+setup:
+  - folder:
+      path: Issues
+      type: issues
+  - database:
+      name: app-db
+      manifest: db/manifest.yaml
+      migrations: db/migrations/
+      sample_data: db/sample.sql
+  - app:
+      name: app
+      archive: app.tar.gz
+placeholders:
+  client:
+    description: The client who reviews the app and comments on it
+    role: comment

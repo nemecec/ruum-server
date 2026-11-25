@@ -84,6 +84,9 @@ pub struct Services {
     /// The telemetry store, its class source and the read operations (card O-2): in memory
     /// here; the server and the Postgres suites install the Postgres class source.
     pub telemetry: Arc<crate::telemetry::query::TelemetryService>,
+    /// The templates (card L-1): the gallery of a `TemplateSource` and the template
+    /// operations. Empty in memory; the server loads `RUUM_GALLERY_DIR`.
+    pub templates: Arc<crate::templates::TemplateService>,
 }
 
 /// The concrete in-memory stores behind a [`Services::in_memory_with_handles`] set, for tests
@@ -253,6 +256,7 @@ impl Services {
             sandboxes: None,
             workload_tokens: None,
             telemetry,
+            templates: Arc::new(crate::templates::TemplateService::empty()),
         };
         (services, handles)
     }

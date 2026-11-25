@@ -1,0 +1,28 @@
+# A gallery issue template (contracts/manifests/template.schema.json, design 9.7).
+manifest_version: 1
+kind: issue
+name: Feature request
+description: Something new that the app should do.
+version: 1.0.0
+issue:
+  schema:
+    type: object
+    required: [problem]
+    additionalProperties: false
+    properties:
+      problem:
+        type: string
+        maxLength: 10000
+        description: The problem the feature solves.
+      proposal:
+        type: string
+        maxLength: 10000
+        description: How it could work.
+      who_needs_it:
+        type: string
+        maxLength: 2000
+        description: Who needs it, and how often.
+  layout:
+    - { field: problem, widget: textarea, label: Problem }
+    - { field: proposal, widget: textarea, label: Proposal }
+    - { field: who_needs_it, widget: text, label: Who needs it }

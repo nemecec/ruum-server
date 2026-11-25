@@ -1,0 +1,16 @@
+{
+  "name": "@ruum/app",
+  "version": "0.1.0",
+  "description": "The Ruum SDK for Node apps: the Ruum-User check, Express and node:http helpers, the workload token, dev mode.",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/src/index.d.ts", "default": "./dist/src/index.js" },
+    "./dev": { "types": "./dist/src/dev.d.ts", "default": "./dist/src/dev.js" }
+  },
+  "bin": { "ruum-dev-token": "./dist/src/cli.js" },
+  "files": ["dist/src"],
+  "engines": { "node": ">=22" },
+  "license": "Apache-2.0"
+}

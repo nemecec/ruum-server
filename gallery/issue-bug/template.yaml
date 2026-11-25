@@ -1,0 +1,36 @@
+# A gallery issue template (contracts/manifests/template.schema.json, design 9.7).
+manifest_version: 1
+kind: issue
+name: Bug
+description: Something does not work as it should.
+version: 1.0.0
+issue:
+  schema:
+    type: object
+    required: [steps, actual]
+    additionalProperties: false
+    properties:
+      steps:
+        type: string
+        maxLength: 10000
+        description: What you did, step by step.
+      expected:
+        type: string
+        maxLength: 10000
+        description: What you expected to happen.
+      actual:
+        type: string
+        maxLength: 10000
+        description: What happened instead.
+      severity:
+        enum: [low, medium, high, critical]
+      app_version:
+        type: string
+        maxLength: 100
+        description: The app version or deployment where it happened.
+  layout:
+    - { field: steps, widget: textarea, label: Steps to reproduce }
+    - { field: expected, widget: textarea, label: Expected }
+    - { field: actual, widget: textarea, label: Actual }
+    - { field: severity, widget: select, label: Severity }
+    - { field: app_version, widget: app_version, label: App version }

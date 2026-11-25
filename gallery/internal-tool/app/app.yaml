@@ -1,0 +1,11 @@
+# yaml-language-server: $schema=https://ruum.space/contracts/manifests/app.schema.json
+# The manifest of the app. Every field: gallery/reference/app-yaml.md.
+runtime: node22
+start: node server.js
+access: platform
+health:
+  path: /healthz
+bindings:
+  files:
+    node: ../Files
+    role: view

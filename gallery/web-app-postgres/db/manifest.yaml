@@ -1,0 +1,13 @@
+# The database of the template (contracts/manifests/database.schema.json).
+engine: postgres
+version: "17"
+plan: shared-small
+backups:
+  pitr_days: 7
+data_classes:
+  public.notes.id: normal
+  public.notes.author_sub: personal
+  public.notes.author_name: personal
+  public.notes.title: normal
+  public.notes.body: personal
+  public.notes.created_at: normal

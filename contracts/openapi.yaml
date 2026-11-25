@@ -6180,7 +6180,6 @@ paths:
       tags: [templates]
       operationId: listTemplates
       x-ruum-area: templates
-      x-ruum-status: planned
       summary: List project and issue templates
       description: |
         The gallery of Ruum (built into the platform, IDs `gallery:<slug>`) and the template
@@ -6212,7 +6211,6 @@ paths:
       tags: [templates]
       operationId: createTemplate
       x-ruum-area: templates
-      x-ruum-status: planned
       summary: Save a project (or an issue kind) as a template
       description: |
         Copies `source_id` (a project folder) into a new folder of type `template` under
@@ -6260,7 +6258,6 @@ paths:
       tags: [templates]
       operationId: getTemplate
       x-ruum-area: templates
-      x-ruum-status: planned
       summary: Read a template
       description: |
         Its `template.yaml`: name, description, version, what the setup makes, the role

@@ -105,9 +105,6 @@ pub const PLANNED_OPERATIONS: &[&str] = &[
     "createIssueRevealRequest",
     "resolveIssueReceipt",
     "decideIssueReveal",
-    "listTemplates",
-    "createTemplate",
-    "getTemplate",
     "instantiateTemplate",
     "getTemplateSetup",
 ];

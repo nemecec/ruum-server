@@ -1,0 +1,4 @@
+# yaml-language-server: $schema=https://ruum.space/contracts/manifests/app.schema.json
+# The manifest of the site. Every field: gallery/reference/app-yaml.md.
+runtime: static
+access: platform

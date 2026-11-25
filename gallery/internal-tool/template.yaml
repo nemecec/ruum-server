@@ -1,0 +1,14 @@
+# A gallery template (contracts/manifests/template.schema.json). docs: gallery/README.md
+manifest_version: 1
+kind: project
+name: Internal tool
+description: >-
+  A Node app that shows the files of one folder to the people of the project. It reads the
+  folder through the Ruum runtime API with view rights only (read-only file views).
+version: 1.0.0
+setup:
+  - folder:
+      path: Files
+  - app:
+      name: internal-tool
+      archive: app.tar.gz

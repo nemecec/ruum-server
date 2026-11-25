@@ -1,0 +1,23 @@
+# A gallery issue template (contracts/manifests/template.schema.json, design 9.7).
+manifest_version: 1
+kind: issue
+name: Question
+description: A question about the app or the project.
+version: 1.0.0
+issue:
+  schema:
+    type: object
+    required: [question]
+    additionalProperties: false
+    properties:
+      question:
+        type: string
+        maxLength: 10000
+        description: The question.
+      context:
+        type: string
+        maxLength: 10000
+        description: What you tried or read already.
+  layout:
+    - { field: question, widget: textarea, label: Question }
+    - { field: context, widget: textarea, label: Context }

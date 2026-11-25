@@ -1,0 +1,41 @@
+# A gallery issue template (contracts/manifests/template.schema.json, design 9.6 and 9.7): the
+# template of the issues that monitoring opens for a new error fingerprint. The counts (how
+# often, how many users, first and last seen) are provider state, not fields (issue.schema.json).
+manifest_version: 1
+kind: issue
+name: Error
+description: An error that monitoring found in an app. Opened by Ruum for each new error.
+version: 1.0.0
+issue:
+  schema:
+    type: object
+    required: [error_type]
+    additionalProperties: false
+    properties:
+      error_type:
+        type: string
+        maxLength: 200
+        description: The type of the error (TypeError, a status code, a Postgres SQLSTATE).
+      message_template:
+        type: string
+        maxLength: 2000
+        description: The message template of the error, without field values.
+      where:
+        type: string
+        maxLength: 500
+        description: The source location of the top frame (src/orders.ts:42).
+      environment:
+        enum: [live, preview]
+      app_version:
+        type: string
+        maxLength: 100
+        description: The deployment where the error was first seen.
+      severity:
+        enum: [low, medium, high, critical]
+  layout:
+    - { field: error_type, widget: text, label: Error }
+    - { field: message_template, widget: textarea, label: Message }
+    - { field: where, widget: text, label: Where }
+    - { field: environment, widget: select, label: Environment }
+    - { field: app_version, widget: app_version, label: First seen in }
+    - { field: severity, widget: select, label: Severity }

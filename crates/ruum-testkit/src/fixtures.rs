@@ -1181,6 +1181,62 @@ mod seed {
             }
         }
 
+        // The project template K (card L-1): a folder of type `template` made by `member`,
+        // with a `template.yaml` whose setup makes a database and an app.
+        let (s2, c, req) = (
+            s.clone(),
+            member_ctx.clone(),
+            NewNode {
+                parent_id: t.projects,
+                name: t.template_name.clone(),
+                kind: NodeKind::Folder,
+                node_type: Some(ruum_core::templates::NODE_TYPE.into()),
+                link: None,
+                on_conflict: OnConflict::Fail,
+            },
+        );
+        let kit_yaml = format!(
+            "manifest_version: 1\nkind: project\nname: {}\nversion: \"0\"\nsetup:\n  \
+             - folder:\n      path: Issues\n      type: issues\n  - database:\n      \
+             name: app-db\n      manifest: db/manifest.yaml\n  - app:\n      name: app\n      \
+             archive: app.tar.gz\nplaceholders:\n  client:\n    description: The client\n    \
+             role: comment\n",
+            t.template_name
+        );
+        if let Some(kit) = step("template K", async move {
+            let folder = s2.nodes.create(&c, req).await?.value.id;
+            let file = s2
+                .nodes
+                .create(
+                    &c,
+                    NewNode {
+                        parent_id: folder,
+                        name: ruum_core::templates::MANIFEST_FILE.into(),
+                        kind: NodeKind::File,
+                        node_type: Some("application/yaml".into()),
+                        link: None,
+                        on_conflict: OnConflict::Fail,
+                    },
+                )
+                .await?
+                .value
+                .id;
+            s2.transfers
+                .put_content(
+                    &c,
+                    file,
+                    kit_yaml.into_bytes().into(),
+                    Some("application/yaml".into()),
+                    None,
+                )
+                .await?;
+            Ok(folder)
+        })
+        .await
+        {
+            t.template = kit;
+        }
+
         // The old file, in the trash.
         let (s2, c, req) = (
             s.clone(),
