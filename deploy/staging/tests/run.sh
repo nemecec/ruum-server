@@ -1271,8 +1271,8 @@ YAML
           -e KUBERNETES_SERVICE_HOST=127.0.0.1 -e KUBERNETES_SERVICE_PORT="${PORT_OVERRIDE:-8443}" -e "SSL_CERT_FILE=${cafile:-/nonexistent}" \
           ${m[@]+"${m[@]}"} --entrypoint /bin/sh "caddy:$CADDY_VERSION-alpine" -c "$(cat "$1")"
       }
-      grep -qxF 'limit=120' "$TMP/wait-api.sh" && grep -qxF 'limit=4' "$TMP/wait-api-short.sh" && grep -qxF 'limit=6' "$TMP/wait-api-6.sh" && [[ -n "$cafile" && "$tmpmount" == /tmp ]] ||
-        bad "could not take the init script (limit=120), its CA path or its /tmp mount from the rendered edge"
+      grep -qxF 'limit=120' "$TMP/wait-api.sh" && grep -qF '/proc/uptime' "$TMP/wait-api.sh" && ! grep -qF 'date +%s' "$TMP/wait-api.sh" && grep -qxF 'limit=4' "$TMP/wait-api-short.sh" && grep -qxF 'limit=6' "$TMP/wait-api-6.sh" && [[ -n "$cafile" && "$tmpmount" == /tmp ]] ||
+        bad "could not take the init script (limit=120, the uptime as its clock), its CA path or its /tmp mount from the rendered edge"
       t0=$SECONDS
       out="$(init "$TMP/wait-api.sh" "$TMP/apica.crt" 2>&1)"; rc=$?
       [[ $rc == 0 && -z "$out" && $((SECONDS - t0)) -lt 30 ]] &&
@@ -2117,6 +2117,7 @@ case "$*" in
   "-n data get pod pg-1 "*) printf stg-2 ;;
   "wait --for=condition=Ready node/stg-1 "*)
     [[ -z "${FAKE_NODE_HANG:-}" ]] || { echo $$ >"$FAKE_DIR/hang.pid"; exec sleep 300; }
+    [[ -z "${FAKE_NODE_OK:-}" ]] || exit 0
     n=$(( $(cat "$FAKE_DIR/node-waits" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$FAKE_DIR/node-waits"
     [[ $n -gt 2 ]] || { echo "Unable to connect to the server: EOF" >&2; exit 1; } ;;
   "-n data wait "*) ;;
@@ -2152,6 +2153,11 @@ FAKE
   kill "$FU_PID" 2>/dev/null; wait "$FU_PID" 2>/dev/null
   FU_PORT=1
   expect 1 "upgrade-talos.sh stops when the node's edge does not answer TLS" upg RUUM_UPGRADE_EDGE_SECONDS=2
+  # Kimi, review of the fix: retry never sleeps past its limit (a pause of 30 s, a limit of 3 s;
+  # the node is Ready at once, so only the edge check retries).
+  t0=$SECONDS
+  expect 1 "upgrade-talos.sh stops at its limit even when the retry pause is longer" upg RUUM_UPGRADE_EDGE_SECONDS=3 RUUM_UPGRADE_RETRY_PAUSE=30 FAKE_NODE_OK=1
+  [[ $((SECONDS - t0)) -le 15 ]] && ok "... in $((SECONDS - t0)) s (limit 3 s, pause 30 s)" || bad "upgrade-talos.sh slept past its limit: $((SECONDS - t0)) s for a limit of 3 s"
   # Kimi re-check of O-53: an edge port that accepts the connection and never answers TLS.
   # retry's limit is a hard limit (3 s here, plus timeout's 5 s for a kill), so the script stops
   # in time instead of waiting for ever (upg's own timeout of 120 s would give exit 124).
