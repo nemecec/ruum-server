@@ -1075,6 +1075,81 @@ async fn another_database_cannot_block_the_drop() {
         .expect("restore B");
 }
 
+/// The connection limit of a role (empty when it is gone).
+async fn conn_limit(engine: &PostgresEngine, name: &str) -> String {
+    let mut admin = engine.admin().await.unwrap();
+    psql(
+        &mut admin,
+        &format!("SELECT rolconnlimit FROM pg_roles WHERE rolname = '{name}'"),
+    )
+    .await
+    .unwrap()
+}
+
+/// A grant made again between the strip and `DROP ROLE` (Kimi run 15 on D-5, 1): another
+/// database's owner names the app role again right before the drop, twice; the drop strips and
+/// tries again, and the role goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grant_made_again_before_drop_role_does_not_block_it() {
+    let Some(engine) = engine().await else { return };
+    let f = seeded(&engine).await;
+    let b = seeded(&engine).await;
+    let a = app_role(&f, RoleKind::AppRead, Uuid::now_v7()).await;
+    let grant = format!("GRANT SELECT ON notes TO {}", lens::ident(&a.role_name));
+    b.migrate(&grant).await.expect("B names A's app role");
+    *engine.before_role_drop.lock() = Some((b.db().clone(), grant, 2));
+    engine
+        .drop_app_role(&a.role_ref().unwrap())
+        .await
+        .expect("the drop strips again after a grant made again");
+    assert_eq!(engine.before_role_drop.lock().as_ref().unwrap().2, 0);
+    assert_eq!(role_count(&engine, &a.role_name).await, "0");
+    assert_eq!(mentions(&engine, b.db(), &a.role_name).await, "0");
+}
+
+/// A purge whose app role another database keeps naming (Kimi run 15 on D-5, 1): the first
+/// `drop_database` drops the database but not the role; the role is out of the app budget
+/// (connection limit 0) and the retry, which finds no database, drops it before it answers
+/// `NotFound`, also in an engine of another process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_purge_is_finished_by_its_retry() {
+    let Some(engine) = engine().await else { return };
+    let doomed_db = seeded(&engine).await;
+    let b = seeded(&engine).await;
+    let doomed = app_role(&doomed_db, RoleKind::AppWrite, Uuid::now_v7()).await;
+    let kept = app_role(&doomed_db, RoleKind::AppRead, Uuid::now_v7()).await;
+    assert_ne!(conn_limit(&engine, &doomed.role_name).await, "0");
+    let grant = format!(
+        "GRANT SELECT ON notes TO {}",
+        lens::ident(&doomed.role_name)
+    );
+    b.migrate(&grant).await.expect("B names the app role");
+    let attempts = crate::postgres::app_roles::DROP_ATTEMPTS;
+    *engine.before_role_drop.lock() = Some((b.db().clone(), grant, 2 + attempts));
+    // The other app role goes first or second; each of its drops also runs the script.
+    let first = engine.drop_database(doomed_db.db()).await;
+    assert!(
+        matches!(first, Err(EngineError::Internal(ref m)) if m.contains("2BP01")),
+        "{first:?}"
+    );
+    assert_eq!(role_count(&engine, &doomed.role_name).await, "1");
+    assert_eq!(conn_limit(&engine, &doomed.role_name).await, "0");
+    *engine.before_role_drop.lock() = None;
+    // The retry in another process (no cached state) and in this one.
+    let other = engine_with(|_| {}).await.expect("a second engine");
+    assert!(matches!(
+        other.drop_database(doomed_db.db()).await,
+        Err(EngineError::NotFound)
+    ));
+    assert_eq!(role_count(&engine, &doomed.role_name).await, "0");
+    assert_eq!(role_count(&engine, &kept.role_name).await, "0");
+    assert_eq!(mentions(&engine, b.db(), &doomed.role_name).await, "0");
+    assert!(matches!(
+        engine.drop_database(doomed_db.db()).await,
+        Err(EngineError::NotFound)
+    ));
+}
+
 /// A database in the trash (review D-5, 3 and 4): every app role is suspended and its
 /// sessions end; a role made afterwards is made `NOLOGIN` and gets no password; the restore
 /// lets them all in again.
