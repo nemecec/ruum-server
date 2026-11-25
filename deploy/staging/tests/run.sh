@@ -1125,8 +1125,16 @@ YAML
   }
   # S-89 (decision 2026-11-25): the driver is off by default, and then the server has no token.
   doc_of "$TMP/ruum-apps.yaml" Deployment ruum-server >"$TMP/srv-default.yaml"
-  ! grep -qE 'RUUM_RUNTIME_DRIVER|serviceAccountName|serviceAccountToken' "$TMP/srv-default.yaml" && grep -qF 'automountServiceAccountToken: false' "$TMP/srv-default.yaml" &&
+  ! grep -qE 'RUUM_RUNTIME_DRIVER|serviceAccountToken' "$TMP/srv-default.yaml" && grep -qF 'automountServiceAccountToken: false' "$TMP/srv-default.yaml" &&
     ok "the Kubernetes driver is off by default and the server gets no ServiceAccount token (S-89)" || bad "the default chart runs the Kubernetes driver or gives the server a token (S-89)"
+  # S-93: with the driver off the server names the ServiceAccount default. Left out, Kubernetes
+  # keeps the deprecated serviceAccount field of a release with the driver on (ruum-server).
+  sa_is_default() { # sa_is_default <server Deployment>: one serviceAccountName, and it is default
+    [[ "$(grep -cE '^ *serviceAccountName:' "$1")" == 1 ]] && grep -qxE ' *serviceAccountName: default' "$1"
+  }
+  doc_of "$TMP/ruum.yaml" Deployment ruum-server >"$TMP/srv-noapps.yaml"
+  sa_is_default "$TMP/srv-default.yaml" && sa_is_default "$TMP/srv-noapps.yaml" &&
+    ok "with the driver off the server runs as the ServiceAccount default, with or without the app runtime (S-93)" || bad "with the driver off the server does not name the ServiceAccount default (S-93)"
   # The Kubernetes runtime driver (I6-1) when turned on: with the app runtime only, its account and token.
   expect 0 "render charts/ruum with the app runtime and the driver on" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.kubernetes=true
   doc_of "$TMP/out" Deployment ruum-server >"$TMP/srv-apps.yaml"
@@ -1141,6 +1149,9 @@ YAML
   expect 1 "charts/ruum refuses a registry that is not host:port" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.kubernetes=true --set 'runtime.registry=http://x/y'
   expect 0 "render charts/ruum with the driver off" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.kubernetes=false
   grep -qF 'RUUM_RUNTIME_DRIVER' "$TMP/out" && bad "runtime.kubernetes=false still renders the driver" || ok "runtime.kubernetes=false keeps the in-memory driver"
+  doc_of "$TMP/out" Deployment ruum-server >"$TMP/srv-off.yaml"
+  sa_is_default "$TMP/srv-off.yaml" && ok "runtime.kubernetes=false names the ServiceAccount default (S-93)" || bad "runtime.kubernetes=false does not name the ServiceAccount default (S-93)"
+  [[ "$(grep -cE '^ *serviceAccountName:' "$TMP/srv-apps.yaml")" == 1 ]] && ok "with the driver on the server names one ServiceAccount (ruum-server)" || bad "the server Deployment names more than one ServiceAccount with the driver on"
   doc_of "$TMP/ruum-apps.yaml" Deployment ruum-gateway >"$TMP/gw.yaml"
   doc_of "$TMP/ruum-apps.yaml" Deployment ruum-egress >"$TMP/eg.yaml"
   [[ -s "$TMP/gw.yaml" && -s "$TMP/eg.yaml" ]] && ok "the gateway and the egress proxy are Deployments in ruum" || bad "no ruum-gateway or ruum-egress Deployment"

@@ -17,6 +17,9 @@
 #   RUUM_REQUIRE_IMPLEMENTED is passed through to the suites.
 #   DATABASE_URL           needed by the mutations whose ENV picks the Postgres backend
 #                          (eval "$(scripts/dev.sh env)" on the laptop).
+#   CI                     when set, the case filters that the tests refuse under CI (T-26:
+#                          RUUM_BUILD_CASES, RUUM_SANDBOX_CASES) are dropped from ENV, so the
+#                          baseline and the mutation run the whole test (backlog T-79).
 #
 # A mutation file sets DESCRIPTION, FILE, PERL, TESTS, optionally PLACEHOLDER=1 and ENV: extra
 # environment variables (NAME=value, separated by spaces) for its cargo test runs, for example
@@ -45,6 +48,29 @@ sync_copy() {
     --exclude /web/dist "$repo/" "$copy/"
 }
 
+# The case filters that a test refuses when CI is set (backlog T-26): a filter skips cases, so CI
+# must run them all. Under CI the script drops them from a mutation's ENV and runs the whole test,
+# which holds every case of the filtered run (backlog T-79). Without CI they stay (the build
+# server's strict check, the laptop).
+ci_refused_filters="RUUM_BUILD_CASES RUUM_SANDBOX_CASES"
+
+effective_env() {
+  # $1: a mutation's ENV. Prints the ENV the cargo test runs get.
+  if [ -z "${CI:-}" ]; then
+    printf '%s' "$1"
+    return
+  fi
+  local out="" word name
+  for word in $1; do
+    name="${word%%=*}"
+    case " $ci_refused_filters " in
+      *" $name "*) ;;
+      *) out="${out:+$out }$word" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 run_tests() {
   # $1: cargo test arguments, $2: extra environment (NAME=value ...). Output goes to $work/log.
   # shellcheck disable=SC2086
@@ -70,7 +96,13 @@ trap 'sync_copy || true' EXIT
 
 # The suites must pass on the clean copy, or a failure proves nothing.
 # Each line is "ENV|TESTS".
-baseline_tests="$(for f in "${files[@]}"; do (ENV=""; source "$f"; echo "$ENV|$TESTS"); done | sort -u)"
+# Under CI the refused case filters are dropped first (effective_env), so the filtered runs of
+# one test become one baseline run of the whole test.
+if [ -n "${CI:-}" ]; then
+  echo "CI is set: the case filters $ci_refused_filters are dropped from ENV; those mutations run the whole test (T-26, T-79)"
+fi
+# shellcheck disable=SC1090
+baseline_tests="$(for f in "${files[@]}"; do (ENV=""; source "$f"; echo "$(effective_env "$ENV")|$TESTS"); done | sort -u)"
 while IFS= read -r line; do
   [ -z "$line" ] && continue
   e="${line%%|*}"
@@ -90,6 +122,7 @@ for f in "${files[@]}"; do
   DESCRIPTION="" FILE="" PERL="" TESTS="" PLACEHOLDER=0 ENV=""
   # shellcheck disable=SC1090
   source "$f"
+  ENV="$(effective_env "$ENV")"
   sync_copy
   target="$copy/$FILE"
   result=""

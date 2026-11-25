@@ -1588,9 +1588,13 @@ pub(crate) mod tests {
         let (other, _) = pg_tenant(&pool).await;
         let one = PgAppStore::new(pool.clone());
         let two = PgAppStore::new(pool.clone());
+        // `short` only where the lock must be refused; a step that must get the lock waits
+        // `free`, so a slow runner (a new connection of the lock pool, a loaded database) does
+        // not turn it into `Conflict` (backlog T-80).
         let short = Duration::from_millis(200);
-        let writer = one.lock_static_sites(t, false, short).await.unwrap();
-        let second = two.lock_static_sites(t, false, short).await.unwrap();
+        let free = Duration::from_secs(10);
+        let writer = one.lock_static_sites(t, false, free).await.unwrap();
+        let second = two.lock_static_sites(t, false, free).await.unwrap();
         let busy = two
             .lock_static_sites(t, true, short)
             .await
@@ -1600,17 +1604,12 @@ pub(crate) mod tests {
             matches!(&busy, Error::Api(e) if e.code == crate::error::ErrorCode::Conflict),
             "{busy:?}"
         );
-        let elsewhere = two.lock_static_sites(other, true, short).await.unwrap();
+        let elsewhere = two.lock_static_sites(other, true, free).await.unwrap();
         drop((writer, second));
-        let gc = two
-            .lock_static_sites(t, true, Duration::from_secs(5))
-            .await
-            .unwrap();
+        let gc = two.lock_static_sites(t, true, free).await.unwrap();
         assert!(one.lock_static_sites(t, false, short).await.is_err());
         drop((gc, elsewhere));
-        one.lock_static_sites(t, false, Duration::from_secs(5))
-            .await
-            .unwrap();
+        one.lock_static_sites(t, false, free).await.unwrap();
     }
 
     /// The file usage of a tenant is the sum of its node sizes, and its member count leaves
