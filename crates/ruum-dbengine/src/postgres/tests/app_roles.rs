@@ -1139,6 +1139,15 @@ async fn a_failed_purge_is_finished_by_its_retry() {
     assert_eq!(role_count(&engine, &doomed.role_name).await, "1");
     assert_eq!(conn_limit(&engine, &doomed.role_name).await, "0");
     *engine.before_role_drop.lock() = None;
+    // A resume of another replica that read the role before the purge lets it in again late
+    // (Kimi run 15, third round): the retry still takes it.
+    let mut admin = engine.admin().await.unwrap();
+    ok(
+        &mut admin,
+        &format!("ALTER ROLE {} LOGIN", lens::ident(&doomed.role_name)),
+    )
+    .await;
+    drop(admin);
     // The retry in another process with the state of before (it finds the database gone at
     // its first read), then in a fresh one and in this one.
     assert!(matches!(
@@ -1158,6 +1167,46 @@ async fn a_failed_purge_is_finished_by_its_retry() {
         engine.drop_database(doomed_db.db()).await,
         Err(EngineError::NotFound)
     ));
+}
+
+/// A role made by another server replica while a purge runs never escapes it (Kimi run 15 on
+/// D-5, third round): the create holds the database's lifecycle lock, so the purge of another
+/// engine waits for it and then drops the new role with the database.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_role_made_during_a_purge_goes_with_it() {
+    let Some(creator) = engine().await else {
+        return;
+    };
+    let creator = Arc::new(creator);
+    let purger = Arc::new(engine_with(|_| {}).await.expect("a second engine"));
+    let f = seeded(&creator).await;
+    let before = app_role(&f, RoleKind::AppRead, Uuid::now_v7()).await;
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let go = Arc::new(tokio::sync::Notify::new());
+    *creator.create_pause.lock() = Some((reached.clone(), go.clone()));
+    let db = f.db().clone();
+    let create = {
+        let (engine, db) = (creator.clone(), db.clone());
+        tokio::spawn(async move {
+            engine
+                .create_app_role(&db, RoleKind::AppWrite, Uuid::now_v7())
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(30), reached.notified())
+        .await
+        .expect("the create holds the lock");
+    let purge = {
+        let (engine, db) = (purger.clone(), db.clone());
+        tokio::spawn(async move { engine.drop_database(&db).await })
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!purge.is_finished(), "the purge waits for the create");
+    go.notify_one();
+    let made = create.await.unwrap().expect("the create");
+    purge.await.unwrap().expect("the purge");
+    assert_eq!(role_count(&creator, &before.role_name).await, "0");
+    assert_eq!(role_count(&creator, &made.role_name).await, "0");
 }
 
 /// A read of the app roles that fails stops the purge (Kimi run 15 on D-5, second review): no

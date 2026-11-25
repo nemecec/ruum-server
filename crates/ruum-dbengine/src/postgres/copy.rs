@@ -1839,7 +1839,10 @@ pub(crate) async fn drop_database(
         Err(EngineError::NotFound) => return drop_gone(engine, db).await,
         Err(e) => return Err(e),
     };
-    match drop_live(engine, &state).await {
+    let lock = app_roles::lifecycle_lock(engine, &state.name).await?;
+    let r = drop_live(engine, &state).await;
+    app_roles::unlock(lock).await;
+    match r {
         // Gone under a cached state (another process dropped it): finish its app roles.
         Err(EngineError::NotFound) => drop_gone(engine, db).await,
         other => other,

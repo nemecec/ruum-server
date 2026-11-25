@@ -53,7 +53,11 @@
 //! to [`DROP_ATTEMPTS`] times. `drop_database` first marks its app roles with a comment that
 //! names the database ([`mark_for_drop`]) and, once the database is gone, sets their connection
 //! limit to 0 (out of the budget); a retried `drop_database` of the gone database drops the
-//! marked roles that the first try left ([`drop_marked`]) before it answers `NotFound`.
+//! marked roles that the first try left ([`drop_marked`]) before it answers `NotFound`. The
+//! engine's locks of a database are per process; `create_app_role`, `suspend_app_access` /
+//! `resume_app_access` and `drop_database` also take a lock of the whole cluster for the
+//! database ([`lifecycle_lock`]), so a role made or resumed by another server replica never
+//! escapes a purge.
 //! `ruum_dbhost` may only signal or revoke with the privileges of the role or the owner, so it
 //! takes membership in them inside the one transaction of the step and gives it back before
 //! the commit (a failure rolls the grant back too).
@@ -97,6 +101,9 @@ pub(crate) const DROP_ATTEMPTS: usize = 5;
 /// The comment on an app role whose database `drop_database` drops: this text and the name of
 /// the database. It is in the shared catalog, so it outlives the database and its meta data.
 const DROPPED_WITH: &str = "ruum: dropped with ";
+
+/// The text before the database name in the key of [`lifecycle_lock`].
+const LIFECYCLE_KEY: &str = "ruum lifecycle ";
 
 /// A warning once per process when `ruum_dbhost` may not set `temp_file_limit`.
 static TEMP_FILE_WARNED: AtomicBool = AtomicBool::new(false);
@@ -446,6 +453,37 @@ pub(crate) async fn forget_access(conn: &mut PgConnection) -> Result<(), EngineE
     Ok(())
 }
 
+/// A lock of the whole cluster on the life of the database `name` (an advisory lock of a
+/// session of its own, keyed by the name): `create_app_role`, `suspend_app_access` /
+/// `resume_app_access` and `drop_database` hold it, so these steps of different server
+/// replicas never interleave (Kimi run 15 on D-5, third round). Held until the returned
+/// session closes ([`unlock`]); a session that breaks or is dropped ends and lets it go.
+/// Take it before the per-process locks of the database (`ops`, the gate).
+pub(crate) async fn lifecycle_lock(
+    engine: &PostgresEngine,
+    name: &str,
+) -> Result<PgConnection, EngineError> {
+    let mut conn = PgConnection::connect_with(&engine.config.dbhost_options())
+        .await
+        .map_err(|e| internal("connect for the lifecycle lock", e))?;
+    let locked =
+        sqlx::query("select pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended($1, 0))")
+            .persistent(false)
+            .bind(format!("{LIFECYCLE_KEY}{name}"))
+            .execute(&mut conn)
+            .await;
+    if let Err(e) = locked {
+        let _ = conn.close().await;
+        return Err(internal("take the lifecycle lock of a database", e));
+    }
+    Ok(conn)
+}
+
+/// Lets the lock of [`lifecycle_lock`] go (the session ends).
+pub(crate) async fn unlock(conn: PgConnection) {
+    let _ = conn.close().await;
+}
+
 /// `suspend_app_access` and `resume_app_access`: the flag first (so a role made later is made
 /// `NOLOGIN`, and no password is issued), then every app role of the list; on suspend their
 /// sessions end, and the call fails while one is still running.
@@ -455,6 +493,17 @@ pub(crate) async fn set_access(
     login: bool,
 ) -> Result<(), EngineError> {
     let state = engine.resolve(db).await?;
+    let lock = lifecycle_lock(engine, &state.name).await?;
+    let r = set_access_locked(engine, &state, login).await;
+    unlock(lock).await;
+    r
+}
+
+async fn set_access_locked(
+    engine: &PostgresEngine,
+    state: &DbState,
+    login: bool,
+) -> Result<(), EngineError> {
     let _ops = state.ops.lock().await;
     let mut conn = engine.dbhost(&state.name).await?;
     let rows = async {
@@ -505,8 +554,30 @@ pub(crate) async fn create(
         )));
     }
     let state = engine.resolve(db).await?;
-    let _gate = engine.enter(&state).await?;
+    let lock = lifecycle_lock(engine, &state.name).await?;
+    let r = create_locked(engine, db, &state, kind, binding).await;
+    unlock(lock).await;
+    r
+}
+
+async fn create_locked(
+    engine: &PostgresEngine,
+    db: &DatabaseRef,
+    state: &DbState,
+    kind: RoleKind,
+    binding: Uuid,
+) -> Result<AppRole, EngineError> {
+    let _gate = engine.enter(state).await?;
     let _ops = state.ops.lock().await;
+    #[cfg(test)]
+    {
+        let pause = engine.create_pause.lock().take();
+        if let Some((reached, go)) = pause {
+            reached.notify_one();
+            go.notified().await;
+        }
+    }
+    // Under the lifecycle lock: a database that another replica dropped is gone here.
     let mut conn = engine.dbhost(&state.name).await?;
     let result = async {
         let rows = read_rows(&mut conn).await?;
@@ -547,7 +618,7 @@ pub(crate) async fn create(
             }
             return Err(e);
         }
-        grant(engine, &state, &mut conn, std::slice::from_ref(&row)).await?;
+        grant(engine, state, &mut conn, std::slice::from_ref(&row)).await?;
         Ok(row)
     }
     .await;
@@ -1291,8 +1362,9 @@ async fn release_connections(engine: &PostgresEngine, names: &[String]) -> Resul
 }
 
 /// Drops the app roles that an earlier `drop_database` of `database` marked and could not drop
-/// ([`mark_for_drop`]), once `database` is gone: out of the budget, then [`drop_orphans`]. A
-/// role that can log in is never taken (the mark of a live role is stale).
+/// ([`mark_for_drop`]), once `database` is gone: no login (a resume of another replica may have
+/// let it in again), out of the budget, then [`drop_orphans`]. While the database exists a
+/// mark does nothing.
 pub(crate) async fn drop_marked(
     engine: &PostgresEngine,
     database: &str,
@@ -1300,7 +1372,7 @@ pub(crate) async fn drop_marked(
     let mut admin = engine.admin().await?;
     let names: Vec<String> = sqlx::query(
         "select r.rolname::text from pg_catalog.pg_roles r
-          where r.rolname ~ '^r_[0-9a-f]{16}$' and not r.rolcanlogin
+          where r.rolname ~ '^r_[0-9a-f]{16}$'
             and pg_catalog.shobj_description(r.oid, 'pg_authid') = $1
             and not exists (select 1 from pg_catalog.pg_database where datname = $2)
           order by 1",
@@ -1318,6 +1390,7 @@ pub(crate) async fn drop_marked(
     if names.is_empty() {
         return Ok(());
     }
+    refuse_logins(engine, &names).await?;
     // Out of the budget first: a role that stays (the drop fails again) holds back nothing.
     let _ = release_connections(engine, &names).await;
     drop_orphans(engine, &names).await

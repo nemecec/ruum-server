@@ -275,6 +275,11 @@ pub struct PostgresEngine {
     /// Tests only: the read of a database's app roles fails (`app_roles::names`).
     #[cfg(test)]
     pub(crate) fail_app_names: AtomicBool,
+    /// Tests only: `create_app_role` signals the first `Notify` once it holds the database's
+    /// lifecycle lock and waits for the second (a create racing a purge of another process).
+    #[cfg(test)]
+    pub(crate) create_pause:
+        crate::lock::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 /// Whether a name is a neutral database name (`d_` + 16 hex).
@@ -318,6 +323,8 @@ impl PostgresEngine {
             before_role_drop: Default::default(),
             #[cfg(test)]
             fail_app_names: AtomicBool::new(false),
+            #[cfg(test)]
+            create_pause: Default::default(),
         })
     }
 
