@@ -4,6 +4,7 @@
 //! (decision 0006 G).
 
 use super::*;
+use std::sync::atomic::Ordering::SeqCst;
 use std::time::{Duration, Instant};
 
 /// A table, a view, a sequence and rows of the database's own schema.
@@ -1127,6 +1128,9 @@ async fn a_failed_purge_is_finished_by_its_retry() {
     let attempts = crate::postgres::app_roles::DROP_ATTEMPTS;
     *engine.before_role_drop.lock() = Some((b.db().clone(), grant, 2 + attempts));
     // The other app role goes first or second; each of its drops also runs the script.
+    // An engine of another process that resolved the database before the purge.
+    let stale = engine_with(|_| {}).await.expect("a second engine");
+    stale.resolve(doomed_db.db()).await.expect("resolve");
     let first = engine.drop_database(doomed_db.db()).await;
     assert!(
         matches!(first, Err(EngineError::Internal(ref m)) if m.contains("2BP01")),
@@ -1135,8 +1139,14 @@ async fn a_failed_purge_is_finished_by_its_retry() {
     assert_eq!(role_count(&engine, &doomed.role_name).await, "1");
     assert_eq!(conn_limit(&engine, &doomed.role_name).await, "0");
     *engine.before_role_drop.lock() = None;
-    // The retry in another process (no cached state) and in this one.
-    let other = engine_with(|_| {}).await.expect("a second engine");
+    // The retry in another process with the state of before (it finds the database gone at
+    // its first read), then in a fresh one and in this one.
+    assert!(matches!(
+        stale.drop_database(doomed_db.db()).await,
+        Err(EngineError::NotFound)
+    ));
+    assert_eq!(role_count(&engine, &doomed.role_name).await, "0");
+    let other = engine_with(|_| {}).await.expect("a third engine");
     assert!(matches!(
         other.drop_database(doomed_db.db()).await,
         Err(EngineError::NotFound)
@@ -1148,6 +1158,70 @@ async fn a_failed_purge_is_finished_by_its_retry() {
         engine.drop_database(doomed_db.db()).await,
         Err(EngineError::NotFound)
     ));
+}
+
+/// A read of the app roles that fails stops the purge (Kimi run 15 on D-5, second review): no
+/// drop with a role left out, unmarked and inside the budget; the next try drops both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_read_of_the_app_roles_stops_the_purge() {
+    let Some(engine) = engine().await else { return };
+    let f = seeded(&engine).await;
+    let role = app_role(&f, RoleKind::AppWrite, Uuid::now_v7()).await;
+    engine.fail_app_names.store(true, SeqCst);
+    let first = engine.drop_database(f.db()).await;
+    engine.fail_app_names.store(false, SeqCst);
+    assert!(matches!(first, Err(EngineError::Internal(_))), "{first:?}");
+    assert_eq!(role_count(&engine, &role.role_name).await, "1");
+    assert_ne!(conn_limit(&engine, &role.role_name).await, "0");
+    assert_eq!(
+        f.run(
+            RoleKind::Owner,
+            StatementMode::Read,
+            "SELECT count(*) FROM notes",
+            vec![]
+        )
+        .await
+        .expect("the database stays")
+        .rows
+        .len(),
+        1
+    );
+    engine.drop_database(f.db()).await.expect("the next try");
+    assert_eq!(role_count(&engine, &role.role_name).await, "0");
+}
+
+/// The mark of a purge is inert while its database exists (a drop that failed leaves it): the
+/// sweep of a retry takes no role of a live database, and the role works again after a restore
+/// from the trash.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mark_on_a_live_database_takes_nothing() {
+    let Some(engine) = engine().await else { return };
+    let f = seeded(&engine).await;
+    let role = app_role(&f, RoleKind::AppRead, Uuid::now_v7()).await;
+    let name = f.db().engine_name.clone();
+    crate::postgres::app_roles::mark_for_drop(
+        &engine,
+        &name,
+        std::slice::from_ref(&role.role_name),
+    )
+    .await
+    .expect("mark");
+    engine.suspend_app_access(f.db()).await.unwrap();
+    crate::postgres::app_roles::drop_marked(&engine, &name)
+        .await
+        .expect("the sweep");
+    assert_eq!(role_count(&engine, &role.role_name).await, "1");
+    assert_ne!(conn_limit(&engine, &role.role_name).await, "0");
+    engine.resume_app_access(f.db()).await.unwrap();
+    let mut s = login(
+        &engine,
+        &creds(&engine, &role, Duration::from_secs(300)).await,
+        None,
+    )
+    .await
+    .expect("the role works");
+    assert_eq!(ok(&mut s, "SELECT count(*) FROM notes").await, "2");
+    close(s).await;
 }
 
 /// A database in the trash (review D-5, 3 and 4): every app role is suspended and its
