@@ -102,11 +102,35 @@ pub async fn services_with(
     install_databases(&mut services, pool.clone(), &handles).await?;
     install_apps(&mut services, pool.clone(), &handles)?;
     install_telemetry(&mut services, pool)?;
+    install_templates(&mut services, &crate::config::GallerySettings::from_env()?)?;
     services.workload_tokens = workload_tokens(
         &identity.public_url,
         &crate::config::WorkloadTokenSettings::from_env(),
     )?;
     Ok(services)
+}
+
+/// The gallery of templates (card L-1): the directory of `RUUM_GALLERY_DIR`, loaded once
+/// (`ruum_core::templates::DirTemplateSource`). A template that fails its checks stops the
+/// start unless `RUUM_GALLERY_STRICT=false`.
+pub fn install_templates(
+    services: &mut Services,
+    settings: &crate::config::GallerySettings,
+) -> anyhow::Result<()> {
+    use ruum_core::templates::{DirTemplateSource, LoadOptions, TemplateService};
+    let opts = LoadOptions {
+        strict: settings.strict,
+        ..LoadOptions::default()
+    };
+    let gallery = DirTemplateSource::load(&settings.dir, &opts)
+        .with_context(|| format!("load the gallery of {}", settings.dir.display()))?;
+    tracing::info!(
+        dir = %settings.dir.display(),
+        templates = ruum_core::templates::TemplateSource::templates(&gallery).len(),
+        "gallery loaded"
+    );
+    services.templates = Arc::new(TemplateService::new(Arc::new(gallery)));
+    Ok(())
 }
 
 /// The telemetry of the services (card O-2): the classes over `telemetry_fields` with a pool

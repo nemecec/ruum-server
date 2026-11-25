@@ -1,0 +1,28 @@
+# The classes of the telemetry fields that server.js writes
+# (contracts/manifests/telemetry-privacy.schema.json). Add a line for every new field.
+fields:
+  - name: method
+    kind: log_field
+    class: normal
+    reason: the HTTP method
+  - name: path
+    kind: log_field
+    class: normal
+    reason: the route of the request, without the query
+  - name: status
+    kind: log_field
+    class: normal
+  - name: duration_ms
+    kind: log_field
+    class: normal
+  - name: note_id
+    kind: log_field
+    class: normal
+    reason: a row ID, not personal
+  - name: port
+    kind: log_field
+    class: normal
+  - name: error_code
+    kind: log_field
+    class: normal
+    reason: a Postgres SQLSTATE or a Node error code, never a message with data

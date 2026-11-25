@@ -30,6 +30,7 @@ pub mod search;
 pub mod sharing;
 pub mod tags;
 pub mod telemetry;
+pub mod templates;
 pub mod tenants;
 pub mod usage;
 pub mod versions;

@@ -1,0 +1,12 @@
+# A gallery template (contracts/manifests/template.schema.json). docs: gallery/README.md
+manifest_version: 1
+kind: project
+name: Static site
+description: >-
+  A site of plain files (HTML, CSS, images) that Ruum serves without a server process. Good
+  for a landing page, documentation or a small brochure site.
+version: 1.0.0
+setup:
+  - app:
+      name: site
+      archive: app.tar.gz

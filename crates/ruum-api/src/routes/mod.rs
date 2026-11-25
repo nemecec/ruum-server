@@ -13,6 +13,7 @@ pub mod search;
 pub mod sharing;
 pub mod system;
 pub mod tags;
+pub mod templates;
 pub mod tenants;
 pub mod versions;
 

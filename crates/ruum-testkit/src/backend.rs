@@ -219,7 +219,7 @@ impl Backend {
     /// `AppState::in_memory()`. Postgres: new stores over the run's database; the world's
     /// tenants are new, so worlds do not meet.
     pub async fn app_state(&self) -> AppState {
-        match &self.pg {
+        with_gallery(match &self.pg {
             None => AppState::in_memory(),
             Some(pg) => {
                 let pool = pg
@@ -231,19 +231,19 @@ impl Backend {
                     .await;
                 AppState::new(pg.services(pool), ApiConfig::default())
             }
-        }
+        })
     }
 
     /// The services of a new world with a database of its own (Postgres) or new in-memory
     /// services. Call [`WorldDb::finish`] on the database when the world is done.
     pub async fn world(&self) -> (AppState, Option<WorldDb>) {
         match &self.pg {
-            None => (AppState::in_memory(), None),
+            None => (with_gallery(AppState::in_memory()), None),
             Some(pg) => {
                 let n = pg.worlds.fetch_add(1, Ordering::Relaxed);
                 let database = pg.copy(&format!("w{n}")).await;
                 let pool = pg.pool(&database, WORLD_POOL_SIZE).await;
-                let state = AppState::new(pg.services(&pool), ApiConfig::default());
+                let state = with_gallery(AppState::new(pg.services(&pool), ApiConfig::default()));
                 let db = WorldDb {
                     server: pg.server.clone(),
                     database,
@@ -475,6 +475,22 @@ impl Pg {
             drop_database(&self.server, &n).await;
         }
     }
+}
+
+/// The services with the repository's gallery (card L-1), loaded once per process: the
+/// suites see the gallery templates in `listTemplates` as the server does.
+fn with_gallery(mut state: AppState) -> AppState {
+    use ruum_core::templates::{DirTemplateSource, LoadOptions, TemplateService};
+    static GALLERY: std::sync::OnceLock<Arc<TemplateService>> = std::sync::OnceLock::new();
+    state.services.templates = GALLERY
+        .get_or_init(|| {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../gallery");
+            let g = DirTemplateSource::load(&dir, &LoadOptions::default())
+                .unwrap_or_else(|e| panic!("the gallery loads: {e}"));
+            Arc::new(TemplateService::new(Arc::new(g)))
+        })
+        .clone();
+    state
 }
 
 /// Creates `database`, as a copy of `template` when given.

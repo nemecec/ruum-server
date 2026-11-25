@@ -115,3 +115,9 @@ RUUM_TEMPO_URL optional
 # The real-store tests of the telemetry privacy suite (crates/ruum-core/src/telemetry/tests/o1b.rs).
 RUUM_TELEMETRY_REQUIRE_STORES test
 RUUM_OTLP_ENDPOINT test
+
+# The gallery of templates (card L-1; crates/ruum-server/src/config.rs, GallerySettings).
+RUUM_GALLERY_DIR optional
+RUUM_GALLERY_STRICT optional
+# Writes gallery/reference/app-yaml.md again (crates/ruum-core/src/templates/tests.rs).
+RUUM_WRITE_GALLERY_REFERENCE test

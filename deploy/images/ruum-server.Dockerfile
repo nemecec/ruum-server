@@ -18,6 +18,8 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /out/ruum-server /app/ruum-server
 COPY migrations /app/migrations
 ENV RUUM_MIGRATIONS_DIR=/app/migrations RUUM_BIND=0.0.0.0:8491 RUUM_DAV_BIND=0.0.0.0:8492
+COPY gallery /app/gallery
+ENV RUUM_GALLERY_DIR=/app/gallery
 USER 65532:65532
 EXPOSE 8491 8492 8493
 ENTRYPOINT ["/app/ruum-server"]

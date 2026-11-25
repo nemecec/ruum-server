@@ -166,6 +166,32 @@ impl WorkloadTokenSettings {
     }
 }
 
+/// The gallery of templates (card L-1, `ruum_core::templates::source`):
+/// `RUUM_GALLERY_DIR`, the directory it is loaded from at start (default `gallery`, relative to
+/// the working directory; the server image sets `/app/gallery`), and `RUUM_GALLERY_STRICT`
+/// (`true` or `false`, default `true`): a template that fails its checks stops the start, or
+/// with `false` is skipped with a warning. A missing or empty directory gives an empty gallery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GallerySettings {
+    pub dir: PathBuf,
+    pub strict: bool,
+}
+
+impl GallerySettings {
+    pub fn from_env() -> anyhow::Result<Self> {
+        Ok(Self {
+            dir: var("RUUM_GALLERY_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("gallery")),
+            strict: var("RUUM_GALLERY_STRICT")
+                .map(|v| v.parse::<bool>())
+                .transpose()
+                .context("RUUM_GALLERY_STRICT must be true or false")?
+                .unwrap_or(true),
+        })
+    }
+}
+
 /// The runtime driver of the sandboxes (backlog I6-1). `RUUM_RUNTIME_DRIVER`: `memory` (the
 /// default: nothing runs) or `kubernetes` (pods in gVisor; the Docker driver of the laptop is
 /// wired by card I-4). The Kubernetes settings:
