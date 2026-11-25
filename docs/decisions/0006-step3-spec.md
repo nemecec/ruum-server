@@ -380,3 +380,40 @@ person can veto it.
    This is the rule that the gateway already applies to static keys (section G, point 4).
 3. The file count limit of `unpack` has no number yet (open question for W-2, backlog
    `2026-11-13-t4a-kimi.md` TK-1); the entry-count case assumes fewer than 65,000 files.
+
+## I. The sandbox supervisor (2026-11-25)
+
+Status: `provisional`. Proposed by card I6-20 (backlog I6-20, S-89, S-91; decision 0008-5). The
+design and its threat model are in `docs/STEP3.md` "The sandbox supervisor". A person can veto
+it; the Kubernetes driver stays off on staging until the person turns it on (0008-5).
+
+1. **A supervisor is the first process of every app sandbox.** `ruum-supervisor` (static Rust,
+   std and `libc` only, `crates/ruum-runtime/supervisor`) starts the app as its child, redacts
+   its standard output and standard error with `ruum-core`'s redactor before the container
+   runtime sees them, forwards signals, reaps children, sets the PID limit it is given and empties
+   `/dev/termination-log` at the end. It is non-dumpable, so the app (same user) cannot write to
+   its output streams through `/proc`. Both drivers use it: Kubernetes injects it with an init
+   container from a pinned image into a read-only memory volume; Docker binds it read-only from
+   the engine's host. This is option 2 of I6-20 ("a redacting supervisor inside the sandbox").
+2. **No Kubernetes Secret holds an app's values (closes S-89).** The record ConfigMap carries the
+   values sealed with AES-256-GCM under a record key that only the server pods hold, bound to the
+   record by the associated data and to the record's fixed fields by a digest. The supervisor
+   fetches them from the server with the pod's projected service account token (audience
+   `ruum-supervisor`, ServiceAccount `ruum-sandbox` without rights). The server accepts only a
+   token that a `TokenReview` confirms for the pod named by the record's current run, with that
+   pod's `uid`, from that pod's address, and only when the stored pod is exactly the pod the
+   driver makes for the sealed record. The pod's creator cannot forge the kubelet's token.
+3. **Rights.** The runtime Role has no verb on Secrets; it gains `tokenreviews` `create`
+   (ClusterRole). The admission policy of `ruum-apps` admits the service account `ruum-sandbox`,
+   one projected token volume of the audience `ruum-supervisor`, `emptyDir` volumes, one init
+   container `ruum-supervisor`, and no Secret volume, `valueFrom` or `envFrom`.
+4. **Transport inside the cluster is plain HTTP** with a source address check. Before a real
+   tenant's secret runs on Kubernetes, node-to-node traffic is encrypted (KubeSpan or the CNI's
+   WireGuard) or the listener gets TLS with a pinned certificate.
+5. **Live log rings have a budget (S-91):** `max_live_log_bytes` per server process and
+   `max_tenant_live_log_bytes` per tenant, enforced as lines arrive; the noisy ring loses its own
+   oldest lines first.
+6. **New binary and dependency (design 18.4, section E-5).** The supervisor is a new binary of
+   the platform; `libc` becomes a direct workspace dependency (it was in the tree through tokio
+   and others). The supervisor image needs a build and a pin of its own (a card for
+   `.github/workflows/images.yml`, decision 0008-3).
