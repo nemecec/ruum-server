@@ -19,7 +19,7 @@ the operations policy and the product direction), the integration of run 8 (2026
 (2026-11-11: the privacy filter of Postgres queries for agents), the integration of run 9 (2026-11-12 to
 11-13: decision 0004-40, cards A-2 and D-3a, step 3 wave 1 with T-4a, W-1, R-1 and spike S-2, and
 updates without downtime O-25), the Kimi re-review fixes of O-25, T-4a and S-2 (2026-11-13), the integration of run 10 (2026-11-13 to
-11-14: card S-35 of decision 0008-1, step 3 wave 2 with T-6, W-2s, B-2 and G-1a), the Kimi review fixes of run 10 (2026-11-14: T-6, G-1a, backlog S-43 and the deploy controller O-34), the integration of run 11 (2026-11-17: step 3 wave 3 with the egress proxy R-2e, the Docker runtime driver R-2a and the laptop telemetry stack I-5), the integration of run 12 (2026-11-18: step 3 wave 4 with the gateway in front of sandboxes G-1b and the node22 builder R-2b, and the follow-ups K11, FU-1, P-57, W2S-1 and O-1a), the Kimi review fixes of run 12 (2026-11-19: P-57, K11, G-1b, O-1a and R-2b), the integration of run 13 (2026-11-20: step 3 wave 5 with the telemetry processor O-1b, bindings B-1 and the Node SDK O-5, the site purge at scale W2S-4 and the staging admin tunnel for Talos O-21), the Kimi review fixes of run 13 (2026-11-21: B-1, O-5, W2S-4 and O-21), the integration of run 14 (2026-11-21: step 3 wave 6 with the runtime API R-3 and the telemetry reads O-2, and the app runtime on staging I-6), the Kimi review fixes of run 14 (2026-11-22: R-3, O-2 and I6-3D, decision 0008-4: static app files in their own bucket, no object store key in the gateway), the integration of run 15 (2026-11-24: the edge fixes O-53 to O-55, the app role kinds of a binding D-5 and the Kubernetes runtime driver I6-1 with S-83), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+11-14: card S-35 of decision 0008-1, step 3 wave 2 with T-6, W-2s, B-2 and G-1a), the Kimi review fixes of run 10 (2026-11-14: T-6, G-1a, backlog S-43 and the deploy controller O-34), the integration of run 11 (2026-11-17: step 3 wave 3 with the egress proxy R-2e, the Docker runtime driver R-2a and the laptop telemetry stack I-5), the integration of run 12 (2026-11-18: step 3 wave 4 with the gateway in front of sandboxes G-1b and the node22 builder R-2b, and the follow-ups K11, FU-1, P-57, W2S-1 and O-1a), the Kimi review fixes of run 12 (2026-11-19: P-57, K11, G-1b, O-1a and R-2b), the integration of run 13 (2026-11-20: step 3 wave 5 with the telemetry processor O-1b, bindings B-1 and the Node SDK O-5, the site purge at scale W2S-4 and the staging admin tunnel for Talos O-21), the Kimi review fixes of run 13 (2026-11-21: B-1, O-5, W2S-4 and O-21), the integration of run 14 (2026-11-21: step 3 wave 6 with the runtime API R-3 and the telemetry reads O-2, and the app runtime on staging I-6), the Kimi review fixes of run 14 (2026-11-22: R-3, O-2 and I6-3D, decision 0008-4: static app files in their own bucket, no object store key in the gateway), the integration of run 15 (2026-11-24: the edge fixes O-53 to O-55, the app role kinds of a binding D-5 and the Kubernetes runtime driver I6-1 with S-83), the staging object storage endpoint O-56 and the Kimi re-check fixes of run 15 (2026-11-25: D-5 and O-53; the I6-1 fix is not merged, I6-22), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -719,7 +719,7 @@ W-2s: `createAppDeployment`, `publishAppDeployment`; card B-2: `listAppRoles`,
 `listAppRoleGrants`, `addAppRoleGrant`, `removeAppRoleGrant`) and 7 more by card O-2 (the
 telemetry reads: `searchAppLogs`, `getAppMetrics`, `getAppTrace`, `compareAppDeployment`,
 `listAppTelemetryFields`, `confirmAppTelemetryFields`, `computeAppPseudonym`), 18 in all; 35
-operations are still `planned` in all. Bindings (B-1) run in the deployment stages, without database bindings (B-1d). The data cluster engine makes the app roles of a database binding (card D-5, `AppRoles`), but nothing hands out their credentials before B-1d. The telemetry processor role (O-1b) is in `ruum-server`, off unless `RUUM_TELEMETRY=on`; the Node SDK (O-5) is in `sdk/node`. The runtime API (`ruum-runtime-api`, card R-3) is a binary of its own with the core's internal runtime routes and the workload token issuer (`RUUM_WORKLOAD_TOKEN_KEY_FILE`; off without it); no chart deploys it yet (I-4). The staging charts and scripts of card I-6 run the app gateway (`ruum-gateway`, G-1a) and the egress proxy (`ruum-egress`, R-2e) on staging with gVisor nodes and the apps domain once the orchestrator applies them (`deploy/staging/README.md` "The app runtime"); the Kubernetes runtime driver (`ruum-runtime` `src/kube`, backlog I6-1) runs in ruum-server with `RUUM_RUNTIME_DRIVER=kubernetes` (the chart sets it with the app runtime) and an admission policy keeps `ruum-apps` gVisor-only (S-83), but node22 deploys are still refused (`runtime_not_ready`) and staging has no builder or registry (I6-13), so node22 apps answer the gateway's 502. The Docker runtime driver (`ruum-runtime`, R-2a) is built and tested but not
+operations are still `planned` in all. Bindings (B-1) run in the deployment stages, without database bindings (B-1d). The data cluster engine makes the app roles of a database binding (card D-5, `AppRoles`), but nothing hands out their credentials before B-1d. The telemetry processor role (O-1b) is in `ruum-server`, off unless `RUUM_TELEMETRY=on`; the Node SDK (O-5) is in `sdk/node`. The runtime API (`ruum-runtime-api`, card R-3) is a binary of its own with the core's internal runtime routes and the workload token issuer (`RUUM_WORKLOAD_TOKEN_KEY_FILE`; off without it); no chart deploys it yet (I-4). The staging charts and scripts of card I-6 run the app gateway (`ruum-gateway`, G-1a) and the egress proxy (`ruum-egress`, R-2e) on staging with gVisor nodes and the apps domain once the orchestrator applies them (`deploy/staging/README.md` "The app runtime"); the Kubernetes runtime driver (`ruum-runtime` `src/kube`, backlog I6-1) runs in ruum-server with `RUUM_RUNTIME_DRIVER=kubernetes` (the chart sets it with the app runtime) and an admission policy keeps `ruum-apps` gVisor-only (S-83), but node22 deploys are still refused (`runtime_not_ready`) and staging has no builder or registry (I6-13), so node22 apps answer the gateway's 502; Kimi's run 15 fixes of the driver (the runtime identity only creates Secrets, a Secret admission rule) are on `fix/i61-kimi15`, not merged (I6-22). The data cluster engine serializes app role create, suspend/resume and a database purge across replicas with an advisory lock, and a purge drops every app role it marked (Kimi fix of D-5). The Docker runtime driver (`ruum-runtime`, R-2a) is built and tested but not
 wired into `ruum-server` (I-4); the laptop telemetry stack (I-5) runs with
 `scripts/dev.sh up --apps`.
 
@@ -879,6 +879,28 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
+
+## Checks (2026-11-25, `main` after the Kimi re-check fixes of run 15, on the build server)
+
+`main` is `b7372e2` before this documentation commit (`c891b17` with `fix/d5-kimi15` and
+`fix/o53-kimi15`; `fix/i61-kimi15` is not merged, I6-22). Each tip was checked with its own key,
+one full check at a time (`panel/integ15k-check.sh`, the same steps as run 15).
+
+| Tip | Workspace (passed / failed / ignored, with `ruum-dbengine`) | Isolation (memory = Postgres) | Permission matrix (memory = Postgres) | Privacy (memory / Postgres) | Trashed | e2e |
+|---|---|---|---|---|---|---|
+| D-5 fix (`2fa1d8e`) | 1527 / 0 / 6 (1366 + 161) | 396 passed, 107 planned | 2144 passed, 512 planned | 99 planned / 38 passed, 61 planned | 112 | browser 172 passed, 1 skipped |
+| O-53 fix (`b7372e2`, final) | **1527 / 0 / 6** (1366 + 161) | **396 passed, 107 planned** | **2144 passed, 512 planned** | **99 planned / 38 passed, 61 planned** | **112** | **browser 172 passed, 1 skipped; smoke PASSED 59 checks** |
+
+On the final tree: `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets
+--locked -- -D warnings` clean; the test kit with `RUUM_REQUIRE_IMPLEMENTED=1` passes on memory
+and Postgres (95 tests each, 0 operations without a case). Also:
+
+- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`: **406 mutations, all
+  KILLED** (unchanged count); the 22 Docker mutations in a shard of their own.
+- `deploy/staging/tests/run.sh` on the Mac: 830 checks passed on the D-5 tip, 846 on the O-53 tip.
+- GitHub CI green: `integ15k/d-5` (`ci` 45612222938), `integ15k/o-53` (45612227805, attempt 3;
+  attempt 1 failed in `memory_limit_enforced`, T-75, attempt 2 in a 200 ms lock wait, T-80).
+- GitHub `nightly` is red since at least 2026-11-21 in the mutation baseline (T-79).
 
 ## Checks (2026-11-24 to 11-25, `main` after the integration of run 15, on the build server)
 
