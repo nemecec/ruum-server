@@ -116,8 +116,11 @@ spec:
             - { name: RUUM_SHUTDOWN_GRACE_SECONDS, value: {{ $grace | quote }} }
             # The server talks to SpiceDB's HTTP gateway, not gRPC (ruum_core::authz::spicedb).
             - { name: RUUM_SPICEDB_HTTP_URL, value: "http://spicedb.authz.svc.cluster.local:8443" }
-            - { name: RUUM_S3_ENDPOINT, value: "https://hel1.your-objectstorage.com" }
-            - { name: RUUM_S3_REGION, value: hel1 }
+            # The endpoint of the location where tofu/cluster makes both buckets (HCLOUD_LOCATION of
+            # versions.env, fsn1 since 2026-11-11). hel1 answers NoSuchBucket (backlog O-56);
+            # tests/run.sh ties both lines to HCLOUD_LOCATION.
+            - { name: RUUM_S3_ENDPOINT, value: "https://fsn1.your-objectstorage.com" }
+            - { name: RUUM_S3_REGION, value: fsn1 }
             - { name: RUUM_S3_BUCKET, value: ruum-staging-blobs-768usm }
             # Static app files in a bucket of their own (decision 0008-4; tofu/cluster). Only the
             # server writes; the gateway gets short-lived links that the server signs.

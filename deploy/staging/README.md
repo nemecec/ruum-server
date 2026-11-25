@@ -1,6 +1,6 @@
 # Staging as code
 
-Staging of Ruum on Hetzner (`hel1`), as decided in decision 0007 (budget EUR 30-50 per month). The
+Staging of Ruum on Hetzner (`fsn1`), as decided in decision 0007 (budget EUR 30-50 per month). The
 design is `panel/staging-plan.md` with every blocker and must item of its two reviews fixed (table
 at the end). Nothing in this folder creates a cloud resource unless you run it with
 `RUUM_STAGING_APPLY=yes`.

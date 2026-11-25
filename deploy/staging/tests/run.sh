@@ -2096,6 +2096,12 @@ lbsvc https | grep -qE '^ +protocol += "tcp"$' && [[ "$(lbsvc https | grep -cE '
 grep -qF 'minio_server = "${var.location}.your-objectstorage.com"' "$STG/tofu/cluster/versions.tf" && grep -qF 'TF_VAR_location="$HCLOUD_LOCATION"' "$STG/steps.sh" &&
   grep -qxF "  sourceEndpoint: https://$HCLOUD_LOCATION.your-objectstorage.com" "$STG/charts/platform/values.yaml" &&
   ok "blob-copy's source endpoint is the location of the tofu buckets ($HCLOUD_LOCATION, backlog O-55)" || bad "blob-copy's source endpoint is not the location where tofu makes the blob bucket"
+# Backlog O-56: the server reads and writes both buckets at the endpoint of their location.
+sv="$STG/charts/ruum/templates/server.yaml"
+grep -qF "{ name: RUUM_S3_ENDPOINT, value: \"https://$HCLOUD_LOCATION.your-objectstorage.com\" }" "$sv" &&
+  grep -qF "{ name: RUUM_S3_REGION, value: $HCLOUD_LOCATION }" "$sv" &&
+  ok "the server's object storage endpoint and region are the location of the tofu buckets ($HCLOUD_LOCATION, backlog O-56)" ||
+  bad "the server's object storage endpoint or region is not the location where tofu makes the buckets"
 bb="$(awk '/^variable "bucket_blobs"/ {on=1} on && /default/ {gsub(/[" ]/, "", $3); print $3; exit}' "$STG/tofu/cluster/variables.tf")"
 grep -qxF "  source: $bb" "$STG/charts/platform/values.yaml" && ok "blob-copy copies the blob bucket of tofu ($bb)" || bad "blob-copy's source is not tofu's bucket_blobs ($bb)"
 rc="$STG/k8s/manifests/runtimeclass.yaml"
