@@ -235,6 +235,8 @@ struct Local {
     /// The secret environment values as Secret keys and values: a token rotation creates the
     /// Secret again with them (the driver cannot read it).
     secret_env: Vec<(String, String)>,
+    /// One token rotation at a time: two at once could each delete the other's new key.
+    rotating: tokio::sync::Mutex<()>,
     redactors: Mutex<Option<Arc<Mutex<Redactors>>>>,
     st: Mutex<LocalSt>,
 }
@@ -1249,9 +1251,26 @@ impl Inner {
     /// one counted for the starter), else one of the starter's own, else `unavailable`. So one
     /// tenant's load evicts its own ended instances first (as the Docker driver, S-61, S-67), and
     /// no tenant takes every slot.
-    fn trim_locals(&self, room: Option<TenantId>) -> Result<(), RuntimeError> {
-        type Group = (usize, Vec<(Instant, InstanceId)>);
+    ///
+    /// With `room`, the new instance's `Local` is added under the same lock when there is room,
+    /// so two starts at once cannot both pass the caps (Kimi review of this fix).
+    fn trim_locals(&self, room: Option<&Arc<Local>>) -> Result<(), RuntimeError> {
         let mut map = self.locals.lock().expect("locals lock");
+        let r = self.trim_in(&mut map, room.map(|l| l.identity.tenant));
+        if r.is_ok()
+            && let Some(l) = room
+        {
+            map.insert(l.id, l.clone());
+        }
+        r
+    }
+
+    fn trim_in(
+        &self,
+        map: &mut HashMap<InstanceId, Arc<Local>>,
+        room: Option<TenantId>,
+    ) -> Result<(), RuntimeError> {
+        type Group = (usize, Vec<(Instant, InstanceId)>);
         let retention = self.cfg.ended_retention;
         map.retain(|_, l| {
             l.st.lock()
@@ -1318,14 +1337,14 @@ impl Inner {
                 let (e, p) = (first(ended.get(&t)), first(parked.get(&t)));
                 match (e, p) {
                     (Some((ea, eid)), Some((pa, _))) if ea <= pa => {
-                        Self::forget(&mut map, eid);
+                        Self::forget(map, eid);
                     }
                     (_, Some((_, pid))) => {
                         if let Some(l) = map.get(&pid) {
                             l.st.lock().expect("local lock").ring.clear();
                         }
                     }
-                    (Some((_, eid)), None) => Self::forget(&mut map, eid),
+                    (Some((_, eid)), None) => Self::forget(map, eid),
                     (None, None) => return Ok(()),
                 }
                 continue;
@@ -1369,7 +1388,7 @@ impl Inner {
             else {
                 return Ok(());
             };
-            Self::forget(&mut map, id);
+            Self::forget(map, id);
         }
     }
 
@@ -1579,27 +1598,54 @@ impl RuntimeDriver for KubeDriver {
             }
         };
         let image = inner.image(&spec.identity, &digest).await?;
-        // Room for its logs in this process, before anything is made.
-        inner.trim_locals(Some(spec.identity.tenant))?;
         let rec = Record::new(&spec, id, image);
         let name = object_name(id);
+        let secret_env = pod::secret_env(&spec);
+        let token = spec.workload_token.expose().to_owned();
+        let base: Vec<String> = spec
+            .redacted_values()
+            .into_iter()
+            .filter(|v| *v != token)
+            .map(str::to_owned)
+            .collect();
+        let local = Arc::new(Local {
+            id,
+            identity: spec.identity,
+            made: Instant::now(),
+            secret_env,
+            rotating: tokio::sync::Mutex::new(()),
+            redactors: Mutex::new(None),
+            st: Mutex::new(LocalSt {
+                ring: Ring::new(inner.cfg.log_lines, MAX_LOG_BYTES, inner.cfg.max_line_bytes),
+                base,
+                tokens: VecDeque::from([token]),
+                followed_run: 0,
+                followers: Vec::new(),
+                touched_ms: rec.last_touch_ms,
+                ended_at: None,
+                parked_at: None,
+            }),
+        });
+        // Room for its logs in this process, before anything is made (the Local is added).
+        inner.trim_locals(Some(&local))?;
         // The record first: a crash after it leaves a record that the sweep ends and removes
         // (with its keys and their Secret, by the garbage collector), never a Secret nobody
         // knows.
-        let record_uid = match inner
+        let made = inner
             .api
             .create(Kind::ConfigMap, &pod::record_body(&inner.cfg, &rec, None))
-            .await?
-        {
-            Write::Done(v) => v
+            .await;
+        let record_uid = match made {
+            Ok(Write::Done(v)) => v
                 .pointer("/metadata/uid")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned(),
-            _ => {
-                return Err(RuntimeError::Internal {
+            other => {
+                inner.locals.lock().expect("locals lock").remove(&id);
+                return Err(other.err().unwrap_or_else(|| RuntimeError::Internal {
                     reason: format!("the instance record {name} exists already"),
-                });
+                }));
             }
         };
         let undo = |e: RuntimeError| async move {
@@ -1618,7 +1664,6 @@ impl RuntimeDriver for KubeDriver {
             })
             .await);
         }
-        let secret_env = pod::secret_env(&spec);
         let made = match inner.new_key(&spec.identity, id, &record_uid).await {
             Ok(key) => {
                 inner
@@ -1626,7 +1671,7 @@ impl RuntimeDriver for KubeDriver {
                         &spec.identity,
                         id,
                         spec.workload_token.expose(),
-                        &secret_env,
+                        &local.secret_env,
                         (&key.0, &key.1),
                         1,
                     )
@@ -1637,35 +1682,6 @@ impl RuntimeDriver for KubeDriver {
         if let Err(e) = made {
             return Err(undo(e).await);
         }
-        let token = spec.workload_token.expose().to_owned();
-        let base: Vec<String> = spec
-            .redacted_values()
-            .into_iter()
-            .filter(|v| *v != token)
-            .map(str::to_owned)
-            .collect();
-        let local = Arc::new(Local {
-            id,
-            identity: spec.identity,
-            made: Instant::now(),
-            secret_env,
-            redactors: Mutex::new(None),
-            st: Mutex::new(LocalSt {
-                ring: Ring::new(inner.cfg.log_lines, MAX_LOG_BYTES, inner.cfg.max_line_bytes),
-                base,
-                tokens: VecDeque::from([token]),
-                followed_run: 0,
-                followers: Vec::new(),
-                touched_ms: rec.last_touch_ms,
-                ended_at: None,
-                parked_at: None,
-            }),
-        });
-        inner
-            .locals
-            .lock()
-            .expect("locals lock")
-            .insert(id, local.clone());
         if let Err(e) = inner.begin_run(&rec).await {
             return Err(undo(e).await);
         }
@@ -1972,6 +1988,7 @@ impl RuntimeDriver for KubeDriver {
         // key, the old keys deleted (the garbage collector removes the old Secret), then the
         // Secret again under the new key. Meanwhile a running pod keeps its token file (the
         // kubelet keeps the last content) and a cold start waits for the Secret.
+        let _one = l.rotating.lock().await;
         let key = inner.new_key(&rec.identity, instance, &record_uid).await?;
         if !inner.drop_keys(instance, Some(&key.0)).await {
             return Err(RuntimeError::Unavailable {

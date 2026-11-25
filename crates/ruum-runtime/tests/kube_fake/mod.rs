@@ -429,6 +429,33 @@ impl Fake {
         }
     }
 
+    /// The garbage collector for a new object whose owner does not exist: it is deleted (at once
+    /// or after `gc_delay_ms`), as a real collector deletes a dependent of an absent owner.
+    fn orphans(self: &Arc<Self>, obj: &Value) {
+        let refs: Vec<String> = obj
+            .pointer("/metadata/ownerReferences")
+            .and_then(Value::as_array)
+            .map(|r| {
+                r.iter()
+                    .filter_map(|x| x["uid"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if refs.is_empty() {
+            return;
+        }
+        let exists = |u: &str| {
+            let o = self.objs.lock().unwrap();
+            let has = |v: &Value| v.pointer("/metadata/uid").and_then(Value::as_str) == Some(u);
+            o.cms.values().any(has)
+                || o.secrets.values().any(has)
+                || o.pods.values().any(|p| has(&p.obj))
+        };
+        if let Some(gone) = refs.into_iter().find(|u| !exists(u)) {
+            self.deleted(gone);
+        }
+    }
+
     /// The Secrets of the namespace (names and data), as the tests see them.
     pub fn secrets(&self) -> Vec<Value> {
         self.objs
@@ -628,12 +655,15 @@ async fn collection_post(
     let key = (ns.clone(), name.clone());
     match kind.as_str() {
         "configmaps" => {
-            let mut o = f.objs.lock().unwrap();
-            if o.cms.contains_key(&key) {
-                return status(StatusCode::CONFLICT, "AlreadyExists");
+            {
+                let mut o = f.objs.lock().unwrap();
+                if o.cms.contains_key(&key) {
+                    return status(StatusCode::CONFLICT, "AlreadyExists");
+                }
+                Fake::bump(&mut o, &mut obj);
+                o.cms.insert(key, obj.clone());
             }
-            Fake::bump(&mut o, &mut obj);
-            o.cms.insert(key, obj.clone());
+            f.orphans(&obj);
             (StatusCode::CREATED, axum::Json(obj)).into_response()
         }
         "secrets" => {
@@ -650,6 +680,8 @@ async fn collection_post(
             }
             Fake::bump(&mut o, &mut obj);
             o.secrets.insert(key, obj.clone());
+            drop(o);
+            f.orphans(&obj);
             (StatusCode::CREATED, axum::Json(obj)).into_response()
         }
         _ => {
@@ -788,6 +820,13 @@ async fn object_put(
         return status(StatusCode::CONFLICT, "the object has been modified");
     }
     obj["metadata"]["namespace"] = json!(ns);
+    // The uid and the owners are the stored object's (a real API server keeps them).
+    obj["metadata"]["uid"] = cur["metadata"]["uid"].clone();
+    if obj.pointer("/metadata/ownerReferences").is_none()
+        && let Some(r) = cur.pointer("/metadata/ownerReferences").cloned()
+    {
+        obj["metadata"]["ownerReferences"] = r;
+    }
     Fake::bump(&mut o, &mut obj);
     o.cms.insert(key, obj.clone());
     axum::Json(obj).into_response()

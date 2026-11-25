@@ -324,8 +324,10 @@ network policies or the kubelet's behaviour: on staging `ops/gvisor-check.sh`,
   removal and the new one a running pod keeps its file; a cold start in that gap waits for the
   Secret. A rotation that fails after it deleted the old key leaves the instance without a Secret
   until the next rotation (a cold start meanwhile does not start).
-- A Secret made by a release before this one (no owner) is not removed by the driver, which may
-  not delete Secrets: `kubectl -n ruum-apps delete secret -l ruum.managed=ruum-runtime` once.
+- A Secret made before the policy `ruum-apps-secrets` (an older release's, without an owner) is
+  not removed by the driver, which may not delete Secrets, and the policy does not check
+  existing objects: delete once every Secret in `ruum-apps` that a key does not own.
+- Token rotations of one instance run one at a time (a lock in the process that redacts).
 - A pod's output also goes to the node's CRI log files (rotated by the kubelet), unredacted; the
   Docker driver keeps output off the engine's disk with the log driver `none` (backlog I6-20).
 - With two server replicas, each one's sandbox directory keeps its own map of deployment to
