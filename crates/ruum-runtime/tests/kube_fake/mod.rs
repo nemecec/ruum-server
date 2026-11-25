@@ -125,6 +125,8 @@ pub struct Fake {
     pub issued: Mutex<HashMap<String, Issued>>,
     /// Each launch answer the supervisor got: (pod, HTTP status).
     pub launches: Mutex<Vec<(String, u16)>>,
+    /// The next pod's supervisor does not ask for its launch (the test asks itself).
+    pub skip_launch_once: AtomicBool,
     /// The registry's objects by digest (manifests and config blobs).
     blobs: Mutex<HashMap<String, Vec<u8>>>,
     namespace: String,
@@ -256,6 +258,7 @@ impl Fake {
             cluster_rules: cluster_rules(),
             issued: Mutex::new(HashMap::new()),
             launches: Mutex::new(Vec::new()),
+            skip_launch_once: AtomicBool::new(false),
             blobs: Mutex::new(HashMap::new()),
             namespace: namespace.to_owned(),
             calls: Mutex::new(Vec::new()),
@@ -396,6 +399,16 @@ impl Fake {
             .iter()
             .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
             .collect()
+    }
+
+    /// Moves the start of a pod's app container `secs` into the past (as the kubelet reports it).
+    pub fn age_pod(&self, ns: &str, name: &str, secs: i64) {
+        let t = (time::OffsetDateTime::now_utc() - time::Duration::seconds(secs))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        self.set_pod(&(ns.to_owned(), name.to_owned()), |p| {
+            p["status"]["containerStatuses"][0]["state"]["running"]["startedAt"] = json!(t);
+        });
     }
 
     pub fn pods(&self) -> Vec<Value> {
@@ -591,13 +604,12 @@ pub fn admit(pod: &Value) -> Result<(), &'static str> {
         return Err("no ephemeral containers");
     }
     let inits = arr(&spec["initContainers"]);
-    let init_ok = inits.is_empty()
-        || (inits.len() == 1
-            && inits[0]["name"] == json!("ruum-supervisor")
-            && arr(&inits[0]["volumeMounts"]).len() == 1
-            && inits[0]["volumeMounts"][0]["name"] == json!("ruum-bin"));
+    let init_ok = inits.len() == 1
+        && inits[0]["name"] == json!("ruum-supervisor")
+        && arr(&inits[0]["volumeMounts"]).len() == 1
+        && inits[0]["volumeMounts"][0]["name"] == json!("ruum-bin");
     if !init_ok {
-        return Err("at most the init container ruum-supervisor, which mounts only ruum-bin");
+        return Err("exactly the init container ruum-supervisor, which mounts only ruum-bin");
     }
     if spec["serviceAccountName"] != json!("ruum-sandbox") {
         return Err("the service account ruum-sandbox only");
@@ -615,6 +627,14 @@ pub fn admit(pod: &Value) -> Result<(), &'static str> {
             return Err("volumes: only emptyDir and the supervisor's projected token");
         }
     }
+    if arr(&spec["volumes"])
+        .iter()
+        .filter(|v| v.get("projected").is_some())
+        .count()
+        != 1
+    {
+        return Err("exactly one projected volume");
+    }
     for c in arr(&spec["containers"]).iter().chain(inits.iter()) {
         if !arr(&c["envFrom"]).is_empty() {
             return Err("no envFrom");
@@ -631,9 +651,11 @@ pub fn admit(pod: &Value) -> Result<(), &'static str> {
         }
     }
     for c in arr(&spec["containers"]) {
-        if arr(&c["volumeMounts"])
-            .iter()
-            .any(|m| m["name"] == json!("ruum-bin") && m["readOnly"] != json!(true))
+        let mounts = arr(&c["volumeMounts"]);
+        if !mounts.iter().any(|m| m["name"] == json!("ruum-bin"))
+            || mounts
+                .iter()
+                .any(|m| m["name"] == json!("ruum-bin") && m["readOnly"] != json!(true))
         {
             return Err("ruum-bin is read-only in every container");
         }
@@ -1392,6 +1414,12 @@ async fn kubelet(f: Arc<Fake>, key: (String, String), log: Arc<LogBuf>) {
         })
         .unwrap_or_default();
     // The supervisor: one launch, then the program of its command with every line redacted.
+    if command.first().map(String::as_str) == Some(SUPERVISOR_PATH)
+        && f.skip_launch_once.swap(false, Ordering::SeqCst)
+    {
+        ready(false);
+        std::future::pending::<()>().await;
+    }
     let (mut sup, args) = if command.first().map(String::as_str) == Some(SUPERVISOR_PATH) {
         let (Some(url), Some(bearer)) = (arg_after(&command, "--launch-url"), token) else {
             log.push(2, b"ruum-supervisor: no launch channel\n".to_vec());

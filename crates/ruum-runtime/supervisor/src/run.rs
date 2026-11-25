@@ -328,22 +328,48 @@ fn pump(
     let _ = done.send(which);
 }
 
-/// Writes the token file whole (a new file renamed over the old one, so a reader never sees a
-/// partial token). The app reads it; nobody else.
+/// Writes the token file whole: a new file under a fresh name, renamed over the old one, so a
+/// reader never sees a partial token. The app (the same user) can write the folder, so the new
+/// file is made with `O_CREAT | O_EXCL` (`create_new`): an existing name, also a symbolic link
+/// the app planted (say to `/proc/self/fd/1`, the supervisor's raw output), fails instead of
+/// being followed, and another name is tried. `rename` replaces a link at the target itself and
+/// never follows it (Kimi review of I6-20, finding 1).
 fn write_token_file(path: &Path, token: &str) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension("new");
-    {
-        let mut f = std::fs::OpenOptions::new()
+    static SEQ: AtomicI32 = AtomicI32::new(0);
+    let dir = path.parent().unwrap_or(Path::new("."));
+    for _ in 0..16 {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let tmp = dir.join(format!(
+            ".token-{}-{}-{nanos}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        let mut f = match std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o440)
-            .open(&tmp)?;
-        f.write_all(token.as_bytes())?;
-        f.sync_all()?;
+            .open(&tmp)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let written = f.write_all(token.as_bytes()).and_then(|()| f.sync_all());
+        drop(f);
+        if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        return Ok(());
     }
-    std::fs::rename(&tmp, path)
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free name for the token file",
+    ))
 }
 
 /// The PID of the app, for the signal thread (0 before it starts).
@@ -820,6 +846,33 @@ mod tests {
         let err = load(&opts).unwrap_err();
         assert!(err.contains("403"), "{err}");
         server.join().unwrap();
+    }
+
+    /// A link the app planted at a name the supervisor might use is never followed: the token
+    /// goes into the token file only (Kimi review of I6-20, finding 1).
+    #[test]
+    fn the_token_write_follows_no_planted_link() {
+        let d = tmp("link");
+        let victim = d.join("victim");
+        std::fs::write(&victim, "untouched").unwrap();
+        let tf = d.join("token");
+        for name in ["token.new", ".token-0-0-0"] {
+            std::os::unix::fs::symlink(&victim, d.join(name)).unwrap();
+        }
+        write_token_file(&tf, "the-token-value").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+        assert_eq!(std::fs::read_to_string(&tf).unwrap(), "the-token-value");
+        // The token file itself replaced by a link: the rename replaces the link.
+        std::fs::remove_file(&tf).unwrap();
+        std::os::unix::fs::symlink(&victim, &tf).unwrap();
+        write_token_file(&tf, "second-value").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+        assert!(
+            !std::fs::symlink_metadata(&tf)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]

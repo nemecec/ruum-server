@@ -356,6 +356,10 @@ live() {
     want no "$r" "$ns" list secrets
     want no "$r" "$ns" create configmaps
   done
+  # The record key lives in ruum (S-89): no Secret verb there either, a no-op patch refused
+  # (Kimi review of I6-20, finding 8).
+  for verb in create watch patch update delete deletecollection; do want no "$r" ruum "$verb" secrets; done
+  patch_refused "$r" ruum
   want no "$r" - create pods
   want no "$r" - list secrets
   local o="system:serviceaccount:$OBSERVER_NS:$OBSERVER" resource

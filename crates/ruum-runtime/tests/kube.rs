@@ -1070,6 +1070,24 @@ fn the_admission_rules_admit_only_the_supervisor_shape() {
             "an ephemeral container",
             change(&|p| p["spec"]["ephemeralContainers"] = serde_json::json!([{ "name": "x" }])),
         ),
+        (
+            "no init container",
+            change(&|p| {
+                p["spec"].as_object_mut().unwrap().remove("initContainers");
+            }),
+        ),
+        (
+            "no supervisor mount",
+            change(&|p| p["spec"]["containers"][0]["volumeMounts"] = serde_json::json!([])),
+        ),
+        (
+            "two projected tokens",
+            change(&|p| {
+                let mut v = p["spec"]["volumes"][1].clone();
+                v["name"] = serde_json::json!("ruum-id2");
+                p["spec"]["volumes"].as_array_mut().unwrap().push(v);
+            }),
+        ),
     ];
     for (what, pod) in cases {
         assert!(kube_fake::admit(&pod).is_err(), "{what} was admitted");
@@ -1539,4 +1557,38 @@ async fn scaled_to_zero_logs_count_to_the_byte_cap() {
     d.rotate_token(id.tenant, s.id, SecretValue::new("tok-after-the-cap-1234"))
         .await
         .unwrap();
+}
+
+/// The launch comes only within two minutes of the app container's start (Kimi review of I6-20,
+/// finding 2): later it can only be the app asking again, which a seal put back on another
+/// replica could otherwise hide. The kubelet writes the start; the pod's creator cannot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_launch_is_refused_long_after_the_start() {
+    let w = world(false).await;
+    let d = w.quiet_driver();
+    w.fake.skip_launch_once.store(true, Ordering::SeqCst);
+    let s = d.start(w.service(identity(), None)).await.unwrap();
+    let pod_n = ruum_runtime::kube::pod_name(s.id, 1);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while w
+        .fake
+        .pod(NS, &pod_n)
+        .and_then(|p| p.pointer("/status/podIP").cloned())
+        .is_none()
+    {
+        assert!(Instant::now() < deadline, "the pod did not run");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (tok, ip) = w.pod_token(&pod_n);
+    w.fake.age_pod(NS, &pod_n, 600);
+    assert_eq!(
+        d.supervisor_launch(&tok, ip).await.unwrap_err(),
+        LaunchRefusal::Forbidden,
+        "a launch ten minutes after the start"
+    );
+    w.fake.age_pod(NS, &pod_n, 1);
+    assert!(
+        d.supervisor_launch(&tok, ip).await.is_ok(),
+        "the launch right after the start"
+    );
 }

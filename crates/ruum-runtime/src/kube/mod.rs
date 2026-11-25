@@ -83,6 +83,9 @@ const REVIEW_CACHE_MAX: usize = 4096;
 /// The supervisor requests one peer address may make per window.
 const PEER_REQUESTS: u32 = 30;
 const PEER_WINDOW: Duration = Duration::from_secs(10);
+/// How long after the app container's start its supervisor may take the launch data (it tries
+/// for 60 s while the seal of its run is written).
+const LAUNCH_WINDOW_SECS: i64 = 120;
 
 /// A shared service of a route (the egress proxy, the internal gateway, the pooler), as the
 /// platform deploys it. The spec cannot name one.
@@ -960,6 +963,13 @@ impl Inner {
                     });
                 }
             };
+            // A seal older than one this process saw was put back: never build on it (Kimi review
+            // of I6-20, finding 2).
+            if rec.sealed.is_some() && !self.fresh_gen(id, s.generation) {
+                return Err(RuntimeError::Internal {
+                    reason: "an older seal of the instance record was put back".to_owned(),
+                });
+            }
             if !change(&rec, &mut s) {
                 return Err(RuntimeError::Unavailable {
                     reason: "the instance changed while its seal was written".to_owned(),
@@ -1672,6 +1682,7 @@ impl Inner {
         pod_n: &str,
         pod_uid: &str,
         peer: IpAddr,
+        launch: bool,
     ) -> Result<(Sealed, Record, String, String), LaunchRefusal> {
         let refuse = |why: &str| {
             tracing::warn!(target: "ruum::runtime", pod = pod_n, reason = why, "a supervisor request was refused");
@@ -1702,6 +1713,31 @@ impl Inner {
         }
         if pod.pointer("/metadata/deletionTimestamp").is_some() {
             return Err(refuse("the pod is being deleted"));
+        }
+        // The launch comes from the supervisor right after the app container started (the
+        // kubelet writes `startedAt`; the pod's creator cannot). Past the window it can only be
+        // the app asking again: refused also when a seal put back on another replica hides the
+        // first launch (Kimi review of I6-20, finding 2; the authority of the launched list is
+        // per process until backlog I620-9).
+        if launch {
+            let started = pod
+                .pointer("/status/containerStatuses")
+                .and_then(Value::as_array)
+                .and_then(|a| {
+                    a.iter()
+                        .find(|c| c["name"] == serde_json::json!(pod::CONTAINER))
+                })
+                .and_then(|c| c.pointer("/state/running/startedAt"))
+                .and_then(Value::as_str)
+                .and_then(|t| {
+                    OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339).ok()
+                });
+            let fresh = started.is_some_and(|t| {
+                (OffsetDateTime::now_utc() - t) < time::Duration::seconds(LAUNCH_WINDOW_SECS)
+            });
+            if !fresh {
+                return Err(refuse("the app container did not start just now"));
+            }
         }
         let mut ips: Vec<IpAddr> = pod
             .pointer("/status/podIPs")
@@ -1784,7 +1820,7 @@ impl Inner {
         }
         let (pod_n, pod_uid) = self.review(bearer).await?;
         for _ in 0..SEAL_TRIES {
-            let (s, mut rec, rv, rec_uid) = self.authorize(&pod_n, &pod_uid, peer).await?;
+            let (s, mut rec, rv, rec_uid) = self.authorize(&pod_n, &pod_uid, peer, launch).await?;
             let launched = s.launched.contains(&pod_uid);
             if !launch {
                 if !launched {
