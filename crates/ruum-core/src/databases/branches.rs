@@ -1,5 +1,5 @@
-//! Branches of a database (card D-3a, the `schema_only` part of card D-3; design 8.4,
-//! decisions 18 and 0004-17, 0004-18, 0004-25, 0004-27, 0004-28): `listDatabaseBranches` and
+//! Branches of a database (cards D-3a and D-3b, card D-3; design 8.4, decisions 18 and
+//! 0004-7, 0004-17, 0004-18, 0004-25, 0004-27, 0004-28): `listDatabaseBranches` and
 //! `createDatabaseBranch`.
 //!
 //! - `list_branches`: `view` on the database; its live child nodes of type `database` (a
@@ -13,26 +13,32 @@
 //!   the source, so it inherits the grants) with the source's manifest and `template` naming
 //!   the source, and the provider makes the branch in a task ([`make_branch`]). The answer is
 //!   `202` with status `provisioning`.
-//! - Data: `schema_only` only (no rows). `masked` (the default) and `full` answer `422
-//!   validation_failed` (hint `/data`) until card D-3b; an agent that asks for `full` gets `403
-//!   user_required`, and a person without `manage` gets `403`, first.
+//! - Data (card D-3b): `masked` (the default), `schema_only` (no rows) or `full` (real data:
+//!   only a person with `manage` on the source, decision 0004-7; an agent gets `403
+//!   user_required`, a person without `manage` gets `403`, before anything is made).
 //!
-//! [`make_branch`] (the provider's task): the engine copy of the source with `schema_only`
-//! data (Postgres drains the source first, decision 0004-27), the branch's own pseudonym key
-//! (`key_node_id` = the branch's node ID, decision 0004-25), the lens from the branch's
-//! manifest, then in one transaction ([`super::DatabaseStore::insert_branch`]) the `databases`
-//! row (`branch_of`, `branch_data`, `branch_at`), copies of the source's applied
-//! `database_migrations` rows, and copies of the source's `database_columns` rows whose
-//! identity comes from the branch's catalog, matched by schema, table and column name
-//! (decision 0004-28), so a catalog sync of the branch changes nothing and no confirmed column
-//! is unconfirmed again.
+//! [`make_branch`] (the provider's task): the engine copy of the source (Postgres drains the
+//! source first, decision 0004-27) with the data asked for. A `masked` copy masks what the
+//! lens of the source masks ([`super::provider::mask_plan`]: each column of the database's own
+//! schema by its class, `personal` when it has none): `personal` becomes the pseudonym of the
+//! value under the source's key, as `text`; `secret` becomes `NULL` with its `NOT NULL`
+//! dropped; checks that read a masked column are dropped; keys, `UNIQUE`, indexes and foreign
+//! keys are built again, and the engine names the ones a collision broke (decision 0004-17).
+//! Those names go into the branch's `status.message` and their number into the journal entry,
+//! never a value. A `masked` or `schema_only` branch has a pseudonym key of its own
+//! (`key_node_id` = the branch's node ID, decision 0004-25); a `full` branch keeps the source's
+//! `key_node_id`. Then the lens from the branch's manifest, and in one transaction
+//! ([`super::DatabaseStore::insert_branch`]) the `databases` row (`branch_of`, `branch_data`,
+//! `branch_at`), copies of the source's applied `database_migrations` rows, copies of the
+//! source's `database_columns` rows whose identity comes from the branch's catalog after the
+//! copy and the masking, matched by schema, table and column name (decision 0004-28), so a
+//! catalog sync of the branch changes nothing and no confirmed column is unconfirmed again,
+//! and the journal entry `database.branch_created` on the source (by the principal pair that
+//! asked for the branch).
 //!
-//! Not written yet: the journal entry `database.branch_created`, which the contract of
-//! `createDatabaseBranch` names. D-3a writes `node.created` and `version.created` only; card
-//! D-3b adds the entry (its event type is still in `planned_types`; review D-3a 5).
-//!
-//! An agent writes on a `schema_only` branch without a grant: the core reads `branch_data`
-//! (`DatabasePermissions::with_grants`, the query API), the "draft branch" rule of section 8.5.
+//! An agent writes on a `masked` or `schema_only` branch without a grant: the core reads
+//! `branch_data` (`DatabasePermissions::with_grants`, the query API), the "draft branch" rule of
+//! section 8.5. A `full` branch is no draft branch: an agent needs `write_live` there.
 
 use super::classes::{ColumnRow, LiveColumn, live_columns, plan, user_schema};
 use super::provider::ProviderDeps;
@@ -40,15 +46,16 @@ use super::{
     Database, DatabaseRow, DatabaseService, NODE_TYPE, PROVIDER_ID, engine_not_available, in_trash,
     refuse_share_link,
 };
-use crate::actor::Context;
+use crate::actor::{Actor, Context, PrincipalKind, PrincipalRef};
 use crate::authz::{self, Role};
 use crate::error::{ApiError, Error, ErrorCode, Result};
-use crate::ids::{NodeId, TenantId, VersionId};
+use crate::ids::{NodeId, PrincipalId, TenantId, UserId, VersionId};
 use crate::journal::Written;
 use crate::nodes::{ChildOrder, NewTyped, NodeKind, OnConflict};
 use crate::paging::{Page, PageRequest};
 use crate::providers::{
-    CreateTypedNodeRequest, DataCopy, ProviderState, Source, invalid, node_not_found,
+    ActorPair, CreateTypedNodeRequest, DataCopy, ProviderPrincipalKind, ProviderState, Source,
+    invalid, node_not_found,
 };
 use crate::tenants::database_limits;
 use ruum_dbengine::{CopyData, EngineError, NewDatabase, PseudonymKey};
@@ -64,17 +71,6 @@ pub struct CreateBranch {
     pub data: DataCopy,
     #[serde(default)]
     pub on_conflict: OnConflict,
-}
-
-/// `422 validation_failed`: `masked` and `full` branches come with card D-3b.
-pub fn data_not_available() -> Error {
-    Error::Api(
-        ApiError::new(
-            ErrorCode::ValidationFailed,
-            "only schema_only branches are available yet; masked and full branches come later",
-        )
-        .with_hint("/data: schema_only"),
-    )
 }
 
 /// `422`: a create of a branch node without its source (the reconciler sends a lost create
@@ -157,9 +153,64 @@ pub fn branch_columns(
     plan(&copied, live, now).rows
 }
 
+/// The most constraint names that a branch's `status.message` lists (the journal entry has the
+/// full count).
+const MAX_NAMES_IN_MESSAGE: usize = 20;
+
+/// The `status.message` of a ready masked branch whose masking left out constraints (decision
+/// 0004-17): their names only, at most [`MAX_NAMES_IN_MESSAGE`]; `None` when none was left out.
+pub fn left_out_message(left_out: &[String]) -> Option<String> {
+    if left_out.is_empty() {
+        return None;
+    }
+    let shown: Vec<&str> = left_out
+        .iter()
+        .take(MAX_NAMES_IN_MESSAGE)
+        .map(String::as_str)
+        .collect();
+    let more = left_out.len() - shown.len();
+    let rest = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "The branch is ready. The masking left out {} key(s), unique index(es) or foreign \
+         key(s) that masked values break: {}{rest}.",
+        left_out.len(),
+        shown.join(", ")
+    ))
+}
+
+/// The platform principal pair of a provider request.
+fn actor_of(by: ActorPair) -> Actor {
+    let kind = match by.actor.kind {
+        ProviderPrincipalKind::User => PrincipalKind::User,
+        ProviderPrincipalKind::Group => PrincipalKind::Group,
+        ProviderPrincipalKind::App | ProviderPrincipalKind::Provider => PrincipalKind::App,
+        ProviderPrincipalKind::Agent => PrincipalKind::Agent,
+        ProviderPrincipalKind::ShareLink => PrincipalKind::ShareLink,
+    };
+    Actor {
+        actor: PrincipalRef {
+            kind,
+            id: PrincipalId(by.actor.id),
+        },
+        on_behalf_of: by.on_behalf_of.map(UserId),
+    }
+}
+
+/// What [`make_branch`] made.
+pub(super) struct MadeBranch {
+    /// The key of the branch's lens.
+    pub key: PseudonymKey,
+    /// The constraints that the masking left out (`table.name`), for the status.
+    pub left_out: Vec<String>,
+}
+
 /// Makes the branch `target` of `source` in the engine and writes its rows (the provider's
-/// task, card D-3a). `version` is the branch's first manifest version. Returns the branch's
-/// pseudonym key. Leaves no engine database without its row, and no row without its engine
+/// task, cards D-3a and D-3b). `version` is the branch's first manifest version; `by` asked for
+/// the branch. Leaves no engine database without its row, and no row without its engine
 /// database.
 pub(super) async fn make_branch(
     deps: &ProviderDeps,
@@ -168,11 +219,8 @@ pub(super) async fn make_branch(
     target: NodeId,
     version: VersionId,
     data: DataCopy,
-) -> Result<PseudonymKey> {
-    let copy = match data {
-        DataCopy::SchemaOnly => CopyData::SchemaOnly,
-        DataCopy::Masked | DataCopy::Full => return Err(data_not_available()),
-    };
+    by: ActorPair,
+) -> Result<MadeBranch> {
     let src = deps
         .store
         .get(tenant, source)
@@ -186,12 +234,43 @@ pub(super) async fn make_branch(
         .get(src.engine)
         .cloned()
         .ok_or_else(|| engine_not_available(src.engine))?;
-    // Decision 0004-25: a schema_only branch has a key of its own (derived from the tenant key
-    // and its node ID), loaded through Q-4 and installed by the engine (decision 0004-30). The
-    // source's key would compute the pseudonyms of a masked copy (card D-3b).
+    // Decision 0004-25: a masked or schema_only branch has a key of its own (derived from the
+    // tenant key and its node ID), loaded through Q-4 and installed by the engine (decision
+    // 0004-30); a full branch keeps its source's key. The source's key computes the pseudonyms
+    // of a masked copy, so the branch's base tables hold what a masked read of the source shows.
     let source_key = deps.keys.engine_key(tenant, src.key_node_id).await?;
-    let key_node_id = Some(target);
+    let key_node_id = match data {
+        DataCopy::Masked | DataCopy::SchemaOnly => Some(target),
+        DataCopy::Full => src.key_node_id,
+    };
     let key = deps.keys.engine_key(tenant, key_node_id).await?;
+    let copy = match data {
+        DataCopy::SchemaOnly => CopyData::SchemaOnly,
+        DataCopy::Full => CopyData::Full,
+        DataCopy::Masked => {
+            // The classes of the source as its lens sees them: the stricter of the column
+            // store and the manifest (the branch's first manifest is the source's head
+            // manifest). The engine refuses the copy when the source's columns change after
+            // this catalog was read (`planned_from`).
+            let catalog = engine
+                .catalog(&src.database_ref())
+                .await
+                .map_err(engine_error)?;
+            let manifest = deps
+                .store
+                .manifest(tenant, version)
+                .await?
+                .ok_or_else(|| Error::Internal("the manifest of a branch is missing".into()))?;
+            let classes =
+                super::query::class_map_from(&*deps.columns, tenant, source, src.engine, &manifest)
+                    .await?;
+            CopyData::Masked(super::provider::mask_plan(
+                &catalog,
+                engine.kind(),
+                &classes,
+            ))
+        }
+    };
     let created = engine
         .copy_database(
             &src.database_ref(),
@@ -248,7 +327,15 @@ pub(super) async fn make_branch(
         // column rows (review D-3a 1). A catalog sync never sees the row without its columns,
         // and a restart never leaves a row (`ready`) without them.
         deps.store
-            .insert_branch(&row, &created.roles, &columns)
+            .insert_branch(
+                &row,
+                &created.roles,
+                &columns,
+                &super::BranchCreated {
+                    by: actor_of(by),
+                    constraints_left_out: created.left_out.len(),
+                },
+            )
             .await
     }
     .await;
@@ -256,7 +343,10 @@ pub(super) async fn make_branch(
         let _ = engine.drop_database(&created.database).await;
         return Err(e);
     }
-    Ok(key)
+    Ok(MadeBranch {
+        key,
+        left_out: created.left_out,
+    })
 }
 
 impl DatabaseService {
@@ -303,17 +393,12 @@ impl DatabaseService {
             return Err(in_trash());
         }
         self.check_guest_policy(ctx).await?;
-        match req.data {
-            DataCopy::SchemaOnly => {}
-            DataCopy::Full => {
-                // Real data: only a person with manage on the source (decision 0004-7).
-                if ctx.actor.is_agent() {
-                    return Err(Error::user_required());
-                }
-                authz::require(&*d.authz, &*d.nodes, ctx, id, Role::Manage).await?;
-                return Err(data_not_available());
+        if req.data == DataCopy::Full {
+            // Real data: only a person with manage on the source (decision 0004-7).
+            if ctx.actor.is_agent() {
+                return Err(Error::user_required());
             }
-            DataCopy::Masked => return Err(data_not_available()),
+            authz::require(&*d.authz, &*d.nodes, ctx, id, Role::Manage).await?;
         }
         let typed = self.typed_row(ctx.tenant, id).await?;
         let row = d.store.get(ctx.tenant, id).await?;
@@ -377,7 +462,7 @@ impl DatabaseService {
             manifest,
             source: Source::Branch {
                 node_id: id,
-                data: DataCopy::SchemaOnly,
+                data: req.data,
             },
             by: ctx.actor.into(),
         };

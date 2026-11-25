@@ -11,15 +11,17 @@
 //! `app_credentials` answers [`EngineError::Unsupported`]. A copy and a restore into a new
 //! database get no app role; a restore in place keeps them.
 //!
-//! Masking is not here. The memory engine has no lens: a `masked_read` or `masked_write`
-//! session reads the real values, and a masked copy is [`EngineError::Unsupported`]. No card of
-//! step 2 owns a memory lens yet (card Q-3 fills the lens of the SQLite engine, `sqlite/lens.rs`,
-//! not this one). So a privacy or masking test must not run on the memory engine: it would pass
-//! without masking.
+//! The memory engine has no lens: a `masked_read` or `masked_write` session reads the real
+//! values. No card of step 2 owns a memory lens (card Q-3 fills the lens of the SQLite engine,
+//! `sqlite/lens.rs`, not this one). So a privacy test of reads must not run on the memory
+//! engine: it would pass without masking. A masked copy (card D-3b, `mask.rs`) masks the stored
+//! rows of the copy, so a masked branch or copy made on the memory engine holds no real
+//! personal or secret value.
 
 mod conn;
 mod dump;
 mod guard;
+mod mask;
 #[cfg(test)]
 mod tests;
 
@@ -185,38 +187,49 @@ impl MemoryEngine {
         blocking(guard, f).await?.1
     }
 
-    /// Makes a database from a dump (empty for a new one) and registers it.
+    /// Makes a database from a dump (empty for a new one) and registers it. With `mask`, the
+    /// loaded rows are masked with the source's key before the database is registered.
     async fn make(
         &self,
         new: &NewDatabase,
         dump: Option<String>,
         key: &PseudonymKey,
+        mask: Option<(MaskPlan, PseudonymKey)>,
     ) -> Result<CreatedDatabase, EngineError> {
         let roles = new_roles();
         let key = key.clone();
         let roles2 = roles.clone();
-        let db = tokio::task::spawn_blocking(move || -> Result<MemDb, EngineError> {
-            let guard = Guard::new();
-            let conn = conn::open(&guard)?;
-            conn::install_ruum_objects(&conn, &roles2)?;
-            if let Some(dump) = dump {
-                conn::load(&conn, &dump)?;
-            }
-            Ok(MemDb {
-                conn,
-                guard,
-                roles: roles2,
-                key,
-                connection_key: None,
-                points: Vec::new(),
-                lens: Vec::new(),
-                app_roles: Vec::new(),
-                apps_suspended: false,
-                dropped: false,
+        let made =
+            tokio::task::spawn_blocking(move || -> Result<(MemDb, Vec<String>), EngineError> {
+                let guard = Guard::new();
+                let conn = conn::open(&guard)?;
+                conn::install_ruum_objects(&conn, &roles2)?;
+                if let Some(dump) = dump {
+                    conn::load(&conn, &dump)?;
+                }
+                let left_out = match &mask {
+                    Some((plan, source_key)) => mask::mask(&conn, plan, source_key)?,
+                    None => Vec::new(),
+                };
+                Ok((
+                    MemDb {
+                        conn,
+                        guard,
+                        roles: roles2,
+                        key,
+                        connection_key: None,
+                        points: Vec::new(),
+                        lens: Vec::new(),
+                        app_roles: Vec::new(),
+                        apps_suspended: false,
+                        dropped: false,
+                    },
+                    left_out,
+                ))
             })
-        })
-        .await
-        .map_err(|e| EngineError::Internal(e.to_string()))??;
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))??;
+        let (db, left_out) = made;
         let mut dbs = self.dbs.lock();
         let engine_name = loop {
             let name = neutral_name("d_");
@@ -240,6 +253,7 @@ impl MemoryEngine {
                 engine_name,
             },
             roles,
+            left_out,
         })
     }
 
@@ -317,7 +331,7 @@ impl DatabaseEngine for MemoryEngine {
         new: &NewDatabase,
         key: &PseudonymKey,
     ) -> Result<CreatedDatabase, EngineError> {
-        self.make(new, None, key).await
+        self.make(new, None, key, None).await
     }
 
     async fn drop_database(&self, db: &DatabaseRef) -> Result<(), EngineError> {
@@ -395,27 +409,24 @@ impl DatabaseEngine for MemoryEngine {
     async fn copy_database(
         &self,
         source: &DatabaseRef,
-        _source_key: &PseudonymKey,
+        source_key: &PseudonymKey,
         new: &NewDatabase,
         data: &CopyData,
         key: &PseudonymKey,
     ) -> Result<CreatedDatabase, EngineError> {
-        let with_rows = match data {
-            CopyData::Full => true,
-            CopyData::SchemaOnly => false,
-            CopyData::Masked(_) => {
-                return Err(EngineError::Unsupported(
-                    "masked copies of the memory engine come with the SQLite lens (cards Q-3, D-3)"
-                        .to_string(),
-                ));
-            }
+        let (with_rows, mask) = match data {
+            CopyData::Full => (true, None),
+            CopyData::SchemaOnly => (false, None),
+            // The rows go with the dump and are masked in the copy before it is registered:
+            // no session ever reaches the copy with values in clear.
+            CopyData::Masked(plan) => (true, Some((plan.clone(), source_key.clone()))),
         };
         let dump = self
             .run(source, move |db| {
                 dump::dump(&db.conn, with_rows).map_err(conn::internal)
             })
             .await?;
-        self.make(new, Some(dump), key).await
+        self.make(new, Some(dump), key, mask).await
     }
 
     async fn create_restore_point(
@@ -454,7 +465,7 @@ impl DatabaseEngine for MemoryEngine {
                     .ok_or(EngineError::RestorePointNotFound)
             })
             .await?;
-        self.make(new, Some(snapshot), key).await
+        self.make(new, Some(snapshot), key, None).await
     }
 
     async fn restore_in_place(

@@ -361,54 +361,234 @@ async fn the_branches_are_listed_under_their_database() {
     );
 }
 
+fn branch_of(name: &str, data: DataCopy) -> CreateBranch {
+    CreateBranch {
+        name: name.into(),
+        data,
+        on_conflict: OnConflict::Fail,
+    }
+}
+
+/// The `database.branch_created` entries of the tenant's journal (memory services).
+fn branch_entries(w: &World) -> Vec<crate::journal::JournalEntry> {
+    w.handles
+        .journal
+        .entries(w.team.id)
+        .into_iter()
+        .filter(|e| e.event == crate::journal::EventType::DatabaseBranchCreated)
+        .collect()
+}
+
+/// Card D-3b: a masked branch (the default) holds the pseudonyms of the source's personal
+/// values under the source's key and keeps its normal values; it has a key of its own; the
+/// journal has `database.branch_created` on the source. The source keeps its values.
 #[tokio::test]
-async fn masked_and_full_branches_wait_for_d_3b() {
+async fn a_masked_branch_holds_pseudonyms_and_its_own_key() {
     let w = world().await;
     let a = ctx(w.team.id, w.alice);
     let id = garden(&w).await;
     let s = &w.s.databases;
-    for data in [DataCopy::Masked, DataCopy::Full] {
-        let (status, code_name, hint) = code(
-            s.create_branch(
-                &a,
-                id,
-                CreateBranch {
-                    name: "not yet".into(),
-                    data,
-                    on_conflict: OnConflict::Fail,
-                },
-            )
-            .await,
-        );
-        assert_eq!((status, code_name.as_str()), (422, "validation_failed"));
-        assert!(hint.starts_with("/data"), "{hint}");
-    }
-    // The default is masked.
-    let req: CreateBranch = serde_json::from_value(json!({ "name": "x" })).unwrap();
+    // latin_name is normal; id and email have no class, so they count as personal.
+    s.list_columns(&a, id, false, PageRequest::default())
+        .await
+        .unwrap();
+    s.confirm_columns(
+        &a,
+        "https://ruum.localhost",
+        id,
+        ConfirmRequest {
+            columns: vec![ConfirmItem {
+                schema: "main".into(),
+                table: "plants".into(),
+                column: "latin_name".into(),
+                class: ruum_dbengine::DataClass::Normal,
+            }],
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    // The default of the request is masked.
+    let req: CreateBranch = serde_json::from_value(json!({ "name": "masked preview" })).unwrap();
     assert_eq!(req.data, DataCopy::Masked);
-    // An agent never gets full data: 403 user_required first.
+    let b = s.create_branch(&a, id, req).await.unwrap().value.node.id;
+    let db = settled(&w.s, &a, b).await;
+    assert_eq!(db.status.state, ProviderState::Ready, "{:?}", db.status);
+    assert_eq!(db.status.message, None, "nothing was left out");
+    assert_eq!(db.branch_data, Some(DataCopy::Masked));
+    let row = s.deps().store.get(w.team.id, b).await.unwrap().unwrap();
+    assert_eq!(
+        row.key_node_id,
+        Some(b),
+        "decision 0004-25: a key of its own"
+    );
+    let rows = run_sql(
+        &w.s,
+        w.team.id,
+        b,
+        &["select latin_name, email from plants order by latin_name"],
+    )
+    .await;
+    let source_key = w.s.tenant_keys.database_key(w.team.id, None).await.unwrap();
+    let expected = crate::privacy::HmacPseudonymizer::new(source_key)
+        .pseudonym_of_canonical("a@example.test")
+        .id()
+        .to_string();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Cell::Text("Bellis perennis".into()), Cell::Null],
+            vec![Cell::Text("Rosa canina".into()), Cell::Text(expected)],
+        ],
+        "normal values kept, personal values as pseudonyms of the source's key, NULL kept"
+    );
+    let ids = run_sql(
+        &w.s,
+        w.team.id,
+        b,
+        &["select count(*) from plants where id in (1, 2)"],
+    )
+    .await;
+    assert_eq!(
+        ids,
+        vec![vec![Cell::Int(0)]],
+        "the personal id is masked too"
+    );
+    let source = run_sql(
+        &w.s,
+        w.team.id,
+        id,
+        &["select email from plants where id = 1"],
+    )
+    .await;
+    assert_eq!(source, vec![vec![Cell::Text("a@example.test".into())]]);
+    // The confirmed class is kept and a sync of the branch changes nothing.
+    let outcome = s.sync_columns(w.team.id, b).await.unwrap();
+    assert!(!outcome.rows_changed, "{outcome:?}");
+    assert_eq!(
+        s.get(&a, b).await.unwrap().unconfirmed_columns,
+        s.get(&a, id).await.unwrap().unconfirmed_columns
+    );
+    // The journal entry, on the source, by Alice.
+    let entries = branch_entries(&w);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    let e = &entries[0];
+    assert_eq!(e.node_id, Some(id));
+    assert_eq!(e.actor, Actor::user(w.alice));
+    assert_eq!(e.data["branch_id"], json!(b));
+    assert_eq!(e.data["data"], "masked");
+    assert_eq!(e.data["constraints_left_out"], 0);
+    assert!(e.data["branch_at"].is_string());
+}
+
+/// Card D-3b: a full branch holds the real values and keeps the source's key; it is no draft
+/// branch (an agent needs `write_live`). Only a person with `manage` may ask for it.
+#[tokio::test]
+async fn a_full_branch_holds_the_real_values_and_the_sources_key() {
+    let w = world().await;
+    let a = ctx(w.team.id, w.alice);
+    let id = garden(&w).await;
+    let s = &w.s.databases;
+    let b = s
+        .create_branch(&a, id, branch_of("full copy", DataCopy::Full))
+        .await
+        .unwrap()
+        .value
+        .node
+        .id;
+    let db = settled(&w.s, &a, b).await;
+    assert_eq!(db.status.state, ProviderState::Ready, "{:?}", db.status);
+    assert_eq!(db.branch_data, Some(DataCopy::Full));
+    let row = s.deps().store.get(w.team.id, b).await.unwrap().unwrap();
+    let source = s.deps().store.get(w.team.id, id).await.unwrap().unwrap();
+    assert_eq!(
+        row.key_node_id, source.key_node_id,
+        "the key follows the data"
+    );
+    let rows = run_sql(
+        &w.s,
+        w.team.id,
+        b,
+        &["select id, email from plants order by id"],
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Cell::Int(1), Cell::Text("a@example.test".into())],
+            vec![Cell::Int(2), Cell::Null],
+        ]
+    );
+    let editor = agent_of(&w, w.alice, Role::Edit).await;
+    let perms = s.get(&editor, b).await.unwrap().my_permissions.unwrap();
+    assert!(
+        !perms.write_live,
+        "a full branch is no draft branch: {perms:?}"
+    );
+    // An agent never gets full data: 403 user_required, and nothing is made.
     let agent = agent_of(&w, w.alice, Role::Manage).await;
     let (status, code_name, _) = code(
-        s.create_branch(
-            &agent,
-            id,
-            CreateBranch {
-                name: "agent full".into(),
-                data: DataCopy::Full,
-                on_conflict: OnConflict::Fail,
-            },
-        )
-        .await,
+        s.create_branch(&agent, id, branch_of("agent full", DataCopy::Full))
+            .await,
     );
     assert_eq!((status, code_name.as_str()), (403, "user_required"));
-    // Nothing was made.
-    assert!(
-        s.list_branches(&a, id, PageRequest::default())
-            .await
-            .unwrap()
-            .items
-            .is_empty()
+    let names: Vec<String> = s
+        .list_branches(&a, id, PageRequest::default())
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|d| d.node.name)
+        .collect();
+    assert_eq!(names, vec!["full copy".to_string()]);
+    let entries = branch_entries(&w);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].data["data"], "full");
+}
+
+/// An agent with `edit` makes a masked branch and writes there without a grant (a draft
+/// branch); the journal entry names the agent and its user.
+#[tokio::test]
+async fn an_agent_makes_a_masked_branch_and_writes_there() {
+    let w = world().await;
+    let a = ctx(w.team.id, w.alice);
+    let id = garden(&w).await;
+    let s = &w.s.databases;
+    let editor = agent_of(&w, w.alice, Role::Edit).await;
+    let b = s
+        .create_branch(&editor, id, branch_of("agent preview", DataCopy::Masked))
+        .await
+        .unwrap()
+        .value
+        .node
+        .id;
+    assert_eq!(
+        settled(&w.s, &a, b).await.status.state,
+        ProviderState::Ready
     );
+    let perms = s.get(&editor, b).await.unwrap().my_permissions.unwrap();
+    assert!(perms.write_live && perms.query_write, "{perms:?}");
+    let entries = branch_entries(&w);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].actor, editor.actor);
+    assert_eq!(entries[0].actor.on_behalf_of, Some(w.alice));
+}
+
+#[test]
+fn the_left_out_names_go_into_the_status_message() {
+    assert_eq!(left_out_message(&[]), None);
+    let m = left_out_message(&["orders.orders_note_fk".to_string()]).unwrap();
+    assert!(
+        m.contains("1 key") && m.contains("orders.orders_note_fk"),
+        "{m}"
+    );
+    let many: Vec<String> = (0..25).map(|i| format!("t.k{i}")).collect();
+    let m = left_out_message(&many).unwrap();
+    assert!(
+        m.contains("25 key") && m.contains("t.k19") && !m.contains("t.k20"),
+        "{m}"
+    );
+    assert!(m.contains("and 5 more"), "{m}");
 }
 
 #[tokio::test]
@@ -497,49 +677,31 @@ async fn a_source_over_the_branch_limit_is_database_too_large() {
     );
 }
 
+/// A lost create of a branch, sent again by the reconciler without its source, is refused, so
+/// the branch ends `failed` and never becomes an empty database.
 #[tokio::test]
-async fn the_provider_refuses_what_d_3a_does_not_build() {
+async fn the_provider_refuses_a_lost_branch_create() {
     let w = world().await;
     let id = garden(&w).await;
     let provider = w.s.databases.deps().provider.clone();
-    let manifest = json!({ "engine": "sqlite", "version": "3", "plan": "shared-small" });
-    let mut with_template = manifest.clone();
+    let mut with_template = json!({ "engine": "sqlite", "version": "3", "plan": "shared-small" });
     with_template["template"] = json!({ "node_id": id });
-    for (source, manifest) in [
-        (
-            Source::Branch {
-                node_id: id,
-                data: DataCopy::Masked,
+    let r = provider
+        .create_typed_node(
+            crate::providers::DeliveryId::new(),
+            CreateTypedNodeRequest {
+                tenant_id: w.team.id,
+                node_id: NodeId::new(),
+                parent_id: None,
+                type_name: NODE_TYPE.into(),
+                version_id: VersionId::new(),
+                manifest: with_template,
+                source: Source::Empty,
+                by: Actor::user(w.alice).into(),
             },
-            manifest.clone(),
-        ),
-        (
-            Source::Branch {
-                node_id: id,
-                data: DataCopy::Full,
-            },
-            manifest.clone(),
-        ),
-        // A lost create of a branch, sent again by the reconciler without its source.
-        (Source::Empty, with_template),
-    ] {
-        let r = provider
-            .create_typed_node(
-                crate::providers::DeliveryId::new(),
-                CreateTypedNodeRequest {
-                    tenant_id: w.team.id,
-                    node_id: NodeId::new(),
-                    parent_id: None,
-                    type_name: NODE_TYPE.into(),
-                    version_id: VersionId::new(),
-                    manifest,
-                    source,
-                    by: Actor::user(w.alice).into(),
-                },
-            )
-            .await;
-        assert_eq!(code(r).0, 422);
-    }
+        )
+        .await;
+    assert_eq!(code(r).0, 422);
 }
 
 #[test]
@@ -579,14 +741,18 @@ async fn the_row_and_the_columns_of_a_branch_are_written_together() {
     w.s.databases.sync_columns(t, id).await.unwrap();
     let rows = columns.list(t, id).await.unwrap();
     assert!(!rows.is_empty());
+    let created = crate::databases::BranchCreated {
+        by: Actor::user(w.alice),
+        constraints_left_out: 0,
+    };
     let b = NodeId::new();
-    DatabaseStore::insert_branch(&*store, &branch_row(b), &[], &rows)
+    DatabaseStore::insert_branch(&*store, &branch_row(b), &[], &rows, &created)
         .await
         .unwrap();
     assert!(store.get(t, b).await.unwrap().is_some());
     assert_eq!(columns.list(t, b).await.unwrap().len(), rows.len());
     assert_eq!(
-        code(DatabaseStore::insert_branch(&*store, &branch_row(b), &[], &[]).await).0,
+        code(DatabaseStore::insert_branch(&*store, &branch_row(b), &[], &[], &created).await).0,
         409
     );
     assert_eq!(columns.list(t, b).await.unwrap().len(), rows.len());
@@ -606,7 +772,7 @@ async fn the_row_and_the_columns_of_a_branch_are_written_together() {
         .await
         .unwrap();
     assert_eq!(
-        code(DatabaseStore::insert_branch(&*store, &branch_row(c), &[], &rows).await).0,
+        code(DatabaseStore::insert_branch(&*store, &branch_row(c), &[], &rows, &created).await).0,
         409
     );
     assert!(store.get(t, c).await.unwrap().is_none());
@@ -985,6 +1151,182 @@ async fn a_schema_only_branch_on_postgres() {
         .to_string();
     assert_eq!(in_branch, expected, "the pseudonym of the branch's key");
     // Purge both: the engine databases go.
+    let p = s.deps().provider.clone();
+    for node in [b, id] {
+        p.deliver_hook(
+            crate::providers::DeliveryId::new(),
+            crate::providers::HookDelivery {
+                hook: crate::providers::HookKind::Purged,
+                tenant_id: w.team.id,
+                node_id: Some(node),
+                seq: None,
+                target_node_id: None,
+                data: None,
+                by: Actor::user(w.alice).into(),
+                at: crate::now(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+}
+
+/// Card D-3b on the data cluster: a masked branch holds in its base tables the pseudonyms that
+/// a masked read of the source shows (the source's key), non-text personal columns as `text`,
+/// keys built again (nothing left out); the copied column rows take their identity and type
+/// from the branch's catalog after the masking, so a sync changes nothing; the branch's own
+/// lens gives other pseudonyms than the source's.
+#[tokio::test]
+async fn a_masked_branch_on_postgres() {
+    use crate::databases::{DatabaseParts, Engines, install};
+    let Some(engine) = pg_engine().await else {
+        return;
+    };
+    let mut w = world().await;
+    let parts = DatabaseParts {
+        engines: Engines {
+            postgres: Some(engine.clone()),
+            sqlite: None,
+        },
+        keys: w.s.tenant_keys.clone(),
+        store: w.handles.databases.clone(),
+        typed: w.handles.typed.clone(),
+        columns: w.s.databases.deps().columns.clone(),
+        masking: std::sync::Arc::new(crate::privacy::RecordingMaskingRules::new()),
+        grants: w.s.databases.deps().grants.clone(),
+        queries: w.s.databases.deps().queries.log.clone(),
+    };
+    install(&mut w.s, parts).unwrap();
+    let a = ctx(w.team.id, w.alice);
+    let s = w.s.databases.clone();
+    let id = s
+        .create(
+            &a,
+            CreateDatabase {
+                parent_id: w.folder,
+                name: format!("People {}", uuid::Uuid::now_v7().simple()),
+                manifest: json!({ "engine": "postgres", "version": "17", "plan": "shared-small" }),
+                source: None,
+                on_conflict: OnConflict::Fail,
+            },
+        )
+        .await
+        .unwrap()
+        .value
+        .node
+        .id;
+    assert_eq!(
+        settled_slow(&w.s, &a, id).await.status.state,
+        ProviderState::Ready
+    );
+    run_sql(
+        &w.s,
+        w.team.id,
+        id,
+        &[
+            "create table people (id integer primary key, email text not null unique, born date)",
+            "insert into people values (1, 'a@example.test', '1990-01-02'), (2, 'b@example.test', null)",
+        ],
+    )
+    .await;
+    s.list_columns(&a, id, false, PageRequest::default())
+        .await
+        .unwrap();
+    s.confirm_columns(
+        &a,
+        "https://ruum.localhost",
+        id,
+        ConfirmRequest {
+            columns: vec![ConfirmItem {
+                schema: "public".into(),
+                table: "people".into(),
+                column: "id".into(),
+                class: ruum_dbengine::DataClass::Normal,
+            }],
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let in_source = masked_email(&w.s, w.team.id, id, 1).await;
+    let b = s
+        .create_branch(&a, id, branch_of("people masked", DataCopy::Masked))
+        .await
+        .unwrap()
+        .value
+        .node
+        .id;
+    let db = settled_slow(&w.s, &a, b).await;
+    assert_eq!(db.status.state, ProviderState::Ready, "{:?}", db.status);
+    assert_eq!(db.status.message, None, "no key was left out");
+    assert_eq!(db.branch_data, Some(DataCopy::Masked));
+    // The base table holds the source's masked view of the value; the normal id is kept; the
+    // date is a pseudonym as text; NULL stays NULL.
+    let rows = run_sql(
+        &w.s,
+        w.team.id,
+        b,
+        &["select id, email, born from people order by id"],
+    )
+    .await;
+    assert_eq!(rows[0][0], Cell::Int(1));
+    assert_eq!(rows[0][1], Cell::Text(in_source.clone()));
+    assert!(
+        matches!(&rows[0][2], Cell::Text(t) if crate::privacy::Pseudonym::parse(t).is_some()),
+        "{rows:?}"
+    );
+    assert_eq!(rows[1][2], Cell::Null);
+    let n = run_sql(
+        &w.s,
+        w.team.id,
+        b,
+        &["select count(*) from people where email like '%@example.test'"],
+    )
+    .await;
+    assert_eq!(n, vec![vec![Cell::Int(0)]], "no email in clear");
+    // The unique key on the masked column is there again.
+    let u = run_sql(
+        &w.s,
+        w.team.id,
+        b,
+        &["select count(*) from pg_catalog.pg_constraint \
+           where conrelid = 'public.people'::regclass and contype in ('p', 'u')"],
+    )
+    .await;
+    assert_eq!(u, vec![vec![Cell::Int(2)]]);
+    // Identity and type from the branch's catalog (born is text now); a sync changes nothing.
+    let row = s.deps().store.get(w.team.id, b).await.unwrap().unwrap();
+    assert_eq!(row.key_node_id, Some(b));
+    let catalog = engine.catalog(&row.database_ref()).await.unwrap();
+    let live = live_columns(&catalog, "public");
+    let stored = s.deps().columns.list(w.team.id, b).await.unwrap();
+    assert_eq!(stored.len(), live.len());
+    for l in &live {
+        let r = stored.iter().find(|r| r.column == l.column).unwrap();
+        assert_eq!(r.identity, l.identity, "{:?}", l.column);
+        assert_eq!(r.data_type, l.data_type);
+    }
+    let born = live.iter().find(|l| l.column.column == "born").unwrap();
+    assert_eq!(born.data_type, "text");
+    let outcome = s.sync_columns(w.team.id, b).await.unwrap();
+    assert!(!outcome.rows_changed, "{outcome:?}");
+    assert_eq!(
+        s.get(&a, b).await.unwrap().unconfirmed_columns,
+        s.get(&a, id).await.unwrap().unconfirmed_columns
+    );
+    // The branch's own lens: a pseudonym of the stored pseudonym, under the branch's key.
+    let in_branch = masked_email(&w.s, w.team.id, b, 1).await;
+    assert_ne!(in_branch, in_source);
+    let branch_key =
+        w.s.tenant_keys
+            .database_key(w.team.id, Some(b))
+            .await
+            .unwrap();
+    let expected = crate::privacy::HmacPseudonymizer::new(branch_key)
+        .pseudonym_of_canonical(&in_source)
+        .id()
+        .to_string();
+    assert_eq!(in_branch, expected);
     let p = s.deps().provider.clone();
     for node in [b, id] {
         p.deliver_hook(

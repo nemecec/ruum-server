@@ -202,6 +202,9 @@ pub fn undo_action(event: crate::journal::EventType) -> Option<&'static str> {
         DatabaseGrantRevoked => None,
         // Only a person decides an approval (card A-2); an agent never wrote one.
         DatabaseApprovalDecided => None,
+        // The undo of a branch is the undo of its `node.created` entry (trash the branch node);
+        // this entry on the source database has nothing of its own to revert (card D-3b).
+        DatabaseBranchCreated => None,
         // `app.settings_changed` names the new values only, so there is no old value to set
         // back (card W-1); an agent can only lower the settings anyway.
         AppSettingsChanged => None,

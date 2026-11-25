@@ -1,6 +1,5 @@
-//! Branches (card D-3a): `listDatabaseBranches` and `createDatabaseBranch` (`schema_only`
-//! data; `masked` and `full` come with card D-3b). The logic is in
-//! `ruum_core::databases::branches`.
+//! Branches (cards D-3a and D-3b): `listDatabaseBranches` and `createDatabaseBranch`
+//! (`masked`, `schema_only` or `full` data). The logic is in `ruum_core::databases::branches`.
 
 use super::database_write;
 use crate::auth::{JsonBody, QueryParams, RequestContext};
@@ -59,9 +58,8 @@ pub async fn list_database_branches(
 /// Make a branch of a database. `POST /v1/databases/{node_id}/branches` (operationId
 /// `createDatabaseBranch`).
 ///
-/// Gap to the contract until card D-3b: the contract says the call writes `node.created`,
-/// `version.created` and `database.branch_created`. D-3a writes the first two only; the
-/// `database.branch_created` entry comes with D-3b (review D-3a 5).
+/// The call writes `node.created` and `version.created` for the branch node at once, and
+/// `database.branch_created` on the source when the branch is made (card D-3b).
 pub async fn create_database_branch(
     State(state): State<AppState>,
     RequestContext(ctx): RequestContext,

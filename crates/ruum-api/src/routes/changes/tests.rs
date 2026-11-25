@@ -171,6 +171,10 @@ fn sample(event: EventType, user: UserId) -> Value {
             "approval_id": id(), "subject": "grant", "decision": "approve",
             "reasons": ["grant"], "classes_confirmed": 0
         }),
+        EventType::DatabaseBranchCreated => json!({
+            "branch_id": id(), "data": "masked", "branch_at": "2026-11-08T12:00:00Z",
+            "constraints_left_out": 0
+        }),
         EventType::AppSettingsChanged => json!({
             "changed": ["telemetry_mode"], "access": "platform", "telemetry_mode": "privacy"
         }),
