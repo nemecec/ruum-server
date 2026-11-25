@@ -115,7 +115,8 @@ they run with plain Docker; without an engine they fail when `CI` is set.
   `max_tenant_live_log_bytes` (backlog S-91, `logs::LogBudget`): a ring whose tenant is past its
   share drops its own oldest lines as lines arrive (never past the budget plus one share), and
   each sweep takes from the tenant with the most bytes until the budget holds. An ended
-  instance's ring leaves the budget and counts to `max_ended_log_bytes`.
+  instance's ring leaves the budget and counts to `max_ended_log_bytes`; a scaled-to-zero
+  instance's ring stays in the live budget (backlog I620-11).
 - Redaction bounds: at most 256 values and 256 KiB per spec (`check_secret_set`), 16 KiB per
   value, and the newest 16 workload tokens of an instance (the current one and 15 earlier); an
   older token is no longer redacted. When a value is part of the marker `<hidden secret>`, a

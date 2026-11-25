@@ -73,7 +73,16 @@ pod_spec() {
         securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
       }]
     } + (if $class != "" then { runtimeClassName: $class, serviceAccountName: "ruum-sandbox" } else {} end))
-  }'
+  }
+  # In ruum-apps: the shape of a sandbox with its supervisor (the admission rules, S-89): the
+  # init container ruum-supervisor (here only `true`), the read-only volume ruum-bin and the
+  # projected token of the audience ruum-supervisor.
+  | if $class != "" then
+      .spec.volumes = [{name: "ruum-bin", emptyDir: {medium: "Memory"}},
+        {name: "ruum-id", projected: {sources: [{serviceAccountToken: {path: "token", audience: "ruum-supervisor", expirationSeconds: 600}}]}}]
+      | .spec.initContainers = [.spec.containers[0] | .name = "ruum-supervisor" | .command = ["true"] | .volumeMounts = [{name: "ruum-bin", mountPath: "/ruum/bin"}]]
+      | .spec.containers[0].volumeMounts = [{name: "ruum-bin", mountPath: "/ruum/bin", readOnly: true}, {name: "ruum-id", mountPath: "/ruum/id", readOnly: true}]
+    else . end'
 }
 
 # run_on NODE NAME [RUNTIMECLASS]: the kernel release that a restricted pod on NODE sees. Without a
@@ -140,25 +149,27 @@ refused "without the runtime class gvisor" "gVisor only" ""
 refused "with an automounted service account token" "no automounted service account token" gvisor '.spec.automountServiceAccountToken = true'
 refused "with another ServiceAccount" "ServiceAccount ruum-sandbox only" gvisor '.spec.serviceAccountName = "default"'
 refused "with a projected token of the API's audience" "mount only emptyDir" gvisor \
-  '.spec.volumes = [{name: "t", projected: {sources: [{serviceAccountToken: {path: "token"}}]}}]'
+  '.spec.volumes[1].projected.sources[0].serviceAccountToken = {path: "token"}'
 refused "with a long-lived supervisor token" "mount only emptyDir" gvisor \
-  '.spec.volumes = [{name: "t", projected: {sources: [{serviceAccountToken: {path: "token", audience: "ruum-supervisor", expirationSeconds: 86400}}]}}]'
+  '.spec.volumes[1].projected.sources[0].serviceAccountToken.expirationSeconds = 86400'
+refused "with a second projected volume" "exactly one projected volume" gvisor \
+  '.spec.volumes += [.spec.volumes[1] | .name = "ruum-id2"]'
 refused "that mounts a Secret" "mount only emptyDir" gvisor \
-  '.spec.volumes = [{name: "token", secret: {secretName: $other}}]'
+  '.spec.volumes += [{name: "token", secret: {secretName: $other}}]'
 refused "that takes a value of a Secret" "no environment value from another object" gvisor \
   '.spec.containers[0].env = [{name: "X", valueFrom: {secretKeyRef: {name: $other, key: "token"}}}]'
 refused "with envFrom" "no envFrom" gvisor '.spec.containers[0].envFrom = [{secretRef: {name: $own}}]'
 refused "with another init container" "init container ruum-supervisor" gvisor \
-  '.spec.initContainers = [.spec.containers[0] | .name = "other"]'
+  '.spec.initContainers[0].name = "other"'
+refused "without the supervisor's init container" "init container ruum-supervisor" gvisor 'del(.spec.initContainers)'
 refused "with a writable supervisor volume" "read-only in every app container" gvisor \
-  '.spec.volumes = [{name: "ruum-bin", emptyDir: {medium: "Memory"}}] | .spec.containers[0].volumeMounts = [{name: "ruum-bin", mountPath: "/ruum/bin"}]'
+  '.spec.containers[0].volumeMounts[0].readOnly = false'
+refused "without the supervisor volume in the app" "read-only in every app container" gvisor \
+  '.spec.containers[0].volumeMounts = [.spec.containers[0].volumeMounts[1]]'
 refused "with the termination message from the logs" "termination message path" gvisor \
   '.spec.containers[0].terminationMessagePolicy = "FallbackToLogsOnError"'
 # The positive control: the shape of a sandbox with its supervisor (the driver's pod, pod.rs).
-out="$(dry_run gvisor '.spec.volumes = [{name: "ruum-bin", emptyDir: {medium: "Memory"}},
-    {name: "ruum-id", projected: {sources: [{serviceAccountToken: {path: "token", audience: "ruum-supervisor", expirationSeconds: 600}}]}}]
-  | .spec.initContainers = [.spec.containers[0] | .name = "ruum-supervisor" | .volumeMounts = [{name: "ruum-bin", mountPath: "/ruum/bin"}]]
-  | .spec.containers[0].volumeMounts = [{name: "ruum-bin", mountPath: "/ruum/bin", readOnly: true}, {name: "ruum-id", mountPath: "/ruum/id", readOnly: true}]' || true)"
+out="$(dry_run gvisor '.' || true)"
 if [[ "$out" == "pod/gvisor-check-admission"* ]]; then
   pass "a restricted gVisor pod in the shape of the sandbox supervisor passes the admission rules (the positive control)"
 else

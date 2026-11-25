@@ -589,8 +589,26 @@ fn api_default(cfg: &KubeConfig, path: &str, v: &Value) -> bool {
     }
 }
 
-/// Go's zero values: a field the driver sent with one of them may be missing from the stored
-/// object (the API server omits empty fields).
+/// The fields the API server omits when they are `false` and whose absence means `false` (its
+/// default): only these may be missing from the stored object. `allowPrivilegeEscalation`,
+/// `automountServiceAccountToken` or `enableServiceLinks` missing would mean `true`, so they
+/// never are (Kimi review of I6-20, finding 5).
+fn omittable(path: &str) -> bool {
+    let key = path.rsplit('/').next().unwrap_or_default();
+    matches!(
+        key,
+        "stdin"
+            | "stdinOnce"
+            | "tty"
+            | "hostNetwork"
+            | "hostPID"
+            | "hostIPC"
+            | "shareProcessNamespace"
+            | "privileged"
+    )
+}
+
+/// Go's zero values (with [`omittable`]: what may be missing).
 fn zero(v: &Value) -> bool {
     match v {
         Value::Bool(b) => !b,
@@ -618,8 +636,9 @@ fn compare(cfg: &KubeConfig, path: &str, sent: &Value, got: &Value) -> Result<()
                 }
             }
             for (k, sv) in a {
-                if !b.contains_key(k) && !zero(sv) {
-                    return Err(format!("{path}/{k}"));
+                let p = format!("{path}/{k}");
+                if !b.contains_key(k) && !(zero(sv) && omittable(&p)) {
+                    return Err(p);
                 }
             }
             Ok(())
@@ -978,6 +997,33 @@ mod tests {
                 Box::new(
                     |p| p["spec"]["containers"][0]["env"][0] = json!({ "name": "MODE", "valueFrom": { "secretKeyRef": { "name": "x", "key": "y" } } }),
                 ),
+            ),
+            (
+                "no allowPrivilegeEscalation",
+                Box::new(|p| {
+                    p["spec"]["containers"][0]["securityContext"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("allowPrivilegeEscalation");
+                }),
+            ),
+            (
+                "no automountServiceAccountToken",
+                Box::new(|p| {
+                    p["spec"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("automountServiceAccountToken");
+                }),
+            ),
+            (
+                "no enableServiceLinks",
+                Box::new(|p| {
+                    p["spec"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("enableServiceLinks");
+                }),
             ),
         ];
         for (what, change) in cases {

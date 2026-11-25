@@ -10,8 +10,8 @@
 #   accept that audience; the kubelet issues it for this pod only, and the server's supervisor
 #   listener checks it with a TokenReview). No Secret volume, no other projected source;
 # - no environment value from another object (valueFrom) and no envFrom, in any container;
-# - at most one init container, named ruum-supervisor, which mounts only ruum-bin; no ephemeral
-#   containers; every app container mounts ruum-bin read-only;
+# - exactly one init container, named ruum-supervisor, which mounts only ruum-bin; no ephemeral
+#   containers; every app container mounts ruum-bin, read-only; exactly one projected volume;
 # - every container keeps the termination message path /dev/termination-log and the policy File
 #   (never FallbackToLogsOnError, which would copy unredacted logs into the pod status).
 # No Secret holds a value of a sandbox (the values are sealed into the records under a key the
@@ -53,14 +53,17 @@ spec:
     - expression: "!has(object.spec.ephemeralContainers) || size(object.spec.ephemeralContainers) == 0"
       message: "pods in ruum-apps have no ephemeral containers"
       reason: Forbidden
-    - expression: "!has(object.spec.initContainers) || (size(object.spec.initContainers) == 1 && object.spec.initContainers[0].name == 'ruum-supervisor' && has(object.spec.initContainers[0].volumeMounts) && size(object.spec.initContainers[0].volumeMounts) == 1 && object.spec.initContainers[0].volumeMounts[0].name == 'ruum-bin')"
-      message: "pods in ruum-apps have at most the init container ruum-supervisor, which mounts only ruum-bin"
+    - expression: "has(object.spec.initContainers) && size(object.spec.initContainers) == 1 && object.spec.initContainers[0].name == 'ruum-supervisor' && has(object.spec.initContainers[0].volumeMounts) && size(object.spec.initContainers[0].volumeMounts) == 1 && object.spec.initContainers[0].volumeMounts[0].name == 'ruum-bin'"
+      message: "pods in ruum-apps have exactly the init container ruum-supervisor, which mounts only ruum-bin"
       reason: Forbidden
     - expression: "has(object.spec.serviceAccountName) && object.spec.serviceAccountName == 'ruum-sandbox'"
       message: "pods in ruum-apps use the ServiceAccount ruum-sandbox only (backlog S-89)"
       reason: Forbidden
     - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir) || (has(v.projected) && has(v.projected.sources) && size(v.projected.sources) == 1 && has(v.projected.sources[0].serviceAccountToken) && !has(v.projected.sources[0].secret) && !has(v.projected.sources[0].configMap) && !has(v.projected.sources[0].downwardAPI) && !has(v.projected.sources[0].clusterTrustBundle) && v.projected.sources[0].serviceAccountToken.audience == 'ruum-supervisor' && has(v.projected.sources[0].serviceAccountToken.expirationSeconds) && v.projected.sources[0].serviceAccountToken.expirationSeconds == 600))"
       message: "pods in ruum-apps mount only emptyDir volumes and the supervisor's projected token (audience ruum-supervisor, 600 s); no Secret"
+      reason: Forbidden
+    - expression: "has(object.spec.volumes) && object.spec.volumes.filter(v, has(v.projected)).size() == 1"
+      message: "pods in ruum-apps have exactly one projected volume (the supervisor's token)"
       reason: Forbidden
     - expression: "variables.all.all(c, !has(c.envFrom) || size(c.envFrom) == 0)"
       message: "pods in ruum-apps take no envFrom"
@@ -71,7 +74,7 @@ spec:
     - expression: "variables.all.all(c, (!has(c.terminationMessagePath) || c.terminationMessagePath == '/dev/termination-log') && (!has(c.terminationMessagePolicy) || c.terminationMessagePolicy == 'File'))"
       message: "pods in ruum-apps keep the termination message path /dev/termination-log and the policy File"
       reason: Forbidden
-    - expression: "object.spec.containers.all(c, !has(c.volumeMounts) || c.volumeMounts.all(m, m.name != 'ruum-bin' || (has(m.readOnly) && m.readOnly == true)))"
+    - expression: "object.spec.containers.all(c, has(c.volumeMounts) && c.volumeMounts.exists(m, m.name == 'ruum-bin') && c.volumeMounts.all(m, m.name != 'ruum-bin' || (has(m.readOnly) && m.readOnly == true)))"
       message: "pods in ruum-apps mount the supervisor (ruum-bin) read-only in every app container"
       reason: Forbidden
 ---
