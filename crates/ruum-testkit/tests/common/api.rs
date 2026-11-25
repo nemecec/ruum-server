@@ -239,9 +239,24 @@ pub fn written_id(write: &Value) -> Result<String, Fail> {
 
 /// Polls `getDatabase` (as the owner) until the state is `ready`, at most [`READY_WITHIN`].
 /// Fails on `failed`. Returns the database. Calls `getDatabase`.
+///
+/// Before each poll it runs one round of the hook deliveries of typed nodes, as `ruum-server`
+/// runs that worker as a task (the privacy suite does the same, `Ctx::copy`): a copy's database
+/// (`copyNode`) is made when its `copied` delivery reaches the provider (card D-3b, backlog
+/// T-77).
 pub async fn wait_ready(cx: &Ctx, db: &str) -> Result<Value, Fail> {
+    use ruum_core::providers::deliveries::{Backoff, DeliveryWorker};
     let start = std::time::Instant::now();
+    let deliveries = DeliveryWorker::new(
+        cx.state.services.typed_nodes.clone(),
+        cx.state.services.providers.clone(),
+        Backoff::default(),
+    );
     loop {
+        deliveries
+            .run_once(DeliveryWorker::ROUND_LIMIT)
+            .await
+            .map_err(|e| Fail::Failed(format!("the hook deliveries failed: {e}")))?;
         let d = cx.ok(Who::Owner, get_database(cx, db), &[200]).await?;
         match d["status"]["state"].as_str() {
             Some("ready") => return Ok(d),
