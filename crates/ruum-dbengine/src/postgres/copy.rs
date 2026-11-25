@@ -158,7 +158,7 @@ pub(crate) async fn drain<'a>(
     state: &'a DbState,
 ) -> Result<RwLockWriteGuard<'a, ()>, EngineError> {
     // The app roles of the database (card D-5): their sessions end with the drain too.
-    let apps = app_roles::names(engine, &state.name).await;
+    let apps = app_roles::names(engine, &state.name).await?;
     let waiting = state.gate.write();
     tokio::pin!(waiting);
     // New requests wait from now on (the write lock is queued). Close what is idle.
@@ -1839,24 +1839,28 @@ pub(crate) async fn drop_database(
         Err(EngineError::NotFound) => return drop_gone(engine, db).await,
         Err(e) => return Err(e),
     };
+    match drop_live(engine, &state).await {
+        // Gone under a cached state (another process dropped it): finish its app roles.
+        Err(EngineError::NotFound) => drop_gone(engine, db).await,
+        other => other,
+    }
+}
+
+/// The steps of `drop_database` on a database that the engine resolved.
+async fn drop_live(engine: &PostgresEngine, state: &DbState) -> Result<(), EngineError> {
     let _ops = state.ops.lock().await;
     if state.dropped.load(Ordering::SeqCst) {
-        return drop_gone(engine, db).await;
+        return Err(EngineError::NotFound);
     }
     let points = restore_points(engine, &state.name).await?;
     // Its app roles go with it (card D-5): no login from now on, their sessions end, and after
     // the database they leave every other database that names them. The mark on each role
-    // outlives the database, so a retry finishes what this call leaves (`drop_gone`).
-    let apps = app_roles::names(engine, &state.name).await;
+    // outlives the database, so a retry finishes what this call leaves (`drop_gone`). A failed
+    // read of the roles stops the drop (a role left out would have no mark).
+    let apps = app_roles::names(engine, &state.name).await?;
     app_roles::refuse_logins(engine, &apps).await?;
     app_roles::mark_for_drop(engine, &state.name, &apps).await?;
-    let guard = match drain(engine, &state).await {
-        Ok(guard) => guard,
-        Err(e) => {
-            app_roles::unmark(engine, &apps).await;
-            return Err(e);
-        }
-    };
+    let guard = drain(engine, state).await?;
     state.dropped.store(true, Ordering::SeqCst);
     engine.forget(&state.name);
     let dropped = async {
@@ -1873,17 +1877,16 @@ pub(crate) async fn drop_database(
         state.dropped.store(false, Ordering::SeqCst);
         let _ = resume(engine, &state.name).await;
         drop(guard);
-        app_roles::unmark(engine, &apps).await;
         return Err(e);
     }
     drop(guard);
     for (_, _, snapshot) in points {
         drop_snapshot(engine, &snapshot).await;
     }
-    // Out of the app budget before the drop: a role that another database holds back (the
-    // drop fails) counts for nothing until a retry drops it.
-    let _ = app_roles::release_connections(engine, &apps).await;
-    let apps_dropped = app_roles::drop_orphans(engine, &apps).await;
+    // Every marked app role of the database, also one that another process's try marked: out
+    // of the app budget first (a role that another database holds back counts for nothing
+    // until a retry drops it), then dropped.
+    let apps_dropped = app_roles::drop_marked(engine, &state.name).await;
     setup::drop_roles(engine, &state.meta.roles).await?;
     apps_dropped
 }

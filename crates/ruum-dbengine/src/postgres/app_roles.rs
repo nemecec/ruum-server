@@ -136,14 +136,20 @@ pub(crate) async fn read_rows(conn: &mut PgConnection) -> Result<Vec<AppRow>, En
         .collect())
 }
 
-/// The names of the app roles of the database `name` (empty when it cannot be read).
-pub(crate) async fn names(engine: &PostgresEngine, name: &str) -> Vec<String> {
-    let Ok(mut conn) = engine.dbhost(name).await else {
-        return Vec::new();
-    };
-    let rows = read_rows(&mut conn).await.unwrap_or_default();
+/// The names of the app roles of the database `name`. A read that fails is an error, never an
+/// empty list: `drop_database` and the drain act on every app role of the list, and a role
+/// left out would outlive its database with no mark (Kimi run 15 on D-5).
+pub(crate) async fn names(engine: &PostgresEngine, name: &str) -> Result<Vec<String>, EngineError> {
+    #[cfg(test)]
+    if engine.fail_app_names.load(Ordering::SeqCst) {
+        return Err(EngineError::Internal(
+            "read the app roles: failed by the test".to_string(),
+        ));
+    }
+    let mut conn = engine.dbhost(name).await?;
+    let rows = read_rows(&mut conn).await;
     let _ = conn.close().await;
-    rows.into_iter().map(|r| r.role_name).collect()
+    Ok(rows?.into_iter().map(|r| r.role_name).collect())
 }
 
 /// `rolcanlogin` of a role, `None` when it does not exist.
@@ -1155,10 +1161,7 @@ pub(crate) async fn drop_role(engine: &PostgresEngine, role: &RoleRef) -> Result
 /// Drops the app roles `names` of a database that `drop_database` has dropped (with its
 /// restore points): each leaves every other database that names it ([`strip_elsewhere`]), then
 /// `DROP ROLE`. Goes on after a failure and returns the first one.
-pub(crate) async fn drop_orphans(
-    engine: &PostgresEngine,
-    names: &[String],
-) -> Result<(), EngineError> {
+async fn drop_orphans(engine: &PostgresEngine, names: &[String]) -> Result<(), EngineError> {
     let mut first = None;
     for name in names {
         let r = async {
@@ -1237,7 +1240,9 @@ async fn before_drop_hook(engine: &PostgresEngine) -> Result<(), EngineError> {
 /// Marks the app roles `names` of `database`, which `drop_database` is about to drop: a comment
 /// on each role names the database ([`DROPPED_WITH`]). The comment is in the shared catalog, so
 /// a retried `drop_database` still finds the roles after the database and its `ruum_meta.roles`
-/// are gone ([`drop_marked`]). Only `ruum_dbhost` (with `ADMIN` on the role) can set it.
+/// are gone ([`drop_marked`]). Only `ruum_dbhost` (with `ADMIN` on the role) can set it. A
+/// mark stays when the drop fails: it does nothing while the database exists, and taking it off
+/// could erase the mark of another process's try that dropped the database.
 pub(crate) async fn mark_for_drop(
     engine: &PostgresEngine,
     database: &str,
@@ -1257,31 +1262,10 @@ pub(crate) async fn mark_for_drop(
     run(&mut admin, "mark the app roles of a dropped database", sql).await
 }
 
-/// Takes the mark of [`mark_for_drop`] off again (the drop of the database failed). Best effort:
-/// a mark left on a role of a live database does nothing, as [`drop_marked`] acts only when the
-/// named database is gone.
-pub(crate) async fn unmark(engine: &PostgresEngine, names: &[String]) {
-    for name in names {
-        if let Ok(Some(_)) = can_login(engine, name).await
-            && let Ok(mut admin) = engine.admin().await
-        {
-            let _ = run(
-                &mut admin,
-                "unmark an app role",
-                format!("comment on role {} is null", ident(name)),
-            )
-            .await;
-        }
-    }
-}
-
 /// Sets the connection limit of the app roles `names` of a dropped database to 0: a role that
 /// another database still holds back no longer counts against the app budget ([`budget`] sums
 /// positive limits only). Goes on after a failure and returns the first one.
-pub(crate) async fn release_connections(
-    engine: &PostgresEngine,
-    names: &[String],
-) -> Result<(), EngineError> {
+async fn release_connections(engine: &PostgresEngine, names: &[String]) -> Result<(), EngineError> {
     let mut first = None;
     for name in names {
         let r = async {
