@@ -14,7 +14,7 @@
 # server process) can still make a pod with another instance's label and mount that Secret. The
 # server is the authority for every instance (any replica wakes any instance from its Secret, and
 # it holds the values anyway: the secret store and the token issuer), so no rule here can tell
-# its honest pods from forged ones. The rules stop mistakes and bugs; decision S-87 in
+# its honest pods from forged ones. The rules stop mistakes and bugs; decision S-89 in
 # docs/backlog/2026-11-24-run15.md names the design that closes it (I6-2).
 # The second policy (ruum-apps-secrets, Kimi run 15 I6-1 finding 4): every Secret created or
 # changed in ruum-apps is an instance Secret: type Opaque (never kubernetes.io/service-account-token,

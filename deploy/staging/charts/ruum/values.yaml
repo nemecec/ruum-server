@@ -101,11 +101,11 @@ gateway:
 # makes one pod of the runtime class gvisor per run in ruum-apps, with its ServiceAccount
 # ruum/ruum-server and the Role of charts/platform runtime-rbac.yaml (the platform step applies
 # both, before the first deploy that sets this). Only with the app runtime (both images set).
-# OFF on staging (person's decision 2026-11-25, backlog S-87): the S-83 admission rule binds a
+# OFF on staging (person's decision 2026-11-25, backlog S-89): the S-83 admission rule binds a
 # pod to "its own" Secret by the ruum.instance label, which the pod's creator sets, so a holder of
 # this ServiceAccount's token could mount another instance's Secret. Off, the server gets no
 # token of ruum/ruum-server at all. Turn it on only with an ownership binding the creator cannot
-# forge (S-87; likely the in-sandbox supervisor of I6-20). Staging has no builder or registry yet,
+# forge (S-89; likely the in-sandbox supervisor of I6-20). Staging has no builder or registry yet,
 # so node22 deploys are refused either way.
 runtime:
   kubernetes: false

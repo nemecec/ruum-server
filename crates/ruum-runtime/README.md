@@ -201,7 +201,7 @@ policy admits only instance Secrets: type `Opaque` (never a service account toke
 service-account annotation, the name of the Secret's `ruum.instance` label, and on create one key
 of that instance as the only owner and no finalizer. The label is set by the pod's creator: the
 rules stop mistakes, not a compromised server process, which can label a pod as another instance
-and mount that Secret (backlog S-85; decision S-87 in `docs/backlog/2026-11-24-run15.md`).
+and mount that Secret (backlog S-85; decision S-89 in `docs/backlog/2026-11-24-run15.md`).
 
 ### States
 

@@ -627,7 +627,7 @@ runtime (both app images) unless `runtime.kubernetes=false`.
   ValidatingAdmissionPolicy, refuses every pod in `ruum-apps` without `runtimeClassName: gvisor`
   or with a service account token, whoever makes it, and binds a pod's Secret by its
   `ruum.instance` label. The pod's creator sets that label, so the rule stops mistakes and bugs,
-  not a compromised server process (backlog S-85; decision S-87 in
+  not a compromised server process (backlog S-85; decision S-89 in
   `docs/backlog/2026-11-24-run15.md`). A second policy admits only `Opaque` instance Secrets owned
   by their key (no service account token Secret). `ops/gvisor-check.sh` runs its control pod
   (without gVisor) in `ops` and proves both with server-side dry runs and positive controls.

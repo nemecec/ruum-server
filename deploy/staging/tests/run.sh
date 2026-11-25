@@ -1123,10 +1123,10 @@ YAML
     awk -v kind="kind: $2" -v name="  name: $3" 'function out() { if (index(doc, "\n" kind "\n") && index(doc, "\n" name "\n")) printf "%s", doc; doc = "\n" }
       BEGIN { doc = "\n" } /^---/ { out(); next } { doc = doc $0 "\n" } END { out() }' "$1"
   }
-  # S-87 (decision 2026-11-25): the driver is off by default, and then the server has no token.
+  # S-89 (decision 2026-11-25): the driver is off by default, and then the server has no token.
   doc_of "$TMP/ruum-apps.yaml" Deployment ruum-server >"$TMP/srv-default.yaml"
   ! grep -qE 'RUUM_RUNTIME_DRIVER|serviceAccountName|serviceAccountToken' "$TMP/srv-default.yaml" && grep -qF 'automountServiceAccountToken: false' "$TMP/srv-default.yaml" &&
-    ok "the Kubernetes driver is off by default and the server gets no ServiceAccount token (S-87)" || bad "the default chart runs the Kubernetes driver or gives the server a token (S-87)"
+    ok "the Kubernetes driver is off by default and the server gets no ServiceAccount token (S-89)" || bad "the default chart runs the Kubernetes driver or gives the server a token (S-89)"
   # The Kubernetes runtime driver (I6-1) when turned on: with the app runtime only, its account and token.
   expect 0 "render charts/ruum with the app runtime and the driver on" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.kubernetes=true
   doc_of "$TMP/out" Deployment ruum-server >"$TMP/srv-apps.yaml"
