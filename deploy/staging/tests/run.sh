@@ -1144,11 +1144,11 @@ YAML
     ok "with the driver off the server runs as the ServiceAccount default, with or without the app runtime (S-93)" || bad "with the driver off the server does not name the ServiceAccount default (S-93)"
   # The Kubernetes runtime driver (I6-1) when turned on: with the app runtime only, its account and
   # token, and the sandbox supervisor (I6-20, S-89): its pinned image and encrypted node traffic.
-  K=(--set runtime.kubernetes=true --set "runtime.supervisorImage=ghcr.io/nemecec/ruum-supervisor@sha256:$(printf '%064d' 5)" --set runtime.nodeNetworkEncrypted=true)
+  KD=(--set runtime.kubernetes=true --set "runtime.supervisorImage=ghcr.io/nemecec/ruum-supervisor@sha256:$(printf '%064d' 5)" --set runtime.nodeNetworkEncrypted=true)
   expect 1 "charts/ruum refuses the driver without the supervisor's image (S-89)" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.kubernetes=true --set runtime.nodeNetworkEncrypted=true
-  expect 1 "charts/ruum refuses a supervisor image by tag" helm template ruum "$STG/charts/ruum" "${A[@]}" "${K[@]}" --set runtime.supervisorImage=ghcr.io/nemecec/ruum-supervisor:latest
-  expect 1 "charts/ruum refuses the driver without encrypted node traffic (decision 0006 I point 4)" helm template ruum "$STG/charts/ruum" "${A[@]}" "${K[@]}" --set runtime.nodeNetworkEncrypted=false
-  expect 0 "render charts/ruum with the app runtime and the driver on" helm template ruum "$STG/charts/ruum" "${A[@]}" "${K[@]}"
+  expect 1 "charts/ruum refuses a supervisor image by tag" helm template ruum "$STG/charts/ruum" "${A[@]}" "${KD[@]}" --set runtime.supervisorImage=ghcr.io/nemecec/ruum-supervisor:latest
+  expect 1 "charts/ruum refuses the driver without encrypted node traffic (decision 0006 I point 4)" helm template ruum "$STG/charts/ruum" "${A[@]}" "${KD[@]}" --set runtime.nodeNetworkEncrypted=false
+  expect 0 "render charts/ruum with the app runtime and the driver on" helm template ruum "$STG/charts/ruum" "${A[@]}" "${KD[@]}"
   doc_of "$TMP/out" Service ruum-supervisor | grep -qF 'port: 8091' && ok "the supervisor listener has its Service (8091)" || bad "no Service ruum-supervisor"
   doc_of "$TMP/out" Deployment ruum-server >"$TMP/srv-apps.yaml"
   grep -qF 'serviceAccountName: ruum-server' "$TMP/srv-apps.yaml" && grep -qF '{ name: RUUM_RUNTIME_DRIVER, value: kubernetes }' "$TMP/srv-apps.yaml" &&
@@ -1160,9 +1160,9 @@ YAML
   grep -qF 'name: RUUM_REGISTRY' "$TMP/srv-apps.yaml" && bad "a registry is set although none is given" || ok "no registry unless one is given (app images fail closed)"
   grep -qF 'RUUM_RUNTIME_DRIVER' "$TMP/ruum.yaml" && bad "the Kubernetes driver renders without the app runtime" || ok "without the app runtime no Kubernetes driver"
   expect 0 "the server env with the app runtime is what the server reads" bash "$HERE/server-env.sh" "$TMP/ruum-apps.yaml"
-  expect 0 "render charts/ruum with a registry" helm template ruum "$STG/charts/ruum" "${A[@]}" "${K[@]}" --set runtime.registry=registry.ruum-apps.svc:5000
+  expect 0 "render charts/ruum with a registry" helm template ruum "$STG/charts/ruum" "${A[@]}" "${KD[@]}" --set runtime.registry=registry.ruum-apps.svc:5000
   grep -qF '{ name: RUUM_REGISTRY, value: "registry.ruum-apps.svc:5000" }' "$TMP/out" && ok "the registry reaches the server" || bad "runtime.registry is not RUUM_REGISTRY"
-  expect 1 "charts/ruum refuses a registry that is not host:port" helm template ruum "$STG/charts/ruum" "${A[@]}" "${K[@]}" --set 'runtime.registry=http://x/y'
+  expect 1 "charts/ruum refuses a registry that is not host:port" helm template ruum "$STG/charts/ruum" "${A[@]}" "${KD[@]}" --set 'runtime.registry=http://x/y'
   expect 0 "render charts/ruum with the driver off" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.kubernetes=false
   grep -qF 'RUUM_RUNTIME_DRIVER' "$TMP/out" && bad "runtime.kubernetes=false still renders the driver" || ok "runtime.kubernetes=false keeps the in-memory driver"
   doc_of "$TMP/out" Deployment ruum-server >"$TMP/srv-off.yaml"
