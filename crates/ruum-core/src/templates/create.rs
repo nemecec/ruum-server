@@ -55,6 +55,12 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 /// The most apps in one template.
 pub const MAX_APPS: usize = 10;
+/// The deepest folder level that the scan reads.
+pub const MAX_DEPTH: usize = 16;
+/// The bytes of all entry paths together (each entry keeps its path).
+pub const MAX_PATH_BYTES: usize = 8 * 1024 * 1024;
+/// The most setup steps of a template (`setup.maxItems`).
+pub const MAX_SETUP_STEPS: usize = 50;
 /// The most nodes that the scan reads (copied or left out).
 pub const MAX_SCANNED: usize = 4 * MAX_COPY_NODES;
 /// Folder and file types that are never in a template: sessions, agent memory and logs.
@@ -162,6 +168,8 @@ enum What {
 #[derive(Default)]
 struct Scan {
     entries: Vec<Entry>,
+    /// The bytes of every entry's path together ([`MAX_PATH_BYTES`]).
+    path_bytes: usize,
     scanned: usize,
     apps: usize,
 }
@@ -282,6 +290,7 @@ async fn create_project(
     let tenant = s.tenants.find(ctx.tenant).await?;
     let plan = AppPlanLimits::of(tenant.plan);
     let scan = scan(s, ctx, &source, &has, &plan).await?;
+    preflight(&scan)?;
 
     let root = make_root(s, ctx, req.parent_id, &name).await?;
     let done = async {
@@ -401,15 +410,28 @@ async fn scan(
     plan: &AppPlanLimits,
 ) -> Result<Scan> {
     let mut out = Scan::default();
-    let mut queue: VecDeque<(NodeId, String, Mode)> = VecDeque::new();
-    queue.push_back((source.id, String::new(), Mode::Normal));
-    while let Some((folder, rel, mode)) = queue.pop_front() {
+    let mut queue: VecDeque<(NodeId, String, Mode, usize)> = VecDeque::new();
+    queue.push_back((source.id, String::new(), Mode::Normal, 0));
+    while let Some((folder, rel, mode, depth)) = queue.pop_front() {
+        if depth >= MAX_DEPTH {
+            return Err(too_large(format!(
+                "a template has at most {MAX_DEPTH} levels of folders"
+            )));
+        }
         for child in children(s, ctx, folder).await? {
             out.scanned += 1;
             if out.scanned > MAX_SCANNED {
                 return Err(too_large(format!(
                     "a template is made from at most {MAX_COPY_NODES} nodes"
                 )));
+            }
+            // The source's own manifest is never copied: only the generated one makes the new
+            // folder a template, and only when the copy is complete.
+            if rel.is_empty()
+                && child.kind != NodeKind::Folder
+                && crate::nodes::name_key(&child.name) == MANIFEST_FILE
+            {
+                continue;
             }
             let crel = join(&rel, &child.name);
             let t = type_of(&child).to_string();
@@ -422,7 +444,7 @@ async fn scan(
             if mode == Mode::Issues {
                 // An issue folder gives only its issues (their content), never attachments.
                 if child.kind == NodeKind::File && t == ISSUE_TYPE {
-                    out.entries.push(entry(What::File));
+                    out.push(entry(What::File))?;
                 }
                 continue;
             }
@@ -444,7 +466,7 @@ async fn scan(
                                 "a template has at most {MAX_APPS} apps"
                             )));
                         }
-                        out.entries.push(entry(What::App(Box::new(row))));
+                        out.push(entry(What::App(Box::new(row))))?;
                     }
                     SMART_FOLDER_TYPE if !has(Include::SmartFolders) => continue,
                     // Issue nodes have no copy of their content before card X-1: left out.
@@ -463,13 +485,13 @@ async fn scan(
                     match t.as_str() {
                         ISSUES_TYPE if !has(Include::Issues) => continue,
                         ISSUES_TYPE => {
-                            out.entries.push(entry(What::Folder));
-                            queue.push_back((child.id, crel.clone(), Mode::Issues));
+                            out.push(entry(What::Folder))?;
+                            queue.push_back((child.id, crel.clone(), Mode::Issues, depth + 1));
                         }
                         SMART_FOLDER_TYPE if !has(Include::SmartFolders) => continue,
                         _ => {
-                            out.entries.push(entry(What::Folder));
-                            queue.push_back((child.id, crel.clone(), Mode::Normal));
+                            out.push(entry(What::Folder))?;
+                            queue.push_back((child.id, crel.clone(), Mode::Normal, depth + 1));
                         }
                     }
                 }
@@ -480,18 +502,69 @@ async fn scan(
                     match t.as_str() {
                         ISSUE_TYPE if !has(Include::Issues) => continue,
                         ISSUE_TEMPLATE_TYPE if !has(Include::IssueTemplates) => continue,
-                        _ => out.entries.push(entry(What::File)),
+                        _ => out.push(entry(What::File))?,
                     }
                 }
-            }
-            if out.entries.len() > MAX_COPY_NODES {
-                return Err(too_large(format!(
-                    "a template is made from at most {MAX_COPY_NODES} nodes"
-                )));
             }
         }
     }
     Ok(out)
+}
+
+impl Scan {
+    /// Adds an entry within the node count and the path budget (each entry keeps its path).
+    fn push(&mut self, e: Entry) -> Result<()> {
+        self.path_bytes += e.rel.len();
+        self.entries.push(e);
+        if self.entries.len() > MAX_COPY_NODES {
+            return Err(too_large(format!(
+                "a template is made from at most {MAX_COPY_NODES} nodes"
+            )));
+        }
+        if self.path_bytes > MAX_PATH_BYTES {
+            return Err(too_large(
+                "the paths of the template are too long in all; save a flatter folder",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The checks of the generated manifest that the scan can make, before anything is written:
+/// the setup's step count, and the paths of the setup steps and placeholders.
+fn preflight(scan: &Scan) -> Result<()> {
+    let steps = scan
+        .entries
+        .iter()
+        .filter(|e| {
+            matches!(e.what, What::App(_))
+                || (matches!(e.what, What::Folder) && !e.rel.contains('/'))
+        })
+        .count();
+    if steps > MAX_SETUP_STEPS {
+        return Err(too_large(format!(
+            "a template has at most {MAX_SETUP_STEPS} top-level folders and apps"
+        )));
+    }
+    for e in &scan.entries {
+        let named = match e.what {
+            What::Folder => !e.rel.contains('/'),
+            What::App(_) => true,
+            What::File => false,
+        };
+        if named {
+            manifest::check_relative("/source_id", &e.rel).map_err(|_| {
+                invalid(
+                    "/source_id",
+                    format!(
+                        "the name {:?} cannot be a path of a template (no \\ or control characters)",
+                        e.src.name
+                    ),
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// The live deployment of an app, or `409` (the person publishes first; fail closed).
@@ -597,7 +670,7 @@ async fn placeholders(
     let cut = |t: String| t.chars().take(MAX_DESCRIPTION).collect::<String>();
     let mut n = 0;
     for (rel, role) in roles {
-        if out.len() >= MAX_PLACEHOLDERS || rel.chars().count() > MAX_ON {
+        if out.len() >= MAX_PLACEHOLDERS || !placeable(&rel) {
             continue;
         }
         n += 1;
@@ -614,7 +687,7 @@ async fn placeholders(
     }
     let mut n = 0;
     for (rel, role) in app_roles {
-        if out.len() >= MAX_PLACEHOLDERS || rel.chars().count() > MAX_ON {
+        if out.len() >= MAX_PLACEHOLDERS || !placeable(&rel) {
             continue;
         }
         n += 1;
@@ -628,6 +701,12 @@ async fn placeholders(
         out.insert(format!("app_role_{n}"), Value::Object(p));
     }
     Ok(out)
+}
+
+/// Whether a path can be a placeholder's `on` (the template schema and the path rules).
+fn placeable(rel: &str) -> bool {
+    rel.is_empty()
+        || (rel.chars().count() <= MAX_ON && manifest::check_relative("/on", rel).is_ok())
 }
 
 fn role_name(r: Role) -> &'static str {
@@ -835,10 +914,27 @@ async fn finish(
         }
         Err(e) => {
             if let Err(t) = s.nodes.trash(ctx, root.id, None).await {
+                // Trash needs `manage`; a caller with `edit` only (a guest, an agent capped at
+                // edit) frees the name at least: the folder has no template.yaml, so it is
+                // never listed (backlog L1-14).
+                let renamed = s
+                    .nodes
+                    .rename(
+                        ctx,
+                        root.id,
+                        format!("{} (failed copy)", root.name)
+                            .chars()
+                            .take(crate::nodes::MAX_NAME_CHARS)
+                            .collect(),
+                        OnConflict::Rename,
+                        None,
+                    )
+                    .await;
                 tracing::warn!(
                     tenant = %ctx.tenant,
                     node = %root.id,
                     error = %t,
+                    renamed = renamed.is_ok(),
                     "createTemplate failed and could not trash the partial template folder"
                 );
             }

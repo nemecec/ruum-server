@@ -9,7 +9,8 @@
 //!   must match `[a-z0-9][a-z0-9-]{0,62}` (the `TemplateId` pattern); other files and
 //!   subdirectories without `template.yaml` (the README, `reference/`) are skipped;
 //! - no symlink anywhere in a template (one is refused, never followed), only regular files and
-//!   folders, at most [`MAX_FILES`] files and the plan's archive bytes in all;
+//!   folders, at most [`MAX_FILES`] files, [`MAX_FILES`] folders, [`MAX_DEPTH`] levels and the
+//!   plan's archive bytes in all;
 //! - `template.yaml` passes [`super::manifest::check`] (the schema, relative paths, issue
 //!   schemas);
 //! - every path that `setup` names exists inside the template: `folder.from` a folder,
@@ -41,6 +42,8 @@ use std::sync::Arc;
 
 /// The most files in one template folder.
 pub const MAX_FILES: usize = 10_000;
+/// The deepest folder level in a template folder.
+pub const MAX_DEPTH: usize = 32;
 /// The suffix of an app archive in `setup`.
 pub const ARCHIVE_SUFFIX: &str = ".tar.gz";
 
@@ -395,6 +398,13 @@ fn collect(
     tree: &mut Tree,
     max_bytes: u64,
 ) -> Result<(), LoadError> {
+    if rel.split('/').count() > MAX_DEPTH {
+        return Err(load_error(
+            name,
+            rel,
+            format!("a template has at most {MAX_DEPTH} levels of folders"),
+        ));
+    }
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .map_err(|e| load_error(name, rel_or_root(rel), format!("cannot read: {e}")))?
         .collect::<Result<_, _>>()
@@ -418,6 +428,13 @@ fn collect(
             ));
         }
         if ft.is_dir() {
+            if tree.dirs.len() >= MAX_FILES {
+                return Err(load_error(
+                    name,
+                    &path,
+                    format!("a template has at most {MAX_FILES} folders"),
+                ));
+            }
             tree.dirs.insert(path.clone());
             collect(name, &e.path(), &path, tree, max_bytes)?;
         } else if ft.is_file() {

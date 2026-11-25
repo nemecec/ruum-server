@@ -2079,3 +2079,159 @@ async fn the_source_view_check_does_not_lean_on_the_store() {
     req.parent_id = gf;
     w.t().create(&s, &guest, req).await.unwrap();
 }
+
+/// Review fixes (Kimi, card L-1): the source's own template.yaml is never copied, the depth and
+/// setup limits and the path rules refuse before anything is written, and a caller who cannot
+/// trash the partial folder frees its name.
+#[tokio::test]
+async fn review_fixes_refuse_before_writing() {
+    let w = world().await;
+    // A source with its own (valid) template.yaml: it is not copied.
+    let src = w.mkdir(w.projects, "Has manifest", None).await;
+    w.file(
+        src,
+        MANIFEST_FILE,
+        "application/yaml",
+        b"kind: project\nname: Old\nversion: \"1\"\n",
+    )
+    .await;
+    w.file(src, "notes.txt", "text/plain", b"n").await;
+    let t = w
+        .t()
+        .create(&w.s, &w.m(), w.project("Has manifest kit", src, vec![]))
+        .await
+        .unwrap()
+        .value;
+    assert_eq!(t.manifest["name"], "Has manifest kit");
+    let names: Vec<String> = w
+        .children(&w.m(), t.node_id.unwrap())
+        .await
+        .into_iter()
+        .map(|n| n.name)
+        .collect();
+    assert_eq!(names, ["notes.txt", MANIFEST_FILE]);
+
+    let journal = |w: &World| w.h.journal.entries(w.team.id).len();
+    // Too deep.
+    let deep = w.mkdir(w.projects, "Deep", None).await;
+    let mut cur = deep;
+    for i in 0..=create::MAX_DEPTH {
+        cur = w.mkdir(cur, &format!("d{i}"), None).await;
+    }
+    let before = journal(&w);
+    let e = api(w
+        .t()
+        .create(&w.s, &w.m(), w.project("Deep kit", deep, vec![]))
+        .await
+        .unwrap_err());
+    assert_eq!(e.0, 413);
+    assert_eq!(journal(&w), before, "nothing written");
+    // Too many top-level folders for the setup.
+    let wide = w.mkdir(w.projects, "Wide", None).await;
+    for i in 0..=create::MAX_SETUP_STEPS {
+        w.mkdir(wide, &format!("f{i}"), None).await;
+    }
+    let before = journal(&w);
+    let e = api(w
+        .t()
+        .create(&w.s, &w.m(), w.project("Wide kit", wide, vec![]))
+        .await
+        .unwrap_err());
+    assert_eq!(e.0, 413);
+    assert_eq!(journal(&w), before, "nothing written");
+    // A top-level folder whose name is not a template path.
+    let odd = w.mkdir(w.projects, "Odd names", None).await;
+    w.mkdir(odd, "back\\slash", None).await;
+    let before = journal(&w);
+    let e = api(w
+        .t()
+        .create(&w.s, &w.m(), w.project("Odd kit", odd, vec![]))
+        .await
+        .unwrap_err());
+    assert_eq!(e.0, 422);
+    assert_eq!(journal(&w), before, "nothing written");
+    // Positive control: 50 top-level folders are fine.
+    let fifty = w.mkdir(w.projects, "Fifty", None).await;
+    for i in 0..create::MAX_SETUP_STEPS {
+        w.mkdir(fifty, &format!("f{i}"), None).await;
+    }
+    w.t()
+        .create(&w.s, &w.m(), w.project("Fifty kit", fifty, vec![]))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_caller_with_edit_only_frees_the_name_of_a_failed_copy() {
+    let w = world().await;
+    let src = w.mkdir(w.projects, "Broken app", None).await;
+    let app =
+        w.s.apps
+            .create(
+                &w.m(),
+                crate::apps::CreateApp {
+                    parent_id: src,
+                    name: "lost".into(),
+                    settings: None,
+                    on_conflict: OnConflict::Fail,
+                },
+            )
+            .await
+            .unwrap()
+            .value
+            .node
+            .id;
+    let ghost = pack_tar_gz(&[("app.yaml".into(), false, b"runtime: static\n")]).unwrap();
+    let m = crate::blobs::manifest_of(
+        &ghost,
+        crate::blobs::chunking_for(ghost.len() as u64, Some("application/gzip")),
+    );
+    w.live(
+        app,
+        m.content_hash.0,
+        ghost.len() as i64,
+        m.encode(),
+        vec![],
+    )
+    .await;
+    w.s.sharing
+        .add_grant(
+            &w.o(),
+            w.projects,
+            Grantee::User { id: w.guest },
+            Role::Edit,
+        )
+        .await
+        .unwrap();
+    let guest = ctx(w.team.id, w.guest);
+    assert!(
+        w.t()
+            .create(&w.s, &guest, w.project("Lost kit", src, vec![]))
+            .await
+            .is_err()
+    );
+    let names: Vec<String> = w
+        .children(&w.m(), w.projects)
+        .await
+        .into_iter()
+        .map(|n| n.name)
+        .collect();
+    assert!(!names.contains(&"Lost kit".to_string()), "{names:?}");
+    assert!(
+        names.contains(&"Lost kit (failed copy)".to_string()),
+        "{names:?}"
+    );
+    let p = w
+        .t()
+        .list(
+            &w.s,
+            &w.m(),
+            ListQuery {
+                source: Some(Origin::Tenant),
+                ..ListQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(p.items.is_empty());
+}

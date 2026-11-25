@@ -8,6 +8,6 @@ data_classes:
   public.notes.id: normal
   public.notes.author_sub: personal
   public.notes.author_name: personal
-  public.notes.title: normal
+  public.notes.title: personal
   public.notes.body: personal
   public.notes.created_at: normal

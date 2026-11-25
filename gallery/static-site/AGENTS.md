@@ -25,7 +25,7 @@ safe.
 - Every migration that adds a column starts with a classes header for each new column:
 
   ```sql
-  -- ruum:classes public.notes.title=normal public.notes.author_name=personal
+  -- ruum:classes public.notes.created_at=normal public.notes.title=personal
   ```
 
   The classes are `normal`, `personal` (names, emails, free text) and `secret` (tokens,
