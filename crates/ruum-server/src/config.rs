@@ -177,9 +177,11 @@ impl WorkloadTokenSettings {
 /// - `RUUM_REGISTRY`: the registry the nodes pull app images from (`host:port`); without it
 ///   every app image is `image_not_found` (fails closed);
 /// - `RUUM_KUBE_EGRESS_PROXY`: the egress proxy's Service as `host:port` (the sandboxes' only
-///   way out); `RUUM_KUBE_EGRESS_CONTROL` (a Unix socket, `unix:/path`) and
-///   `RUUM_KUBE_EGRESS_CONTROL_TOKEN_FILE`: its control listener, where the driver registers each pod's address (backlog I6-2; without them no pod
-///   is registered and the proxy refuses every sandbox, which fails closed);
+///   way out). `RUUM_KUBE_EGRESS_CONTROL` and `RUUM_KUBE_EGRESS_CONTROL_TOKEN_FILE` (the
+///   control listener, where the driver would register each pod's address, backlog I6-2) are
+///   refused until backlog S-86 is fixed (a registration can outlive its pod without a record,
+///   and after an address is reused the proxy names the wrong app; Kimi run 15, I6-1 finding
+///   3). Without them no pod is registered and the proxy refuses every sandbox (fails closed);
 /// - `RUUM_KUBE_SPLIT_LOG_STREAMS` (`on` or `off`, default `off`): read standard output and
 ///   standard error apart (the API server's feature gate `PodLogsQuerySplitStreams`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -245,6 +247,12 @@ impl RuntimeSettings {
         anyhow::ensure!(
             egress_control.is_some() == egress_control_token_file.is_some(),
             "RUUM_KUBE_EGRESS_CONTROL and RUUM_KUBE_EGRESS_CONTROL_TOKEN_FILE are set together"
+        );
+        // Not before S-86 is fixed (Kimi run 15, I6-1 finding 3): a registration that outlives
+        // its pod with no record names the wrong app once the address is reused.
+        anyhow::ensure!(
+            egress_control.is_none(),
+            "RUUM_KUBE_EGRESS_CONTROL is refused until backlog S-86 is fixed (an egress registration can outlive its pod); leave it unset, the proxy then refuses every sandbox"
         );
         let split_log_streams = match get("RUUM_KUBE_SPLIT_LOG_STREAMS").as_deref() {
             None | Some("off") => false,
@@ -359,6 +367,14 @@ mod tests {
             &[("RUUM_KUBE_API_URL", "http://kubernetes.default.svc")][..],
             &[
                 ("RUUM_KUBE_EGRESS_CONTROL", "http://ruum-egress:3129"),
+                ("RUUM_KUBE_EGRESS_CONTROL_TOKEN_FILE", "/run/t"),
+            ][..],
+            // Not before S-86 is fixed (Kimi run 15, I6-1 finding 3), even on a Unix socket.
+            &[
+                (
+                    "RUUM_KUBE_EGRESS_CONTROL",
+                    "unix:/run/ruum-egress/control.sock",
+                ),
                 ("RUUM_KUBE_EGRESS_CONTROL_TOKEN_FILE", "/run/t"),
             ][..],
         ] {

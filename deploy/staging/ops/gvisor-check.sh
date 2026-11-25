@@ -18,6 +18,11 @@
 #    Secret (a volume, or an environment value) and with envFrom. A gVisor pod that mounts its
 #    own instance Secret and takes a value from it must pass the dry run (the positive control:
 #    the refusals come from the rules, not from another error).
+# 4. The Secret rules of ruum-apps (the same file, policy ruum-apps-secrets; Kimi run 15 I6-1
+#    finding 4): server-side dry runs of Secrets in ruum-apps that must be refused: of the type
+#    kubernetes.io/service-account-token (the token controller would fill it with a token), with
+#    a service account annotation, named for another instance, and without its key as the one
+#    owner. The instance Secret owned by its key must pass (the positive control).
 # Not read-only in step 2: it creates two short pods per node (ruum-apps and ops) and deletes
 # them. Step 3 creates nothing (dry runs).
 # Exit 1 on any failure.
@@ -145,6 +150,38 @@ if [[ "$out" == "pod/gvisor-check-admission"* ]]; then
   pass "a restricted gVisor pod with its own instance Secret passes the admission rules (the positive control)"
 else
   bad "a restricted gVisor pod with its own Secret did not pass the dry run, so the refusals above prove nothing: ${out:-no answer}"
+fi
+
+# 4. The Secret rules of ruum-apps (Kimi run 15 I6-1 finding 4): dry runs, nothing is made.
+# secret_dry_run [JQ]: the API server's answer to the instance Secret of OWN_ID, changed by JQ.
+secret_dry_run() {
+  jq -cn --arg id "$OWN_ID" --arg own "$OWN_SECRET" --arg other "$OTHER_SECRET" "{apiVersion: \"v1\", kind: \"Secret\", type: \"Opaque\",
+    metadata: {name: \$own, namespace: \"ruum-apps\", labels: {\"ruum.instance\": \$id},
+      ownerReferences: [{apiVersion: \"v1\", kind: \"ConfigMap\", name: (\"ruum-k-\" + (\$own | ltrimstr(\"ruum-i-\")) + \"-check\"),
+        uid: \"00000000-0000-0000-0000-000000000001\"}]},
+    stringData: {token: \"not-a-secret\"}} | ${1:-.}" | kubectl create --dry-run=server -f - -o name 2>&1
+}
+# refused_secret WHAT NEEDLE JQ: the dry run must be refused by the Secret policy with NEEDLE.
+refused_secret() {
+  local out
+  out="$(secret_dry_run "$3" || true)"
+  if [[ "$out" == *"ruum-apps-secrets"* && "$out" == *"$2"* ]]; then
+    pass "ruum-apps refuses a Secret $1 (the Secret rules)"
+  else
+    bad "ruum-apps did not refuse a Secret $1 with its Secret rules: ${out:-no answer} (k8s/manifests/apps-admission.yaml)"
+  fi
+}
+refused_secret "of the type kubernetes.io/service-account-token" "type Opaque only" \
+  '.type = "kubernetes.io/service-account-token" | .metadata.annotations = {"kubernetes.io/service-account.name": "default"}'
+refused_secret "with a service account annotation" "no service account annotation" \
+  '.metadata.annotations = {"kubernetes.io/service-account.name": "default"}'
+refused_secret "named for another instance" "an instance Secret" '.metadata.name = $other'
+refused_secret "without its key as the one owner" "owned by one key ConfigMap" 'del(.metadata.ownerReferences)'
+out="$(secret_dry_run || true)"
+if [[ "$out" == "secret/$OWN_SECRET"* ]]; then
+  pass "an instance Secret owned by its key passes the Secret rules (the positive control)"
+else
+  bad "an instance Secret owned by its key did not pass the dry run, so the Secret refusals above prove nothing: ${out:-no answer}"
 fi
 
 [[ $fail == 0 ]] && echo "gvisor check: passed" || echo "gvisor check: FAILED"

@@ -117,8 +117,9 @@ log "the gVisor extension on every node, then the runtime class gvisor (card I-6
 bash "$STG/ops/gvisor-check.sh" --class-only >&2 ||
   die "not every node runs the Talos extension gvisor: run deploy/staging/tool.sh bash deploy/staging/ops/upgrade-talos.sh first (README \"The app runtime\")"
 k apply -f "$HERE/manifests/runtimeclass.yaml" >/dev/null
-# Every pod of ruum-apps in gVisor, without a token (backlog S-83), before anything can make one.
-log "the admission rule of ruum-apps: gVisor only (backlog S-83)"
+# Every pod of ruum-apps in gVisor, without a token (backlog S-83), and every Secret there an
+# instance Secret (Kimi run 15 I6-1 finding 4), before anything can make one.
+log "the admission rules of ruum-apps: gVisor only, instance Secrets only (backlog S-83, I6-1)"
 k apply -f "$HERE/manifests/apps-admission.yaml" >/dev/null
 
 log "secrets, one per consumer"

@@ -3,8 +3,11 @@
 //! uses are exactly the verbs of the driver's Role (`deploy/staging/charts/platform/templates/
 //! runtime-rbac.yaml`); the fake API server of the tests refuses every other one.
 //!
-//! The answers of Secret writes hold the Secret's data, so they are never parsed, logged or put
-//! into an error text: the client reads only their status code.
+//! On Secrets the client only creates (the Role has no other verb: `patch`, `update` and a
+//! `delete` with a finalizer answer with the Secret, Kimi run 15, I6-1 finding 1). The answer of
+//! a create holds the data the driver sent, so it is never parsed, logged or put into an error
+//! text: the client reads only its status code. Deletes always say `propagationPolicy:
+//! Background`, so the garbage collector removes what an object owns (a key's Secret).
 
 use ruum_core::runtime::RuntimeError;
 use serde_json::Value;
@@ -259,51 +262,25 @@ impl Api {
         }
     }
 
-    /// A JSON merge patch. The answer is not read (it is a Secret's in the driver's one use).
-    pub(crate) async fn merge_patch(
-        &self,
-        kind: Kind,
-        name: &str,
-        body: &Value,
-    ) -> Result<Write, RuntimeError> {
-        let what = format!("patch {} {name}", kind.plural());
-        let r = self
-            .send(
-                &what,
-                self.client
-                    .patch(self.url(kind, Some(name)))
-                    .header(
-                        reqwest::header::CONTENT_TYPE,
-                        "application/merge-patch+json",
-                    )
-                    .body(body.to_string()),
-            )
-            .await?;
-        match r.status().as_u16() {
-            200 | 201 => Ok(Write::Done(Value::Null)),
-            404 => Ok(Write::Gone),
-            409 => Ok(Write::Conflict),
-            _ => Err(self.refused(&what, kind, r).await),
-        }
-    }
-
-    /// `DELETE` an object; a missing one is fine. `grace` is the pod's termination grace.
+    /// `DELETE` an object; a missing one is fine. `grace` is the pod's termination grace. Never
+    /// called for Secrets (the garbage collector removes them with their key).
     pub(crate) async fn delete(
         &self,
         kind: Kind,
         name: &str,
         grace: Option<u64>,
     ) -> Result<(), RuntimeError> {
+        debug_assert!(kind != Kind::Secret, "the driver never deletes a Secret");
         let what = format!("delete {} {name}", kind.plural());
-        let mut req = self.client.delete(self.url(kind, Some(name)));
+        let mut opts = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "DeleteOptions",
+            "propagationPolicy": "Background",
+        });
         if let Some(g) = grace {
-            req = req.json(&serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "DeleteOptions",
-                "gracePeriodSeconds": g,
-                "propagationPolicy": "Background",
-            }));
+            opts["gracePeriodSeconds"] = serde_json::json!(g);
         }
+        let req = self.client.delete(self.url(kind, Some(name))).json(&opts);
         let r = self.send(&what, req).await?;
         match r.status().as_u16() {
             200 | 202 | 404 => Ok(()),

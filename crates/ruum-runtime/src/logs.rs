@@ -78,6 +78,13 @@ impl Ring {
         self.bytes + self.lines.len() * std::mem::size_of::<LogLine>()
     }
 
+    /// Drops every line and keeps the numbering: the next line gets the next `seq`, so a reader
+    /// sees a gap, never a number twice.
+    pub(crate) fn clear(&mut self) {
+        self.lines = VecDeque::new();
+        self.bytes = 0;
+    }
+
     /// The `seq` of the newest line (0 before the first).
     pub(crate) fn last_seq(&self) -> u64 {
         self.next_seq - 1

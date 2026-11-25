@@ -9,8 +9,17 @@
 //!   restart (adoption, backlog R2A-1). State changes replace it with its `resourceVersion`, so
 //!   of two processes only one makes a change (and its effects: usage, unregistration).
 //! - **Secret `ruum-i-<id>`**: the workload token (key `token`) and the secret environment values
-//!   (keys `env.<NAME>`). The driver writes it and never reads it (its Role has no `get` on
-//!   Secrets); the pod mounts the token as a file and takes the values as environment values.
+//!   (keys `env.<NAME>`). The driver only creates it: its Role has no other verb on Secrets
+//!   (Kimi run 15, I6-1 finding 1). `get`, `list` and `watch` read a Secret, and so do `patch`
+//!   and `update` (their answer is the changed Secret) and `delete` (with `propagationPolicy:
+//!   Foreground` or `Orphan` the API server adds a finalizer and answers with the Secret). The
+//!   pod mounts the token as a file and takes the values as environment values.
+//! - **ConfigMap `ruum-k-<id>-<tag>`** (label `ruum.role: key`, no data): the key, the only owner
+//!   (`ownerReferences`) of the Secret, itself owned by the record. The driver never deletes the
+//!   Secret: it deletes the key and the API server's garbage collector deletes the Secret. A
+//!   token rotation makes a new key, deletes the old one and creates the Secret again under the
+//!   new key once the collector removed the old Secret; an ended instance loses its key. A
+//!   removed record takes its keys and their Secret with it.
 //! - **Pod `ruum-i-<id>-<run>`**: one per run (a cold start makes a new pod).
 
 use super::KubeConfig;
@@ -34,6 +43,15 @@ pub(crate) const SANDBOX_UID: i64 = 10001;
 /// The name of an instance's ConfigMap and Secret.
 pub fn object_name(id: InstanceId) -> String {
     format!("ruum-i-{}", id.0.simple())
+}
+
+/// The label that marks a key ConfigMap (the owner of the instance Secret), and its value.
+pub const LABEL_ROLE: &str = "ruum.role";
+pub const ROLE_KEY: &str = "key";
+
+/// The name of one key of an instance (see the module docs); `tag` is new for each key.
+pub fn key_name(id: InstanceId, tag: &str) -> String {
+    format!("ruum-k-{}-{tag}", id.0.simple())
 }
 
 /// The name of the pod of one run.
@@ -232,25 +250,70 @@ pub(crate) fn read_record(cm: &Value) -> Option<(Record, String)> {
     (tenant_ok && inst_ok && name_ok).then_some((rec, rv))
 }
 
-/// The Secret of an instance: the token and the secret environment values.
-pub(crate) fn secret_body(cfg: &KubeConfig, spec: &WorkloadSpec, id: InstanceId) -> Value {
+/// An owner reference to a ConfigMap of the namespace (the garbage collector removes the
+/// dependent once the owner is gone).
+fn owned_by(name: &str, uid: &str) -> Value {
+    json!([{ "apiVersion": "v1", "kind": "ConfigMap", "name": name, "uid": uid }])
+}
+
+/// A key of an instance: no data, owned by the record (`record_uid`).
+pub(crate) fn key_body(
+    cfg: &KubeConfig,
+    identity: &WorkloadIdentity,
+    id: InstanceId,
+    tag: &str,
+    record_uid: &str,
+) -> Value {
+    let mut l = labels(cfg, identity, id);
+    l[LABEL_ROLE] = json!(ROLE_KEY);
+    json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": key_name(id, tag),
+            "labels": l,
+            "ownerReferences": owned_by(&object_name(id), record_uid),
+        },
+    })
+}
+
+/// The Secret of an instance: the token and the secret environment values (`env`: the Secret
+/// key and the value), owned by the key `key` (its name and uid).
+pub(crate) fn secret_body(
+    cfg: &KubeConfig,
+    identity: &WorkloadIdentity,
+    id: InstanceId,
+    token: &str,
+    env: &[(String, String)],
+    key: (&str, &str),
+) -> Value {
     let mut data = serde_json::Map::new();
-    data.insert(
-        "token".to_owned(),
-        json!(spec.workload_token.expose().to_owned()),
-    );
-    for v in &spec.env {
-        if let EnvValue::Secret(s) = &v.value {
-            data.insert(env_key(&v.name), json!(s.expose().to_owned()));
-        }
+    data.insert("token".to_owned(), json!(token));
+    for (k, v) in env {
+        data.insert(k.clone(), json!(v));
     }
     json!({
         "apiVersion": "v1",
         "kind": "Secret",
         "type": "Opaque",
-        "metadata": { "name": object_name(id), "labels": labels(cfg, &spec.identity, id) },
+        "metadata": {
+            "name": object_name(id),
+            "labels": labels(cfg, identity, id),
+            "ownerReferences": owned_by(key.0, key.1),
+        },
         "stringData": Value::Object(data),
     })
+}
+
+/// The secret environment values of a spec, as Secret keys and values.
+pub(crate) fn secret_env(spec: &WorkloadSpec) -> Vec<(String, String)> {
+    spec.env
+        .iter()
+        .filter_map(|v| match &v.value {
+            EnvValue::Secret(s) => Some((env_key(&v.name), s.expose().to_owned())),
+            EnvValue::Plain(_) => None,
+        })
+        .collect()
 }
 
 /// A shared service as the pod reaches it: its address on the pod's `/etc/hosts`.
@@ -816,5 +879,40 @@ mod tests {
         let id = InstanceId::new();
         assert!(object_name(id).len() <= 63);
         assert!(pod_name(id, u32::MAX).len() <= 63);
+        let tag = uuid::Uuid::now_v7().simple().to_string();
+        assert!(key_name(id, &tag).len() <= 253);
+    }
+
+    /// The Secret is owned by its key and the key by the record, so the garbage collector removes
+    /// the Secret with its key (the driver may not delete a Secret: Kimi run 15, I6-1 finding 1).
+    #[test]
+    fn the_secret_is_owned_by_its_key_and_the_key_by_the_record() {
+        let cfg = KubeConfig::new("https://k", "ruum-apps", "gvisor");
+        let id = InstanceId::new();
+        let identity = WorkloadIdentity {
+            tenant: ruum_core::ids::TenantId::new(),
+            app: ruum_core::ids::NodeId::new(),
+            deployment: uuid::Uuid::now_v7(),
+            environment: ruum_core::runtime::Environment::Live,
+        };
+        let key = key_body(&cfg, &identity, id, "t1", "uid-of-the-record");
+        assert_eq!(key["metadata"]["labels"][LABEL_ROLE], json!(ROLE_KEY));
+        assert_eq!(
+            key["metadata"]["ownerReferences"],
+            json!([{ "apiVersion": "v1", "kind": "ConfigMap", "name": object_name(id),
+                "uid": "uid-of-the-record" }])
+        );
+        assert!(key.get("data").is_none());
+        let env = vec![("env.X".to_owned(), "v".to_owned())];
+        let secret = secret_body(&cfg, &identity, id, "tok", &env, (&key_name(id, "t1"), "k"));
+        assert_eq!(secret["type"], json!("Opaque"));
+        assert_eq!(secret["metadata"]["name"], json!(object_name(id)));
+        assert_eq!(
+            secret["metadata"]["ownerReferences"],
+            json!([{ "apiVersion": "v1", "kind": "ConfigMap", "name": key_name(id, "t1"),
+                "uid": "k" }])
+        );
+        assert_eq!(secret["stringData"], json!({ "token": "tok", "env.X": "v" }));
+        assert!(secret["metadata"].get("annotations").is_none());
     }
 }

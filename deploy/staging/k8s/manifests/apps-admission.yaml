@@ -9,6 +9,19 @@
 # environment values come only from that Secret, and there is no envFrom. The driver's Role may
 # create pods, so without these rules a pod could mount another instance's Secret (another
 # tenant's token and values) although the Role has no get on Secrets.
+# What the pod rules do not stop (backlog S-85, Kimi run 15 I6-1 finding 2): the label
+# ruum.instance is set by the pod's creator, so the ServiceAccount ruum-server (a compromised
+# server process) can still make a pod with another instance's label and mount that Secret. The
+# server is the authority for every instance (any replica wakes any instance from its Secret, and
+# it holds the values anyway: the secret store and the token issuer), so no rule here can tell
+# its honest pods from forged ones. The rules stop mistakes and bugs; decision S-87 in
+# docs/backlog/2026-11-24-run15.md names the design that closes it (I6-2).
+# The second policy (ruum-apps-secrets, Kimi run 15 I6-1 finding 4): every Secret created or
+# changed in ruum-apps is an instance Secret: type Opaque (never kubernetes.io/service-account-token,
+# which the token controller fills with a ServiceAccount token), no service-account annotation,
+# named ruum-i-<its ruum.instance label without dashes>, and a new one is owned by exactly one key
+# ConfigMap ruum-k-<the same ID>-<tag> and has no finalizer (the garbage collector removes it
+# with its key: the driver may not delete a Secret, see charts/platform runtime-rbac.yaml).
 # ops/gvisor-check.sh checks the rules live (server-side dry runs that must be refused, and a
 # positive control); its control pod without gVisor runs in ops.
 # k8s/apply.sh applies this file after the runtime class.
@@ -63,6 +76,51 @@ metadata:
   name: ruum-apps-gvisor
 spec:
   policyName: ruum-apps-gvisor
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: ruum-apps
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: ruum-apps-secrets
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: ruum-apps
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["secrets"]
+  variables:
+    # The instance Secret of the object's ruum.instance label, or '' without the label.
+    - name: own
+      expression: "has(object.metadata.labels) && 'ruum.instance' in object.metadata.labels ? 'ruum-i-' + object.metadata.labels['ruum.instance'].replace('-', '') : ''"
+  validations:
+    - expression: "has(object.type) && object.type == 'Opaque'"
+      message: "Secrets in ruum-apps are of type Opaque only (no service account token Secret)"
+      reason: Forbidden
+    - expression: "!has(object.metadata.annotations) || !object.metadata.annotations.exists(k, k.startsWith('kubernetes.io/service-account'))"
+      message: "Secrets in ruum-apps carry no service account annotation"
+      reason: Forbidden
+    - expression: "variables.own != '' && object.metadata.name == variables.own && object.metadata.name.matches('^ruum-i-[0-9a-f]{32}$')"
+      message: "a Secret in ruum-apps is an instance Secret, ruum-i-<its ruum.instance label without dashes>"
+      reason: Forbidden
+    - expression: "request.operation != 'CREATE' || ((!has(object.metadata.finalizers) || size(object.metadata.finalizers) == 0) && has(object.metadata.ownerReferences) && size(object.metadata.ownerReferences) == 1 && object.metadata.ownerReferences[0].apiVersion == 'v1' && object.metadata.ownerReferences[0].kind == 'ConfigMap' && object.metadata.ownerReferences[0].name.startsWith(variables.own.replace('ruum-i-', 'ruum-k-') + '-'))"
+      message: "a new Secret in ruum-apps is owned by one key ConfigMap of its instance and has no finalizer"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: ruum-apps-secrets
+spec:
+  policyName: ruum-apps-secrets
   validationActions: [Deny]
   matchResources:
     namespaceSelector:
