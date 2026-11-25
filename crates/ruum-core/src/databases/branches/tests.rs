@@ -1346,3 +1346,75 @@ async fn a_masked_branch_on_postgres() {
         .unwrap();
     }
 }
+
+/// Kimi review of D-3b, finding 2: a masked copy reads the classes of the source again after
+/// the engine's copy and fails when they now give another plan (a class changed during the
+/// copy, so a value could be in clear that is restricted now).
+#[tokio::test]
+async fn a_class_change_during_a_masked_copy_fails_it() {
+    let w = world().await;
+    let a = ctx(w.team.id, w.alice);
+    let id = garden(&w).await;
+    let s = &w.s.databases;
+    let provider = s.deps().provider.clone();
+    let deps = provider.deps();
+    let row = s.deps().store.get(w.team.id, id).await.unwrap().unwrap();
+    let engine = w.s.database_engines.get(row.engine).unwrap().clone();
+    let catalog = engine.catalog(&row.database_ref()).await.unwrap();
+    let plan = crate::databases::provider::current_mask_plan(
+        deps,
+        w.team.id,
+        id,
+        row.engine,
+        engine.kind(),
+        &catalog,
+    )
+    .await
+    .unwrap();
+    crate::databases::provider::require_same_mask_plan(
+        deps,
+        w.team.id,
+        id,
+        row.engine,
+        engine.kind(),
+        &catalog,
+        &plan.columns,
+    )
+    .await
+    .expect("no change, the same plan");
+    s.list_columns(&a, id, false, PageRequest::default())
+        .await
+        .unwrap();
+    s.confirm_columns(
+        &a,
+        "https://ruum.localhost",
+        id,
+        ConfirmRequest {
+            columns: vec![ConfirmItem {
+                schema: "main".into(),
+                table: "plants".into(),
+                column: "email".into(),
+                class: ruum_dbengine::DataClass::Secret,
+            }],
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let (status, _, _) = code(
+        crate::databases::provider::require_same_mask_plan(
+            deps,
+            w.team.id,
+            id,
+            row.engine,
+            engine.kind(),
+            &catalog,
+            &plan.columns,
+        )
+        .await,
+    );
+    assert_eq!(
+        status, 503,
+        "personal became secret: the copy must not be used"
+    );
+}

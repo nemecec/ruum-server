@@ -889,10 +889,6 @@ async fn mask_columns(
             )
             .await?;
         }
-        // Keys, `UNIQUE` and exclusion constraints and unique indexes that hold the column:
-        // dropped now and built again after the masking, so a pseudonym collision (or a NULL in
-        // a key on a secret column) leaves out the one key, not the whole copy.
-        drop_keys(conn, &table, rel, attnum, &column.table, &mut keys).await?;
         found.push(FoundColumn {
             column,
             how: *how,
@@ -906,6 +902,16 @@ async fn mask_columns(
     // No code of the tenant may run while values are still in clear (FU1-R10-1 of the Kimi
     // review of run 10): the statements below would run it on every table they change.
     refuse_code_in_the_masking(conn, &found).await?;
+    // Keys, `UNIQUE` and exclusion constraints and unique indexes that hold a masked column:
+    // dropped now and built again after the masking, so a pseudonym collision (or a NULL in a
+    // key on a secret column) leaves out the one key, not the whole copy. Only after the
+    // refusal above: an index whose expression or predicate calls code of the tenant refuses
+    // the copy first, so no index that is built again can call a function of the tenant while
+    // the copy's owner may still call the `ruum_copy` pseudonym functions under the SOURCE key
+    // (a dictionary of the source's pseudonyms; Kimi review of D-3b, finding 1).
+    for f in &found {
+        drop_keys(conn, &f.table, f.rel, f.attnum, &f.column.table, &mut keys).await?;
+    }
     // Pass 2: mask.
     for f in &found {
         let (column, table, col) = (f.column, &f.table, ident(&f.column.column));

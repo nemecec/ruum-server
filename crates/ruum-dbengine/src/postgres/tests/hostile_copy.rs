@@ -1158,7 +1158,7 @@ async fn a_masked_copy_runs_no_tenant_code_on_values_in_clear() {
         "INSERT INTO people VALUES (1, 'tok_people')",
         "INSERT INTO z_secrets VALUES (1, 'tok_z')",
     ];
-    let cases: [(&str, &str, &str); 6] = [
+    let cases: [(&str, &str, &str); 7] = [
         (
             "a check that reads no masked column",
             "ALTER TABLE people ADD CONSTRAINT people_leak CHECK (public.leak(id)) NOT VALID;",
@@ -1168,6 +1168,15 @@ async fn a_masked_copy_runs_no_tenant_code_on_values_in_clear() {
             "an index expression",
             "CREATE INDEX people_leak_idx ON people (public.leak_imm(id));",
             "index people_leak_idx",
+        ),
+        (
+            // A unique index on a masked column is dropped before the masking and built again
+            // after it (card D-3b). It must still be refused first: built again, its function
+            // would run while the copy's owner may call the pseudonyms of the source's key
+            // (Kimi review of D-3b, finding 1).
+            "a unique index on a masked column with an expression of the tenant",
+            "CREATE UNIQUE INDEX people_oracle ON people (token, public.leak_imm(id));",
+            "index people_oracle",
         ),
         (
             "a domain of a secret column",

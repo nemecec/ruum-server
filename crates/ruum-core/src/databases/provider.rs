@@ -161,6 +161,12 @@ impl DatabaseProvider {
         }
     }
 
+    /// What the provider works with (tests).
+    #[cfg(test)]
+    pub(crate) fn deps(&self) -> &ProviderDeps {
+        &self.inner.deps
+    }
+
     /// True when the provider holds a key for the database (for tests of `purged`).
     pub fn holds_key(&self, tenant: TenantId, node: NodeId) -> bool {
         self.inner
@@ -470,6 +476,7 @@ impl Inner {
         // through Q-4 and the engine installs it in the copy.
         let key_node_id = src.key_node_id;
         let key = self.deps.keys.engine_key(tenant, key_node_id).await?;
+        let mut masked_from = None;
         let copy = match data {
             DataCopy::Full => CopyData::Full,
             DataCopy::SchemaOnly => CopyData::SchemaOnly,
@@ -478,18 +485,19 @@ impl Inner {
                     .catalog(&src.database_ref())
                     .await
                     .map_err(engine_error)?;
-                let manifest = self.head_manifest(tenant, source).await?;
-                let classes = super::query::class_map_from(
-                    &*self.deps.columns,
+                // The engine's own schema (the memory engine of the tests serves Postgres
+                // manifests with SQLite's `main`), so the plan names the columns the copy has.
+                let plan = current_mask_plan(
+                    &self.deps,
                     tenant,
                     source,
                     src.engine,
-                    &manifest,
+                    engine.kind(),
+                    &catalog,
                 )
                 .await?;
-                // The engine's own schema (the memory engine of the tests serves Postgres
-                // manifests with SQLite's `main`), so the plan names the columns the copy has.
-                CopyData::Masked(mask_plan(&catalog, engine.kind(), &classes))
+                masked_from = Some((catalog, plan.columns.clone()));
+                CopyData::Masked(plan)
             }
         };
         let created = engine
@@ -509,6 +517,18 @@ impl Inner {
             .map_err(engine_error)?;
         // The lens of the copy, from the copy's manifest (the classes the copy starts with).
         let rest = async {
+            if let Some((catalog, columns)) = &masked_from {
+                require_same_mask_plan(
+                    &self.deps,
+                    tenant,
+                    source,
+                    src.engine,
+                    engine.kind(),
+                    catalog,
+                    columns,
+                )
+                .await?;
+            }
             let manifest = self.head_manifest(tenant, target).await?;
             let sync = super::query::interim_catalog_sync(src.engine, &manifest);
             engine
@@ -709,6 +729,56 @@ pub fn mask_plan(
         columns,
         planned_from: Some(planned_from),
     }
+}
+
+/// The mask plan of `source` (a database of the engine `src_engine`, held by an engine of the
+/// kind `engine_kind`) from `catalog` and the classes its lens has now: its head manifest and
+/// its column rows ([`mask_plan`]).
+pub(super) async fn current_mask_plan(
+    deps: &ProviderDeps,
+    tenant: TenantId,
+    source: NodeId,
+    src_engine: EngineKind,
+    engine_kind: EngineKind,
+    catalog: &Catalog,
+) -> Result<MaskPlan> {
+    let row = deps
+        .typed
+        .get(tenant, source)
+        .await?
+        .ok_or_else(|| node_not_found(source))?;
+    let manifest = deps
+        .store
+        .manifest(tenant, row.desired_version)
+        .await?
+        .ok_or_else(|| Error::Internal("the manifest of a database is missing".into()))?;
+    let classes =
+        super::query::class_map_from(&*deps.columns, tenant, source, src_engine, &manifest).await?;
+    Ok(mask_plan(catalog, engine_kind, &classes))
+}
+
+/// Fails (`503`, retry) when the classes of `source` now give another mask plan for `catalog`
+/// than `columns`, the plan a masked copy was made with: a class changed during the copy, so
+/// the copy may hold a value in clear that is restricted now (Kimi review of D-3b, finding 2).
+/// Called after the engine's copy; a change after the copy's snapshot reaches the copy's lens
+/// through the copy's own manifest and rows.
+pub(super) async fn require_same_mask_plan(
+    deps: &ProviderDeps,
+    tenant: TenantId,
+    source: NodeId,
+    src_engine: EngineKind,
+    engine_kind: EngineKind,
+    catalog: &Catalog,
+    columns: &[(ColumnRef, MaskAs)],
+) -> Result<()> {
+    let now = current_mask_plan(deps, tenant, source, src_engine, engine_kind, catalog).await?;
+    if now.columns != columns {
+        return Err(Error::api(
+            crate::error::ErrorCode::Unavailable,
+            "the classes of the source changed while it was copied; copy it again",
+        ));
+    }
+    Ok(())
 }
 
 fn copies_not_available() -> Error {
@@ -1559,7 +1629,7 @@ mod postgres_tests {
     //! masked copy holds pseudonyms (under the source's key: the same as the source's lens
     //! shows) and `NULL` for a secret column.
 
-    use super::super::tests::{ctx, settled, world};
+    use super::super::tests::{ctx, world};
     use super::super::{DatabaseParts, Engines, install};
     use super::*;
     use crate::nodes::{CopyRequest, OnConflict};
@@ -1635,6 +1705,23 @@ mod postgres_tests {
         }
     }
 
+    /// Polls `getDatabase` until the state is not `provisioning`: the data cluster can be slow
+    /// while other tests run (a masked copy drops and builds keys again), at most 60 s.
+    async fn settled_slow(
+        s: &crate::Services,
+        c: &crate::actor::Context,
+        id: NodeId,
+    ) -> super::super::Database {
+        for _ in 0..600 {
+            let db = s.databases.get(c, id).await.unwrap();
+            if db.status.state != ProviderState::Provisioning {
+                return db;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("database {id} is still provisioning after 60 s");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn postgres_copies_are_full_or_masked() {
         let Some(engine) = engine().await else {
@@ -1679,7 +1766,7 @@ mod postgres_tests {
                 .node
                 .id;
         assert_eq!(
-            settled(&w.s, &a, src).await.status.state,
+            settled_slow(&w.s, &a, src).await.status.state,
             ProviderState::Ready
         );
         let row = w
@@ -1728,7 +1815,7 @@ mod postgres_tests {
                 .unwrap()
                 .value;
         worker.run_once(100).await.unwrap();
-        let db = settled(&w.s, &a, full.id).await;
+        let db = settled_slow(&w.s, &a, full.id).await;
         assert_eq!(db.status.state, ProviderState::Ready, "{:?}", db.status);
         let rows = read(
             &w,
@@ -1755,7 +1842,7 @@ mod postgres_tests {
         let b = ctx(w.team.id, w.bob);
         let masked = w.s.nodes.copy(&b, src, copy_to).await.unwrap().value;
         worker.run_once(100).await.unwrap();
-        let db = settled(&w.s, &a, masked.id).await;
+        let db = settled_slow(&w.s, &a, masked.id).await;
         assert_eq!(db.status.state, ProviderState::Ready, "{:?}", db.status);
         let m_row = w
             .handles
