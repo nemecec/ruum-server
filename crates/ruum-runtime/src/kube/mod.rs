@@ -54,7 +54,9 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tokio::task::JoinHandle;
 
-pub use pod::{LABEL_RUN, SUPERVISOR_IN_IMAGE, object_name, pod_name};
+pub use pod::{
+    LABEL_RUN, SUPERVISOR_IN_IMAGE, check_stored_sample, object_name, pod_name, sample_pod,
+};
 pub use seal::RecordKey;
 
 /// The label that marks every object of the driver, and its value.
@@ -113,6 +115,13 @@ pub struct KubeConfig {
     /// The runtime class of every pod (`gvisor`). Required: the admission policy of the
     /// namespace refuses a pod without it (backlog S-83).
     pub runtime_class: String,
+    /// The `overhead.podFixed` of the runtime class (resource name to quantity, such as `cpu` to
+    /// `50m`); empty when the class has none. The driver sends it as `spec.overhead`: the
+    /// RuntimeClass admission plugin refuses a pod whose overhead differs from the class's and
+    /// writes the class's into a pod without one, so the exhaustive read-back
+    /// (`pod::verify`) then holds the stored pod to exactly this value (review of I6-20,
+    /// required change 1).
+    pub runtime_class_overhead: BTreeMap<String, String>,
     /// The registry (`host:port`) the nodes pull app images from; `None`: no registry yet, so
     /// every OCI image is `image_not_found` (fails closed).
     pub registry: Option<String>,
@@ -200,6 +209,7 @@ impl KubeConfig {
             ca_file: None,
             namespace: namespace.into(),
             runtime_class: runtime_class.into(),
+            runtime_class_overhead: BTreeMap::new(),
             registry: None,
             registry_url: None,
             routes: BTreeMap::new(),
@@ -244,6 +254,16 @@ impl KubeConfig {
         };
         if self.namespace.is_empty() || self.runtime_class.is_empty() {
             return bad("the Kubernetes driver needs a namespace and a runtime class");
+        }
+        for (r, q) in &self.runtime_class_overhead {
+            let parses = match r.as_str() {
+                "cpu" => pod::quantity(q.strip_suffix('m').unwrap_or(q)).is_some(),
+                "memory" => pod::quantity(q).is_some(),
+                _ => false,
+            };
+            if !parses {
+                return bad("the runtime class overhead names cpu or memory with a quantity");
+            }
         }
         if self.stop_timeout > Duration::from_secs(30) {
             return bad("the stop timeout is at most 30 s");
@@ -1719,22 +1739,33 @@ impl Inner {
         // the app asking again: refused also when a seal put back on another replica hides the
         // first launch (Kimi review of I6-20, finding 2; the authority of the launched list is
         // per process until backlog I620-9).
+        // The kubelet writes the status after the container started, on its own schedule: while
+        // the app container has no `startedAt` and has not ended, the supervisor asks again
+        // (503), never a final refusal (Kimi re-check of I6-20, finding 2).
         if launch {
-            let started = pod
+            let app = pod
                 .pointer("/status/containerStatuses")
                 .and_then(Value::as_array)
                 .and_then(|a| {
                     a.iter()
                         .find(|c| c["name"] == serde_json::json!(pod::CONTAINER))
-                })
-                .and_then(|c| c.pointer("/state/running/startedAt"))
-                .and_then(Value::as_str)
+                });
+            if app.is_some_and(|c| c.pointer("/state/terminated").is_some()) {
+                return Err(refuse("the app container ended"));
+            }
+            let Some(started) = app.and_then(|c| c.pointer("/state/running/startedAt")) else {
+                return Err(not_ready(
+                    "the app container's start is not in the status yet",
+                ));
+            };
+            let fresh = started
+                .as_str()
                 .and_then(|t| {
                     OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339).ok()
+                })
+                .is_some_and(|t| {
+                    (OffsetDateTime::now_utc() - t) < time::Duration::seconds(LAUNCH_WINDOW_SECS)
                 });
-            let fresh = started.is_some_and(|t| {
-                (OffsetDateTime::now_utc() - t) < time::Duration::seconds(LAUNCH_WINDOW_SECS)
-            });
             if !fresh {
                 return Err(refuse("the app container did not start just now"));
             }
@@ -1755,6 +1786,10 @@ impl Inner {
             .and_then(|x| x.parse::<IpAddr>().ok())
         {
             ips.push(ip);
+        }
+        // No address in the status yet (the kubelet writes it on its own schedule): ask again.
+        if ips.is_empty() {
+            return Err(not_ready("the pod's address is not in the status yet"));
         }
         if !ips.iter().any(|ip| canonical(*ip) == peer) {
             return Err(refuse("the request does not come from the pod's address"));
@@ -1852,11 +1887,12 @@ impl Inner {
             match self.put(&rec, &rv).await {
                 Ok(true) => {
                     self.fresh_gen(rec.instance, next.generation);
+                    let redact = launch_redact(&s);
                     let answer = Launch {
                         v: LAUNCH_VERSION,
                         argv: s.argv,
                         env: s.env,
-                        redact: s.previous,
+                        redact,
                         token: Some(s.token),
                         pids_limit: self.cfg.pids_limit,
                         token_poll_secs: Some(TOKEN_POLL_SECS),
@@ -2256,6 +2292,7 @@ impl RuntimeDriver for KubeDriver {
                 .filter(|v| !v.is_empty())
                 .collect(),
             token: token.clone(),
+            earlier_tokens: Vec::new(),
             run: rec.run,
             pod_uid: None,
             launched: Vec::new(),
@@ -2620,11 +2657,40 @@ impl RuntimeDriver for KubeDriver {
                 ) {
                     return false;
                 }
-                s.token = new.clone();
+                if s.token != new {
+                    let old = std::mem::replace(&mut s.token, new.clone());
+                    s.earlier_tokens.retain(|t| t != &old && t != &new);
+                    s.earlier_tokens.push(old);
+                    let over = s.earlier_tokens.len().saturating_sub(MAX_KEPT_TOKENS - 1);
+                    s.earlier_tokens.drain(..over);
+                }
                 true
             })
             .await
     }
+}
+
+/// The values a launch answer redacts besides the secret values and the current token: the
+/// previous values, then the earlier tokens newest first as far as the supervisor's limits allow
+/// (`Launch::check`: at most `MAX_SECRET_VALUES` values to redact, and the bytes of the secret
+/// set plus the kept tokens). A token left out is one the driver's own redactor still has.
+fn launch_redact(s: &Sealed) -> Vec<String> {
+    use ruum_core::runtime::redact::{
+        MAX_SECRET_TOTAL_BYTES, MAX_SECRET_VALUE_BYTES, MAX_SECRET_VALUES,
+    };
+    let mut out = s.previous.clone();
+    let mut bytes: usize = s.env.iter().map(|(_, v)| v.len()).sum::<usize>()
+        + out.iter().map(String::len).sum::<usize>()
+        + s.token.len();
+    let budget = MAX_SECRET_TOTAL_BYTES + MAX_KEPT_TOKENS * MAX_SECRET_VALUE_BYTES;
+    for t in s.earlier_tokens.iter().rev() {
+        if out.len() >= MAX_SECRET_VALUES || bytes + t.len() > budget || t.is_empty() {
+            break;
+        }
+        bytes += t.len();
+        out.push(t.clone());
+    }
+    out
 }
 
 /// An address in one form: an IPv4-mapped IPv6 address as IPv4.

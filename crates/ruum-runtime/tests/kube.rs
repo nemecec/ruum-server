@@ -164,6 +164,7 @@ async fn world(split: bool) -> World {
     let token = dir.join("token");
     std::fs::write(&token, format!("{TOKEN}\n")).unwrap();
     let mut cfg = KubeConfig::new(url.clone(), NS, "gvisor");
+    cfg.runtime_class_overhead = kube_fake::staging_runtime_class_overhead();
     cfg.token_file = Some(token);
     cfg.registry = Some("registry.test:5000".into());
     cfg.registry_url = Some(url);
@@ -532,6 +533,49 @@ async fn a_changed_pod_is_refused() {
         assert!(w.fake.config_maps().is_empty(), "{t:?}: the record stayed");
         assert!(w.fake.secret_names().is_empty(), "{t:?}: the Secret stayed");
     }
+}
+
+/// The runtime class's overhead (review of I6-20, required change 1): the RuntimeClass
+/// admission plugin writes it into every pod, so the exhaustive read-back must know it. A driver
+/// with the class's overhead starts (the conformance suite runs with it); one without the
+/// setting refuses the stored pod; one with another value is refused at the create. Both fail
+/// closed and leave nothing behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_runtime_class_overhead_is_checked() {
+    let w = world(false).await;
+    for overhead in [
+        BTreeMap::new(),
+        BTreeMap::from([
+            ("cpu".to_owned(), "50m".to_owned()),
+            ("memory".to_owned(), "128Mi".to_owned()),
+        ]),
+    ] {
+        let mut cfg = w.cfg.clone();
+        cfg.runtime_class_overhead = overhead.clone();
+        let d =
+            Arc::new(KubeDriver::new(cfg, w.egress.clone(), Arc::new(MemoryUsage::new())).unwrap());
+        *w.listener.lock().unwrap() = Some(d.clone());
+        let err = d
+            .start(w.spec(identity(), &[Step::Serve]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "internal", "{overhead:?}: {err}");
+        assert!(w.fake.pods().is_empty(), "{overhead:?}: the pod stayed");
+        assert!(
+            w.fake.config_maps().is_empty(),
+            "{overhead:?}: the record stayed"
+        );
+    }
+    let d = w.driver(Arc::new(MemoryUsage::new()));
+    let id = identity();
+    let s = d.start(w.spec(id, &[Step::Serve])).await.unwrap();
+    let pods = w.fake.pods();
+    assert_eq!(pods.len(), 1);
+    assert_eq!(
+        pods[0].pointer("/spec/overhead"),
+        Some(&serde_json::json!({ "cpu": "50m", "memory": "64Mi" }))
+    );
+    d.stop(id.tenant, s.id).await.unwrap();
 }
 
 /// A second driver (another server process, or the same after a restart) answers for the
@@ -1094,6 +1138,27 @@ fn the_admission_rules_admit_only_the_supervisor_shape() {
     }
 }
 
+/// The launch decision trusts the pod's `status.podIPs` and its app container's `startedAt`
+/// (S-89), so the runtime identity may never write a pod or its status (review of I6-20,
+/// required change 3; `ops/rbac-check.sh` asserts the same against the live cluster).
+#[test]
+fn the_runtime_role_writes_no_pod_and_no_pod_status() {
+    for (resource, verbs) in kube_fake::role_rules() {
+        if resource.starts_with("pods") {
+            for v in &verbs {
+                assert!(
+                    !matches!(v.as_str(), "update" | "patch" | "*"),
+                    "the runtime Role may {v} {resource}"
+                );
+            }
+        }
+        assert!(
+            !matches!(resource.as_str(), "pods/status" | "pods/*" | "*"),
+            "the runtime Role names {resource}"
+        );
+    }
+}
+
 /// The runtime identity has no verb on Secrets at all (S-89: no Secret holds a value, so none is
 /// needed): create, get, list, watch, patch, update and delete are refused by its Role, and the
 /// namespace admits no Secret anyway.
@@ -1366,6 +1431,70 @@ async fn a_changed_record_or_a_moved_seal_is_refused() {
     );
 }
 
+/// After a wake the new pod's supervisor redacts the tokens that rotations replaced (they stay
+/// valid until their expiry): the seal keeps them and the launch answer names them (Kimi
+/// re-check of I6-20, finding 3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_woken_pod_redacts_the_earlier_tokens() {
+    let w = world(false).await;
+    let d = w.driver(Arc::new(MemoryUsage::new()));
+    let id = identity();
+    // Idle after 3 s: the rotations end well before the scale to zero.
+    let spec = w.service(id, Some(Duration::from_secs(3)));
+    let first = spec.workload_token.expose().to_owned();
+    let s = d.start(spec).await.unwrap();
+    wait_state(&d, id.tenant, s.id, |x| *x == InstanceState::Running).await;
+    let second = format!("tok-second-{}", uuid::Uuid::now_v7().simple());
+    let third = format!("tok-third-{}", uuid::Uuid::now_v7().simple());
+    for t in [&second, &third] {
+        d.rotate_token(id.tenant, s.id, SecretValue::new(t.clone()))
+            .await
+            .unwrap();
+    }
+    let st = wait_state(&d, id.tenant, s.id, |x| {
+        matches!(x, InstanceState::ScaledToZero | InstanceState::Exited(_))
+    })
+    .await;
+    assert_eq!(
+        st,
+        InstanceState::ScaledToZero,
+        "{st:?} {:?}",
+        w.fake.launches.lock().unwrap()
+    );
+    w.fake.skip_launch_once.store(true, Ordering::SeqCst);
+    d.wake(id.tenant, s.id).await.unwrap();
+    let pod_n = ruum_runtime::kube::pod_name(s.id, 2);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while w
+        .fake
+        .pod(NS, &pod_n)
+        .and_then(|p| p.pointer("/status/podIP").cloned())
+        .is_none()
+    {
+        assert!(Instant::now() < deadline, "the woken pod did not run");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (tok, ip) = w.pod_token(&pod_n);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let answer = loop {
+        match d.supervisor_launch(&tok, ip).await {
+            Ok(a) => break a,
+            Err(LaunchRefusal::NotReady) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("the woken pod's launch: {e:?}"),
+        }
+    };
+    let answer: serde_json::Value = serde_json::from_slice(&answer).unwrap();
+    assert_eq!(answer["token"], serde_json::json!(third));
+    let redact: Vec<String> = serde_json::from_value(answer["redact"].clone()).unwrap();
+    assert!(
+        redact.contains(&first) && redact.contains(&second),
+        "the earlier tokens are not redacted after the wake"
+    );
+    d.stop(id.tenant, s.id).await.unwrap();
+}
+
 /// A token rotation seals the new token into the record; the supervisor gets it at its next
 /// token request (the conformance suite checks that the app reads it, redacted). An older seal
 /// put back by a writer of the record is refused (S-89 rollback).
@@ -1580,6 +1709,48 @@ async fn the_launch_is_refused_long_after_the_start() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let (tok, ip) = w.pod_token(&pod_n);
+    // The kubelet writes the status on its own schedule (Kimi re-check of I6-20, finding 2): no
+    // start or no address in it yet means "ask again", never a final refusal.
+    let saved = w.fake.pod(NS, &pod_n).unwrap()["status"].clone();
+    w.fake.edit_pod_status(NS, &pod_n, |st| {
+        st["containerStatuses"][0]["state"] = serde_json::json!({ "waiting": {} });
+    });
+    assert_eq!(
+        d.supervisor_launch(&tok, ip).await.unwrap_err(),
+        LaunchRefusal::NotReady,
+        "no start in the status yet"
+    );
+    w.fake.edit_pod_status(NS, &pod_n, |st| {
+        st.as_object_mut().unwrap().remove("containerStatuses");
+    });
+    assert_eq!(
+        d.supervisor_launch(&tok, ip).await.unwrap_err(),
+        LaunchRefusal::NotReady,
+        "no container status yet"
+    );
+    let running = saved.clone();
+    w.fake.edit_pod_status(NS, &pod_n, |st| {
+        *st = running;
+        st.as_object_mut().unwrap().remove("podIP");
+        st["podIPs"] = serde_json::json!([]);
+    });
+    assert_eq!(
+        d.supervisor_launch(&tok, ip).await.unwrap_err(),
+        LaunchRefusal::NotReady,
+        "no address in the status yet"
+    );
+    let ended = saved.clone();
+    w.fake.edit_pod_status(NS, &pod_n, |st| {
+        *st = ended;
+        st["containerStatuses"][0]["state"] =
+            serde_json::json!({ "terminated": { "exitCode": 0, "reason": "Completed" } });
+    });
+    assert_eq!(
+        d.supervisor_launch(&tok, ip).await.unwrap_err(),
+        LaunchRefusal::Forbidden,
+        "an app container that ended"
+    );
+    w.fake.edit_pod_status(NS, &pod_n, |st| *st = saved);
     w.fake.age_pod(NS, &pod_n, 600);
     assert_eq!(
         d.supervisor_launch(&tok, ip).await.unwrap_err(),
@@ -1590,5 +1761,66 @@ async fn the_launch_is_refused_long_after_the_start() {
     assert!(
         d.supervisor_launch(&tok, ip).await.is_ok(),
         "the launch right after the start"
+    );
+}
+
+/// The driver's settings on staging (`charts/ruum` `templates/server.yaml` and
+/// `crates/ruum-server` `wiring.rs`): the namespace, the runtime class and its overhead, the
+/// egress proxy, the supervisor listener. The image digest is a placeholder (a dry run pulls
+/// nothing).
+fn staging_config() -> KubeConfig {
+    let mut c = KubeConfig::new("https://kubernetes.default.svc", "ruum-apps", "gvisor");
+    c.runtime_class_overhead = kube_fake::staging_runtime_class_overhead();
+    c.supervisor_image = format!("ghcr.io/nemecec/ruum-supervisor@sha256:{}", "0".repeat(64));
+    c.supervisor_address = "ruum-supervisor.ruum.svc.cluster.local".into();
+    c.routes = BTreeMap::from([(
+        Route::EgressProxy,
+        SharedService {
+            address: "ruum-egress.ruum.svc.cluster.local".into(),
+            alias: "ruum-egress".into(),
+            port: 3128,
+        },
+    )]);
+    c
+}
+
+const SAMPLE_POD: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../deploy/staging/k8s/sandbox-sample-pod.json"
+);
+const SAMPLE_POD_STORED: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../deploy/staging/k8s/sandbox-sample-pod.stored.json"
+);
+
+/// The sample pod that `ops/gvisor-check.sh` sends to the API server (a server-side dry run) is
+/// the one this driver makes on staging (review of I6-20, required change 2). After a change of
+/// the pod, the message holds the new file.
+#[test]
+fn the_staging_sample_pod_is_the_drivers() {
+    let want = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&ruum_runtime::kube::sample_pod(&staging_config())).unwrap()
+    );
+    let have = std::fs::read_to_string(SAMPLE_POD).unwrap_or_default();
+    assert!(
+        have == want,
+        "deploy/staging/k8s/sandbox-sample-pod.json is not the driver's pod; the new file:\n--- sample pod ---\n{want}--- end ---"
+    );
+}
+
+/// What the real API server stored for the sample pod (`ops/gvisor-check.sh` writes it; the
+/// orchestrator commits it before the driver is turned on) passes the driver's read-back: every
+/// default the API server and its admission plugins add is one the read-back knows. Without the
+/// committed answer the gate is the live check (deploy/staging/README.md).
+#[test]
+fn the_api_servers_answer_to_the_sample_pod_passes_the_read_back() {
+    let Ok(text) = std::fs::read_to_string(SAMPLE_POD_STORED) else {
+        return;
+    };
+    let stored: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        ruum_runtime::kube::check_stored_sample(&staging_config(), &stored),
+        Ok(())
     );
 }

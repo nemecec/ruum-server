@@ -192,6 +192,9 @@ impl WorkloadTokenSettings {
 ///   listener of this process) and `RUUM_KUBE_SUPERVISOR_NETWORK=encrypted` (node-to-node
 ///   traffic is encrypted and authenticated: the launch channel is plain HTTP; decision 0006 I
 ///   point 4). `RUUM_KUBE_NODE_ARCH` (default `amd64`): the platform of a multi-arch image.
+/// - `RUUM_KUBE_RUNTIME_CLASS_OVERHEAD` (`cpu=50m,memory=64Mi`; default none): the runtime
+///   class's `overhead.podFixed`, exactly as its manifest has it. The RuntimeClass admission
+///   plugin writes it into every pod and the driver's read-back must know it (review of I6-20).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeSettings {
     Memory,
@@ -215,6 +218,28 @@ pub struct KubeSettings {
     pub supervisor_service: (String, u16),
     pub supervisor_listen: std::net::SocketAddr,
     pub node_arch: String,
+    pub runtime_class_overhead: std::collections::BTreeMap<String, String>,
+}
+
+/// `name=quantity,...` of `RUUM_KUBE_RUNTIME_CLASS_OVERHEAD` (the driver checks the names and
+/// the quantities).
+fn overhead(v: &str) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    for part in v.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (k, q) = part
+            .split_once('=')
+            .context("RUUM_KUBE_RUNTIME_CLASS_OVERHEAD must be name=quantity,...")?;
+        let (k, q) = (k.trim(), q.trim());
+        anyhow::ensure!(
+            matches!(k, "cpu" | "memory") && !q.is_empty(),
+            "RUUM_KUBE_RUNTIME_CLASS_OVERHEAD names cpu or memory with a quantity"
+        );
+        anyhow::ensure!(
+            out.insert(k.to_owned(), q.to_owned()).is_none(),
+            "RUUM_KUBE_RUNTIME_CLASS_OVERHEAD names {k} twice"
+        );
+    }
+    Ok(out)
 }
 
 /// `host:port` of a setting.
@@ -332,6 +357,9 @@ impl RuntimeSettings {
             supervisor_service,
             supervisor_listen,
             node_arch: get("RUUM_KUBE_NODE_ARCH").unwrap_or_else(|| "amd64".into()),
+            runtime_class_overhead: overhead(
+                &get("RUUM_KUBE_RUNTIME_CLASS_OVERHEAD").unwrap_or_default(),
+            )?,
         })))
     }
 }
@@ -424,6 +452,19 @@ mod tests {
         assert!(!k.split_log_streams);
         assert_eq!(k.supervisor_listen.port(), 8091);
         assert_eq!(k.node_arch, "amd64");
+        assert!(k.runtime_class_overhead.is_empty());
+        let mut with = ok.clone();
+        with.push(("RUUM_KUBE_RUNTIME_CLASS_OVERHEAD", "cpu=50m, memory=64Mi"));
+        let RuntimeSettings::Kubernetes(k) = runtime(&with).unwrap() else {
+            panic!("not kubernetes");
+        };
+        assert_eq!(
+            k.runtime_class_overhead,
+            std::collections::BTreeMap::from([
+                ("cpu".to_owned(), "50m".to_owned()),
+                ("memory".to_owned(), "64Mi".to_owned()),
+            ])
+        );
         // The supervisor settings are required, the image by digest, the network encrypted.
         for missing in base.iter().skip(1) {
             let all: Vec<_> = base.iter().filter(|x| x != &missing).cloned().collect();
@@ -443,6 +484,9 @@ mod tests {
             &[("RUUM_KUBE_EGRESS_PROXY", "no-port")][..],
             &[("RUUM_KUBE_EGRESS_CONTROL", "unix:/run/x.sock")][..],
             &[("RUUM_KUBE_SPLIT_LOG_STREAMS", "yes")][..],
+            &[("RUUM_KUBE_RUNTIME_CLASS_OVERHEAD", "gpu=1")][..],
+            &[("RUUM_KUBE_RUNTIME_CLASS_OVERHEAD", "cpu=50m,cpu=60m")][..],
+            &[("RUUM_KUBE_RUNTIME_CLASS_OVERHEAD", "memory")][..],
             // Credentials never in clear (Kimi review of I6-1, finding 9).
             &[("RUUM_KUBE_API_URL", "http://kubernetes.default.svc")][..],
             &[

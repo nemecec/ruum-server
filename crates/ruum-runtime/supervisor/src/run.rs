@@ -527,9 +527,20 @@ pub fn supervise(
         say("cannot set the PID limit");
         return EXIT_LAUNCH_FAILED;
     }
-    let mut cmd = Command::new(&launch.argv[0]);
-    cmd.args(&launch.argv[1..])
-        .envs(launch.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+    // Init mode: this thread blocks the forwarded signals, and a child inherits the mask (std's
+    // `Command` keeps it), so an app that never resets its mask (most compiled programs) would
+    // never see a forwarded SIGTERM. The supervisor's own `exec` step empties the mask, then
+    // replaces itself with the app (no `unsafe` here: the workspace forbids it).
+    let mut cmd = if opts.init {
+        let mut c = Command::new(SELF_EXE);
+        c.arg("exec").arg("--").args(&launch.argv);
+        c
+    } else {
+        let mut c = Command::new(&launch.argv[0]);
+        c.args(&launch.argv[1..]);
+        c
+    };
+    cmd.envs(launch.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -613,6 +624,20 @@ pub fn supervise(
             .open(t);
     }
     code
+}
+
+/// The supervisor's own binary, for the `exec` step of init mode.
+const SELF_EXE: &str = "/proc/self/exe";
+
+/// The `exec` step of init mode (`ruum-supervisor exec -- <argv...>`): empties the signal mask
+/// this process inherited from the supervisor and replaces it with the app. Returns only when
+/// the app's command did not start.
+pub fn exec_app(argv: &[String]) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    if SigSet::empty().thread_set_mask().is_err() {
+        return std::io::Error::other("cannot empty the signal mask");
+    }
+    Command::new(&argv[0]).args(&argv[1..]).exec()
 }
 
 /// Copies the running binary to `dest` (mode 0555), for the init container of a Kubernetes

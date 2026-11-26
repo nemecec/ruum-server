@@ -664,28 +664,41 @@ The orchestrator (cards first, then the platform step):
    admin tunnel) or the CNI's WireGuard. Check on every node: `deploy/staging/tool.sh talosctl -n
    <node ip> get kubespanpeerstatuses` lists every other node with state `up`. Only then may
    `runtime.nodeNetworkEncrypted: true` be set.
-5. **I6-19**: the kubelet's `podPidsLimit` in the Talos machine config (the hard PID bound of a
+5. **I620-9** (the shared launch authority across server replicas, `docs/backlog/2026-11-26-i620.md`):
+   built and merged before the first real tenant's secret runs on Kubernetes. Staging runs two
+   server replicas behind the Service `ruum-supervisor`, so the rollback residual of
+   `docs/STEP3.md` "Rollback" applies there. Until then only test values run on the driver.
+   Also I620-1 to I620-3 (the published image, encrypted node traffic, the gVisor proofs).
+6. **I6-19**: the kubelet's `podPidsLimit` in the Talos machine config (the hard PID bound of a
    sandbox), with its live fork check in `ops/gvisor-check.sh`.
-6. **The record key**: `deploy/staging/secrets-init.sh` (adds `STG_RUUM_RUNTIME_RECORD_KEY`, 64
+7. **The record key**: `deploy/staging/secrets-init.sh` (adds `STG_RUUM_RUNTIME_RECORD_KEY`, 64
    hexadecimal characters; a name that is present is never changed), then
    `RUUM_STAGING_APPLY=yes deploy/staging/secrets-push.sh platform`. This step also applies the
    new admission policy, the ClusterRole `ruum-runtime-tokenreview`, the ServiceAccount
    `ruum-apps/ruum-sandbox` and the network policies, and runs `ops/rbac-check.sh live`.
-7. **Live checks** before the switch:
+8. **Live checks** before the switch:
    - `deploy/staging/tool.sh bash deploy/staging/ops/gvisor-check.sh`: every line `PASS`, among
      them "ruum-apps refuses a pod that mounts a Secret", "... with a projected token of the
      API's audience", "... with a writable supervisor volume", "a restricted gVisor pod in the
      shape of the sandbox supervisor passes the admission rules (the positive control)" and
      "ruum-apps refuses a Secret named for an instance (Opaque)".
+   - **The pod read-back** (review of I6-20): the same run ends with "the API server stores the
+     driver's sample pod as committed, ...". The first time it fails: it writes the API server's
+     answer to `~/.config/ruum/staging/sandbox-sample-pod.stored.json`. Copy that file to
+     `deploy/staging/k8s/sandbox-sample-pod.stored.json` in a card, and CI's test
+     `the_api_servers_answer_to_the_sample_pod_passes_the_read_back` (crates/ruum-runtime
+     `tests/kube.rs`) must pass with it. A default that the driver's check does not know fails
+     that test: fix `pod::verify` first (allow it with its exact value only). Then run the check
+     again: every line `PASS`. The driver is not turned on before.
    - `deploy/staging/tool.sh bash deploy/staging/ops/rbac-check.sh live` ends with "... the
      runtime driver has its sandbox rights in ruum-apps and TokenReviews only and no verb on
      Secrets ...; the sandbox account has none".
    - `deploy/staging/tool.sh kubectl -n ruum get secret ruum-runtime-record-key -o name` answers
      the Secret (never print its data).
-8. **The switch**: in a change of `deploy/staging/k8s/values` (or the chart values),
+9. **The switch**: in a change of `deploy/staging/k8s/values` (or the chart values),
    `runtime.kubernetes: true`, `runtime.supervisorImage: <digest>`,
    `runtime.nodeNetworkEncrypted: true`; then `deploy/staging/deploy.sh <sha of main>`.
-9. **Checks after the deploy**:
+10. **Checks after the deploy**:
    - `deploy/staging/tool.sh kubectl -n ruum logs deploy/ruum-server | grep -E 'runtime driver|supervisor listener|the sweep'`:
      per pod one line `runtime driver: Kubernetes (backlog I6-1)` and one `supervisor listener
      (sandboxes only) listening`, the expected warnings (no egress control listener, no
@@ -693,7 +706,7 @@ The orchestrator (cards first, then the platform step):
    - `deploy/staging/tool.sh kubectl -n ruum get service ruum-supervisor` shows port 8091.
    - `deploy/staging/status.sh --checks`: as before; the node22 line stays `BLOCKED` (no builder,
      no registry).
-10. **The first sandbox** (once a registry and node22 deploys exist): start one app whose start
+11. **The first sandbox** (once a registry and node22 deploys exist): start one app whose start
     command prints a known test value of a secret; then the admin checks, on the pod:
     `kubectl -n ruum-apps logs <pod>` shows `<hidden secret>` and not the value (the node's CRI
     file holds the same lines); `kubectl -n ruum-apps exec <pod> -c app -- sh -c 'echo x >

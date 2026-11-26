@@ -347,6 +347,10 @@ live() {
   want no "$r" "$APPS_NS" patch pods ephemeralcontainers
   want no "$r" "$APPS_NS" update pods
   want no "$r" "$APPS_NS" patch pods
+  # The launch decision trusts status.podIPs and the app container's startedAt (S-89): a write
+  # to pods/status would let a runtime-token holder move a victim pod's address to its own
+  # (review of I6-20, required change 3).
+  for verb in update patch; do want no "$r" "$APPS_NS" "$verb" pods status; done
   want no "$r" "$APPS_NS" create serviceaccounts token
   want no "$r" "$APPS_NS" create rolebindings.rbac.authorization.k8s.io
   want no "$r" "$APPS_NS" create roles.rbac.authorization.k8s.io

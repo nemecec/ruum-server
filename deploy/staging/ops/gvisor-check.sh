@@ -24,8 +24,16 @@
 # 4. The Secret rule of ruum-apps (the same file, policy ruum-apps-secrets, backlog S-89): a
 #    Secret in ruum-apps is refused, whatever it is (an Opaque one, a service account token
 #    Secret).
+# 5. The pod read-back (review of I6-20, required change 2): the driver's own sample pod
+#    (k8s/sandbox-sample-pod.json, which a test of crates/ruum-runtime holds equal to the
+#    driver's pod) as a server-side dry run in ruum-apps. The answer (its name, labels,
+#    annotations and spec) goes to $RUUM_STAGING_WORK/sandbox-sample-pod.stored.json and must
+#    equal the committed k8s/sandbox-sample-pod.stored.json, which CI holds to the driver's
+#    read-back (the test the_api_servers_answer_to_the_sample_pod_passes_the_read_back). A new
+#    answer (another Kubernetes release, another admission plugin) fails until it is committed
+#    and CI passes with it. The driver is not turned on before this step passes.
 # Not read-only in step 2: it creates two short pods per node (ruum-apps and ops) and deletes
-# them. Steps 3 and 4 create nothing (dry runs).
+# them. Steps 3, 4 and 5 create nothing (dry runs).
 # Exit 1 on any failure.
 set -uo pipefail
 WORK="${RUUM_STAGING_WORK:-$HOME/.config/ruum/staging}"
@@ -196,6 +204,24 @@ refused_secret() {
 refused_secret "named for an instance (Opaque)" '.'
 refused_secret "of the type kubernetes.io/service-account-token" \
   '.type = "kubernetes.io/service-account-token" | .metadata.annotations = {"kubernetes.io/service-account.name": "ruum-sandbox"}'
+
+# 5. The pod read-back (review of I6-20): the API server's defaults against the driver's check.
+K8S="$(cd "$(dirname "${BASH_SOURCE[0]}")/../k8s" && pwd)"
+SAMPLE="$K8S/sandbox-sample-pod.json"
+COMMITTED="$K8S/sandbox-sample-pod.stored.json"
+mkdir -p "$WORK"
+LIVE="$WORK/sandbox-sample-pod.stored.json"
+NORM='{metadata: ({name: .metadata.name, labels: .metadata.labels} + (if (.metadata.annotations // {}) == {} then {} else {annotations: .metadata.annotations} end)), spec: .spec}'
+if answer="$(kubectl -n "$NS" create --dry-run=server -o json -f "$SAMPLE" 2>&1)" &&
+  jq -S "$NORM" <<<"$answer" >"$LIVE" 2>/dev/null; then
+  if [[ -f "$COMMITTED" ]] && [[ "$(jq -S . "$COMMITTED")" == "$(cat "$LIVE")" ]]; then
+    pass "the API server stores the driver's sample pod as committed, and CI holds that answer to the driver's read-back"
+  else
+    bad "the API server's answer to the sample pod is not the committed one: copy $LIVE to deploy/staging/k8s/sandbox-sample-pod.stored.json, commit it, and let CI run the read-back test (the driver stays off until then)"
+  fi
+else
+  bad "the sample pod did not pass the dry run: ${answer:-no answer}"
+fi
 
 [[ $fail == 0 ]] && echo "gvisor check: passed" || echo "gvisor check: FAILED"
 exit "$fail"
