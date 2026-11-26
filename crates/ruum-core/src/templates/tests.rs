@@ -831,13 +831,16 @@ const ENTERED_SECRET: &str = "sk_live_template_test_ENTERED_4242";
 const GENERATED_SECRET: &str = "generated-session-key-TEMPLATE-9999";
 const LIVE_SECRET: &str = "stage-secret-LIVE-1234";
 
-fn api(e: Error) -> (u16, String, Option<String>, Option<Value>) {
+/// The answer body of an error (status, code, hint, details, message): two `404`s are the same
+/// answer only when all of it is equal.
+fn api(e: Error) -> (u16, String, Option<String>, Option<Value>, String) {
     let a = e.to_api();
     (
         a.code.http_status(),
         a.code.as_str().to_string(),
         a.hint,
         a.details.map(|d| *d),
+        a.message,
     )
 }
 
