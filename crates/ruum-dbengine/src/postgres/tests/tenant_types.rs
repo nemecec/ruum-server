@@ -935,3 +935,84 @@ async fn the_guards_hide_a_domain_over_a_built_in_type_on_their_own() {
     );
     close(owner).await;
 }
+
+/// A source with one secret column, and the plan that masks it (backlog T-90).
+async fn probed_copy(engine: &PostgresEngine, probe: &str) -> Result<CreatedDatabase, EngineError> {
+    let f = Fixture::new(engine).await;
+    f.migrate("CREATE TABLE t (id integer PRIMARY KEY, sec text);")
+        .await
+        .expect("migration");
+    f.run(
+        RoleKind::Owner,
+        StatementMode::Write,
+        "INSERT INTO t VALUES (1, 'tok_probe')",
+        vec![],
+    )
+    .await
+    .expect("a row");
+    let plan = MaskPlan {
+        columns: vec![(
+            ColumnRef {
+                schema: "public".into(),
+                table: "t".into(),
+                column: "sec".into(),
+            },
+            MaskAs::Null,
+        )],
+        planned_from: None,
+    };
+    let new = conformance::new_database(f.db().tenant_id);
+    copy::step_2_probe::set(new.node_id, probe);
+    let (key, _) = conformance::test_key();
+    engine
+        .copy_database(f.db(), &f.key, &new, &CopyData::Masked(plan), &key)
+        .await
+}
+
+/// Backlog T-90: a statement that runs as the copy's owner in step 2 (the test probe, where
+/// tenant code of step 2 would run) has `USAGE` on `ruum_copy`, the entry points, and none on
+/// `ruum_mask`, the schema of the key (backlog 2026-11-09 S-9). Since D-3b no tenant code of
+/// the copy runs in step 2 any more, so only the probe reaches this guard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_owner_holds_no_right_on_ruum_mask_between_step_2_and_step_3() {
+    let Some(engine) = engine().await else { return };
+    let copy = probed_copy(
+        &engine,
+        "CREATE TABLE public.probe AS SELECT \
+           pg_catalog.has_schema_privilege('ruum_mask', 'USAGE') AS m, \
+           pg_catalog.has_schema_privilege('ruum_copy', 'USAGE') AS c",
+    )
+    .await
+    .expect("the copy goes through");
+    let mut owner = session(&engine, &copy.database, RoleKind::Owner).await;
+    assert_eq!(
+        psql(
+            &mut owner,
+            "select m::text || '|' || c::text from public.probe"
+        )
+        .await
+        .unwrap(),
+        "false|true",
+        "in step 2 the owner reached the entry points, and not the schema of the key"
+    );
+    close(owner).await;
+}
+
+/// Backlog T-90: an object that tenant code of step 2 makes over an entry point of `ruum_copy`
+/// (here the test probe's view) makes step 3 refuse the copy (review-masking-1 F2); dropping
+/// `ruum_copy` with `CASCADE` would drop it silently instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn step_3_refuses_an_object_that_step_2_made_over_ruum_copy() {
+    let Some(engine) = engine().await else { return };
+    let err = probed_copy(
+        &engine,
+        "CREATE VIEW public.oracle AS SELECT ruum_copy.pseudonym('x'::text) AS p",
+    )
+    .await
+    .expect_err("the copy is refused");
+    assert!(
+        matches!(&err, EngineError::Internal(m) if m.contains("depend on the lens schemas")
+            && m.contains("oracle")),
+        "{err:?}"
+    );
+}

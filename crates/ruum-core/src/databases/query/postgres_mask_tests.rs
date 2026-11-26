@@ -2107,3 +2107,62 @@ async fn tenant_views_are_evaluated_over_masked_inputs() {
     );
     pg.drop().await;
 }
+
+/// Kimi review of D-3b on `main`, finding 1: the catalog's free-form text (defaults, comments,
+/// function bodies, sequence states) is not behind the lens and can hold real values, so an
+/// agent (with or without `read_personal`) and Bob (`edit`, no `manage`) get `422
+/// statement_not_allowed`, hint `catalog_text_needs_manage`; Alice (`manage`) reads it. Other
+/// catalog reads still run for everyone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn free_form_catalog_text_needs_manage() {
+    let Some(pg) = setup().await else { return };
+    let a = pg.alice();
+    for s in [
+        "alter table orders alter column label set default 'tok_default_marker'",
+        "comment on table orders is 'tok_comment_marker'",
+    ] {
+        pg.ok(&a, write(s)).await;
+    }
+    let refusal = (
+        422,
+        "statement_not_allowed".to_string(),
+        Some("catalog_text_needs_manage".to_string()),
+    );
+    let reads = [
+        "select pg_get_expr(adbin, adrelid) from pg_attrdef where adrelid = 'orders'::regclass",
+        "select column_default from information_schema.columns \
+         where table_name = 'orders' and column_name = 'label'",
+        "select obj_description('orders'::regclass, 'pg_class')",
+    ];
+    for text in reads {
+        let r = pg.ok(&a, sql(text)).await;
+        let cells = serde_json::to_string(&r.rows).unwrap();
+        assert!(
+            cells.contains("tok_"),
+            "control: Alice reads it: {text}: {cells}"
+        );
+        for (who, name) in [(pg.agent(), "agent"), (pg.bob(), "bob")] {
+            assert_eq!(pg.refused(&who, sql(text)).await, refusal, "{name}: {text}");
+        }
+    }
+    pg.grant(GrantKind::ReadPersonal).await;
+    for text in reads {
+        assert_eq!(
+            pg.refused(&pg.agent(), sql(text)).await,
+            refusal,
+            "an agent with read_personal: {text}"
+        );
+    }
+    let r = pg
+        .ok(
+            &pg.agent(),
+            sql("select relname from pg_class where relname = 'orders'"),
+        )
+        .await;
+    assert_eq!(
+        r.rows[0][0],
+        json!("orders"),
+        "other catalog reads still run"
+    );
+    pg.drop().await;
+}

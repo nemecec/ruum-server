@@ -5,6 +5,9 @@
 # Security rule: decision 0004-37 (d) and review-masking-1 F2: such a copy is refused.
 # Since card FU-1 the copy refuses it in step 3 (copy.rs, drop_copy_entry_points), before the
 # lens build of setup.rs, whose own check is now a second line (backlog 2026-11-17 T-57).
+# Since D-3b no tenant code of the copy runs in step 2; the test probe of step 2
+# (copy::step_2_probe, backlog 2026-11-26 T-90) makes such a view in
+# tenant_types::step_3_refuses_an_object_that_step_2_made_over_ruum_copy.
 # Runs the tenant-type cases of ruum-dbengine against the data cluster postgres-data.
 DESCRIPTION="a masked copy ignores objects that depend on the lens schemas"
 FILE="crates/ruum-dbengine/src/postgres/copy.rs"

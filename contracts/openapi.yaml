@@ -3741,6 +3741,14 @@ paths:
         name), and the engine sessions are built so that such a statement cannot reach another
         role, file or database even if it runs.
 
+        **Catalog text** (Postgres). For agents and people without `manage`, a statement that
+        reads free-form text of the catalog (function bodies, view and rule definitions,
+        defaults, check and index expressions, comments, sequence states; for example
+        `pg_proc`, `pg_attrdef`, `pg_description`, `pg_sequences`, `pg_get_viewdef`,
+        `obj_description`, `information_schema.columns`) is refused with `422
+        statement_not_allowed`, hint `catalog_text_needs_manage`: such text can hold real values,
+        and no class covers it. `getDatabaseSchema` gives names and types.
+
         **People** see `normal` and `personal` values as they are. `secret` values need `manage`
         (others read them masked, with the same rules as agents), so a viewer never reads a
         password hash or token, also not through a filter.
