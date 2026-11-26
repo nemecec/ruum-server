@@ -318,7 +318,11 @@ async fn hand_overs_of_a_database_with_tenant_types_grant_nothing() {
             .collect(),
         planned_from: None,
     };
-    for data in [CopyData::Full, CopyData::SchemaOnly, CopyData::Masked(plan)] {
+    for data in [
+        CopyData::Full,
+        CopyData::SchemaOnly(MaskPlan::default()),
+        CopyData::Masked(plan),
+    ] {
         let (key, _) = conformance::test_key();
         let copy = engine
             .copy_database(

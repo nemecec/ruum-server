@@ -2133,12 +2133,14 @@ async fn free_form_catalog_text_needs_manage() {
         "select column_default from information_schema.columns \
          where table_name = 'orders' and column_name = 'label'",
         "select obj_description('orders'::regclass, 'pg_class')",
+        "select string_agg(enumlabel::text, ',' order by enumsortorder) from pg_enum \
+         where enumtypid = 'mood'::regtype",
     ];
     for text in reads {
         let r = pg.ok(&a, sql(text)).await;
         let cells = serde_json::to_string(&r.rows).unwrap();
         assert!(
-            cells.contains("tok_"),
+            cells.contains("tok_") || cells.contains("happy,sad"),
             "control: Alice reads it: {text}: {cells}"
         );
         for (who, name) in [(pg.agent(), "agent"), (pg.bob(), "bob")] {

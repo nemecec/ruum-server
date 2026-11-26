@@ -436,8 +436,10 @@ pub struct MigrationOutcome {
 pub enum CopyData {
     /// Real data (only a person with `manage` on the source; the platform checks it).
     Full,
-    /// The schema, no rows.
-    SchemaOnly,
+    /// The schema, no rows. The plan's `secret` columns ([`MaskAs::Null`]) lose their
+    /// defaults (Kimi review of D-3b on `main`, finding 1): a secret default is a real value.
+    /// Its `personal` columns and `planned_from` are not used.
+    SchemaOnly(MaskPlan),
     /// `personal` columns as pseudonyms under the SOURCE key (retyped to `text`), `secret`
     /// columns as `NULL` (decision 0004-25; cards D-3, Q-2, Q-3).
     Masked(MaskPlan),

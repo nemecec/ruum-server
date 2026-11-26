@@ -824,7 +824,8 @@ pub const HINT_CATALOG_TEXT: &str = "catalog_text_needs_manage";
 /// The relations and functions of the Postgres catalog that show free-form text of the
 /// database's schema: function bodies, view and rule definitions, defaults, check and index
 /// expressions, trigger arguments, policy expressions, comments, the initial values of
-/// aggregates, the missing values of added columns, and the state of sequences. Such text can
+/// aggregates, the missing values of added columns, argument defaults, enum labels, and the
+/// state of sequences. Such text can
 /// hold real values (a token in a default, a name in a comment), and no class covers it.
 const CATALOG_TEXT_NAMES: &[&str] = &[
     // Relations and views.
@@ -833,6 +834,7 @@ const CATALOG_TEXT_NAMES: &[&str] = &[
     "pg_attribute",
     "pg_constraint",
     "pg_description",
+    "pg_enum",
     "pg_foreign_server",
     "pg_foreign_table",
     "pg_index",
@@ -860,9 +862,13 @@ const CATALOG_TEXT_NAMES: &[&str] = &[
     "pg_views",
     // Functions.
     "col_description",
+    "enum_first",
+    "enum_last",
+    "enum_range",
     "obj_description",
     "pg_get_constraintdef",
     "pg_get_expr",
+    "pg_get_function_arguments",
     "pg_get_function_sqlbody",
     "pg_get_functiondef",
     "pg_get_indexdef",
@@ -972,6 +978,9 @@ mod tests {
             "select pg_sequence_last_value('s')",
             "select attmissingval from pg_attribute",
             "select typdefault from pg_type",
+            "select enumlabel from pg_enum",
+            "select enum_range(null::mood)",
+            "select pg_get_function_arguments('f'::regproc)",
             "select definition from pg_views",
             "select column_default from information_schema.columns",
             "select routine_definition from INFORMATION_SCHEMA.Routines",
