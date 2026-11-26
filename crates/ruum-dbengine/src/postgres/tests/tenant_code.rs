@@ -456,7 +456,9 @@ const EXPRESSION_PLACES: &[&str] = &[
     // Rules (a view's own `_RETURN` is its query): the rules clause.
     "pg_rewrite.ev_action",
     "pg_rewrite.ev_qual",
-    // Extended statistics: evaluated by ANALYZE (owner only), never in a write.
+    // Extended statistics: evaluated by ANALYZE (owner only), never in a write. A masked copy
+    // analyzes its tables only in step 4, after the `ruum_copy` entry points are gone
+    // (review-d3b required change 1, `an_analyze_of_the_masked_tables_cannot_reach_ruum_copy`).
     "pg_statistic_ext.stxexprs",
     // Trigger conditions: the triggers clause.
     "pg_trigger.tgqual",

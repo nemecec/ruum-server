@@ -532,6 +532,26 @@ async fn a_full_branch_holds_the_real_values_and_the_sources_key() {
             .await,
     );
     assert_eq!((status, code_name.as_str()), (403, "user_required"));
+    // A person with edit but without manage (Bob, a guest with edit, once guests may create
+    // resources, so only the manage check stands in his way): 403, and nothing is made
+    // (decision 0004-7; review-d3b required change 2).
+    w.s.tenants
+        .update(
+            &a,
+            None,
+            Some(TenantPolicyChange {
+                guests_create_resources: Some(true),
+                ..TenantPolicyChange::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let bob = ctx(w.team.id, w.bob);
+    let (status, code_name, _) = code(
+        s.create_branch(&bob, id, branch_of("editor full", DataCopy::Full))
+            .await,
+    );
+    assert_eq!((status, code_name.as_str()), (403, "permission_denied"));
     let names: Vec<String> = s
         .list_branches(&a, id, PageRequest::default())
         .await

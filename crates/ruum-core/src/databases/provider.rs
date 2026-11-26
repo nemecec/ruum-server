@@ -342,8 +342,11 @@ impl Inner {
             }
         };
         let status = match outcome {
-            Ok(key) => {
-                let status = status(target, ProviderState::Ready, generation, desired);
+            Ok((key, left_out)) => {
+                let mut status = status(target, ProviderState::Ready, generation, desired);
+                // A masked copy names the keys its masking left out, as a masked branch does
+                // (decision 0004-17; review-d3b required change 3).
+                status.message = super::branches::left_out_message(&left_out);
                 self.lock().insert(
                     (tenant, target),
                     Live {
@@ -463,7 +466,7 @@ impl Inner {
         source: NodeId,
         target: NodeId,
         data: DataCopy,
-    ) -> Result<ruum_dbengine::PseudonymKey> {
+    ) -> Result<(ruum_dbengine::PseudonymKey, Vec<String>)> {
         let src = self
             .deps
             .store
@@ -561,7 +564,7 @@ impl Inner {
             let _ = engine.drop_database(&created.database).await;
             return Err(e);
         }
-        Ok(key)
+        Ok((key, created.left_out))
     }
 
     /// The manifest of the newest version of a node.
@@ -1743,10 +1746,15 @@ mod postgres_tests {
         };
         install(&mut w.s, parts).unwrap();
         let a = ctx(w.team.id, w.alice);
-        // The token column is secret, the email column has no class (personal).
+        // The token columns are secret, the email column has no class (personal). The masking
+        // breaks the `UNIQUE NULLS NOT DISTINCT` key on `badges.token` (two NULLs collide), so a
+        // masked copy leaves it out and names it (review-d3b required change 3).
         let manifest = json!({
             "engine": "postgres", "version": "17", "plan": "shared-small",
-            "data_classes": { "public.people.token": "secret" },
+            "data_classes": {
+                "public.people.token": "secret",
+                "public.badges.token": "secret",
+            },
         });
         let src =
             w.s.databases
@@ -1784,7 +1792,10 @@ mod postgres_tests {
                 &MigrationRequest {
                     up: "CREATE TABLE people (id int primary key, email text not null, \
                          token text not null); \
-                         INSERT INTO people VALUES (1, 'alice@example.com', 's3cret');"
+                         INSERT INTO people VALUES (1, 'alice@example.com', 's3cret'); \
+                         CREATE TABLE badges (id int primary key, token text not null \
+                           CONSTRAINT badges_token_key UNIQUE NULLS NOT DISTINCT); \
+                         INSERT INTO badges VALUES (1, 'badge-a'), (2, 'badge-b');"
                         .into(),
                     timeout: Duration::from_secs(30),
                     dry_run: false,
@@ -1817,6 +1828,7 @@ mod postgres_tests {
         worker.run_once(100).await.unwrap();
         let db = settled_slow(&w.s, &a, full.id).await;
         assert_eq!(db.status.state, ProviderState::Ready, "{:?}", db.status);
+        assert_eq!(db.status.message, None, "a full copy leaves out no key");
         let rows = read(
             &w,
             full.id,
@@ -1844,6 +1856,12 @@ mod postgres_tests {
         worker.run_once(100).await.unwrap();
         let db = settled_slow(&w.s, &a, masked.id).await;
         assert_eq!(db.status.state, ProviderState::Ready, "{:?}", db.status);
+        let message = db.status.message.clone().unwrap_or_default();
+        assert!(
+            message.contains("1 key") && message.contains("badges.badges_token_key"),
+            "the masked copy names the key it left out: {:?}",
+            db.status
+        );
         let m_row = w
             .handles
             .databases

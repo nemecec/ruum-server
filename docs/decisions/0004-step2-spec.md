@@ -943,7 +943,7 @@ in step 2 of a masked copy. As `mask` it could read the key and change `ruum_mas
   gets `USAGE` on `ruum_copy` and `EXECUTE` on the wrappers only, and step 3 drops `ruum_copy`
   after the check (`copy.rs` `make_copy_entry_points`; tests `tenant_types.rs`
   `step_2_of_a_masked_copy_has_no_right_on_ruum_mask` and
-  `a_masked_copy_refuses_an_object_that_points_into_the_lens_schemas`; mutation
+  `a_view_filled_after_the_masking_cannot_reach_ruum_copy`; mutation
   `dbengine-mask-copy-owner-usage`). The role kinds are frozen (item 34), so no new role kind was added:
   `mask` stays the owner of the functions, the key and the views. A role that lens sessions
   never run as, as the owner of the functions and the key (review-dbhost-2), needs a later

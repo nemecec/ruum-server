@@ -157,8 +157,9 @@ pub fn branch_columns(
 /// full count).
 const MAX_NAMES_IN_MESSAGE: usize = 20;
 
-/// The `status.message` of a ready masked branch whose masking left out constraints (decision
-/// 0004-17): their names only, at most [`MAX_NAMES_IN_MESSAGE`]; `None` when none was left out.
+/// The `status.message` of a ready masked branch or masked copy whose masking left out
+/// constraints (decision 0004-17): their names only, at most [`MAX_NAMES_IN_MESSAGE`]; `None`
+/// when none was left out.
 pub fn left_out_message(left_out: &[String]) -> Option<String> {
     if left_out.is_empty() {
         return None;
@@ -175,7 +176,7 @@ pub fn left_out_message(left_out: &[String]) -> Option<String> {
         String::new()
     };
     Some(format!(
-        "The branch is ready. The masking left out {} key(s), unique index(es) or foreign \
+        "The masked database is ready. The masking left out {} key(s), unique index(es) or foreign \
          key(s) that masked values break: {}{rest}.",
         left_out.len(),
         shown.join(", ")
