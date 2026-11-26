@@ -1135,7 +1135,8 @@ async fn clear_statistics(conn: &mut PgConnection) -> Result<(), EngineError> {
 /// - **sequences**: the state of every sequence (`last_value`, `is_called`) is the source's
 ///   and tells values that the masking removed (a personal ID column's highest value). Each one
 ///   is restarted; one owned by an integer column (`serial`, identity) is then set to the
-///   highest value of that column in the copy, so new rows of the copy get new values. A
+///   highest value of that column in the copy (the lowest for a descending sequence; held
+///   within the sequence's bounds), so new rows of the copy get new values. A
 ///   masked personal column is `text` in the copy, and a masked secret column holds no value,
 ///   so their sequences stay restarted.
 /// - **comments**: every comment on an object of the tenant is removed. A comment is free text
@@ -1159,13 +1160,17 @@ async fn scrub_outside_the_tables(conn: &mut PgConnection) -> Result<(), EngineE
             "{left} large objects of the copy are left after the unlink"
         )));
     }
-    // Sequences. int2, int4 and int8 are the OIDs 21, 23 and 20.
+    // Sequences. int2, int4 and int8 are the OIDs 21, 23 and 20. A descending sequence takes
+    // the column's lowest value, an ascending one its highest; the value is held within the
+    // sequence's bounds, or `setval` would refuse the copy (a row put in by hand beyond them).
     let sequences = sqlx::query(
         "select format('alter sequence %s restart', s.seqrelid::regclass),
                 case when a.attnum is not null and a.atttypid = any ('{20,21,23}'::oid[])
-                     then format('select setval(%L::regclass, m) from (select max(%I) as m from %s) x \
-                                   where m is not null',
-                                 s.seqrelid::regclass::text, a.attname, a.attrelid::regclass) end
+                     then format('select setval(%L::regclass, greatest(%L::int8, least(%L::int8, m))) \
+                                    from (select %s(%I)::int8 as m from %s) x where m is not null',
+                                 s.seqrelid::regclass::text, s.seqmin, s.seqmax,
+                                 case when s.seqincrement < 0 then 'min' else 'max' end,
+                                 a.attname, a.attrelid::regclass) end
            from pg_sequence s
            join pg_class c on c.oid = s.seqrelid
            join pg_namespace n on n.oid = c.relnamespace
