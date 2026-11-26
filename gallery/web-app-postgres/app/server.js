@@ -86,6 +86,9 @@ function page(user, notes) {
 </body></html>`;
 }
 
+// The routes that handle() answers; the request log names one of these or "other".
+const ROUTES = ["/", "/notes"];
+
 async function handle(req, res, user) {
   const url = new URL(req.url ?? "/", "http://app.invalid");
   if (req.method === "GET" && url.pathname === "/") {
@@ -115,7 +118,9 @@ const signedIn = withRuumUser(async (req, res, user) => {
     log("error", "request failed with {error_code}", { error_code: e?.code ?? "unknown" });
     if (!res.headersSent) send(res, 500, "text/plain; charset=utf-8", "Something went wrong.\n");
   } finally {
-    const path = new URL(req.url ?? "/", "http://app.invalid").pathname;
+    // The matched route, never the raw path: a path the client chose can hold an email or a token.
+    const pathname = new URL(req.url ?? "/", "http://app.invalid").pathname;
+    const path = ROUTES.includes(pathname) ? pathname : "other";
     log("info", "{method} {path} answered {status} in {duration_ms} ms", {
       method: req.method,
       path,
