@@ -258,16 +258,17 @@ mod tests {
         }
     }
 
-    async fn post_token(addr: SocketAddr) -> String {
-        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    /// One request and its whole answer. `Err` when the server closed or reset the connection
+    /// (a connection over a cap): the caller decides whether that is expected.
+    async fn post_token(addr: SocketAddr) -> std::io::Result<String> {
+        let mut s = tokio::net::TcpStream::connect(addr).await?;
         s.write_all(
             b"POST /v1/token HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         )
-        .await
-        .unwrap();
+        .await?;
         let mut out = String::new();
-        s.read_to_string(&mut out).await.unwrap();
-        out
+        s.read_to_string(&mut out).await?;
+        Ok(out)
     }
 
     /// Kimi re-check of I6-20 in run 16, defect 4: a peer that opens connections and sends no
@@ -295,7 +296,9 @@ mod tests {
         // The freed place is taken again (the drop reaches the server shortly after).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let answer = post_token(addr).await;
+            // A try before the freed place is visible is closed at the cap: an empty answer, or
+            // a reset when the request bytes were still unread (Kimi review of this fix).
+            let answer = post_token(addr).await.unwrap_or_default();
             if answer.starts_with("HTTP/1.1 200") {
                 assert!(answer.ends_with("127.0.0.1"), "{answer}");
                 break;
@@ -386,7 +389,8 @@ mod tests {
         let answer = tokio::time::timeout(Duration::from_secs(5), client)
             .await
             .expect("no answer")
-            .unwrap();
+            .unwrap()
+            .expect("the answer");
         assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
         assert!(answer.ends_with("answer"), "{answer}");
         tokio::time::timeout(Duration::from_secs(5), server)
