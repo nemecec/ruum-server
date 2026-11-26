@@ -482,7 +482,25 @@ impl Inner {
         let mut masked_from = None;
         let copy = match data {
             DataCopy::Full => CopyData::Full,
-            DataCopy::SchemaOnly => CopyData::SchemaOnly,
+            DataCopy::SchemaOnly => {
+                // The classes, so the copy drops the defaults of the secret columns (Kimi review
+                // of D-3b on `main`, finding 1).
+                let catalog = engine
+                    .catalog(&src.database_ref())
+                    .await
+                    .map_err(engine_error)?;
+                CopyData::SchemaOnly(
+                    current_mask_plan(
+                        &self.deps,
+                        tenant,
+                        source,
+                        src.engine,
+                        engine.kind(),
+                        &catalog,
+                    )
+                    .await?,
+                )
+            }
             DataCopy::Masked => {
                 let catalog = engine
                     .catalog(&src.database_ref())

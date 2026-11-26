@@ -313,7 +313,7 @@ async fn no_pseudonym_oracle_on_a_schema_only_branch() {
             f.db(),
             &f.key,
             &conformance::new_database(f.db().tenant_id),
-            &CopyData::SchemaOnly,
+            &CopyData::SchemaOnly(MaskPlan::default()),
             &f.key,
         )
         .await
@@ -675,7 +675,13 @@ async fn copies_carry_no_app_grants() {
         .await
         .unwrap();
     let schema_only = engine
-        .copy_database(f.db(), &f.key, &new(), &CopyData::SchemaOnly, &f.key)
+        .copy_database(
+            f.db(),
+            &f.key,
+            &new(),
+            &CopyData::SchemaOnly(MaskPlan::default()),
+            &f.key,
+        )
         .await
         .unwrap();
     let restored = engine
@@ -967,7 +973,13 @@ async fn large_objects_of_an_app_role_block_neither_copies_nor_the_drop() {
         .await
         .expect("a full copy");
     let schema_only = engine
-        .copy_database(f.db(), &f.key, &new(), &CopyData::SchemaOnly, &f.key)
+        .copy_database(
+            f.db(),
+            &f.key,
+            &new(),
+            &CopyData::SchemaOnly(MaskPlan::default()),
+            &f.key,
+        )
         .await
         .expect("a schema-only copy");
     let restored = engine

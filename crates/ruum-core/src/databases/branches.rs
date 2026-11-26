@@ -247,7 +247,25 @@ pub(super) async fn make_branch(
     let key = deps.keys.engine_key(tenant, key_node_id).await?;
     let mut masked_from = None;
     let copy = match data {
-        DataCopy::SchemaOnly => CopyData::SchemaOnly,
+        DataCopy::SchemaOnly => {
+            // The classes, so the copy drops the defaults of the secret columns (Kimi review of
+            // D-3b on `main`, finding 1).
+            let catalog = engine
+                .catalog(&src.database_ref())
+                .await
+                .map_err(engine_error)?;
+            CopyData::SchemaOnly(
+                super::provider::current_mask_plan(
+                    deps,
+                    tenant,
+                    source,
+                    src.engine,
+                    engine.kind(),
+                    &catalog,
+                )
+                .await?,
+            )
+        }
         DataCopy::Full => CopyData::Full,
         DataCopy::Masked => {
             // The classes of the source as its lens sees them now. The engine refuses the copy

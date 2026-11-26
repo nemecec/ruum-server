@@ -355,7 +355,7 @@ async fn drop_old_mask_objects(conn: &mut PgConnection, old_mask: &str) -> Resul
 /// What a hand-over does with the data.
 enum Data<'a> {
     Keep,
-    SchemaOnly,
+    SchemaOnly(&'a MaskPlan),
     Masked(&'a MaskPlan, &'a PseudonymKey),
 }
 
@@ -724,8 +724,9 @@ async fn change_data(
         }
         let out = match data {
             Data::Keep => MaskOutcome::default(),
-            Data::SchemaOnly => {
+            Data::SchemaOnly(plan) => {
                 empty_tables(&mut conn).await?;
+                drop_secret_defaults(&mut conn, plan).await?;
                 clear_statistics(&mut conn).await?;
                 MaskOutcome::default()
             }
@@ -865,6 +866,40 @@ async fn leave_catalog_path(conn: &mut PgConnection, old: &str) -> Result<(), En
     Ok(())
 }
 
+/// Drops the defaults of the `secret` columns of `plan` in a `schema_only` copy (Kimi review of
+/// D-3b on `main`, finding 1): a secret default is a real value in the catalog, and new rows of
+/// the copy would get it. A generated column keeps its expression.
+async fn drop_secret_defaults(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), EngineError> {
+    let (tables, columns): (Vec<String>, Vec<String>) = plan
+        .columns
+        .iter()
+        .filter(|(c, how)| c.schema == "public" && *how == MaskAs::Null)
+        .map(|(c, _)| (format!("public.{}", ident(&c.table)), c.column.clone()))
+        .unzip();
+    if tables.is_empty() {
+        return Ok(());
+    }
+    let old = enter_catalog_path(conn).await?;
+    let rows = sqlx::query(
+        "select format('alter table %s alter column %I drop default', a.attrelid::regclass, a.attname)
+           from rows from (unnest($1::text[]), unnest($2::text[])) as m(t, c)
+           join pg_attribute a on a.attrelid = to_regclass(m.t) and a.attname = m.c
+            and a.attnum > 0 and not a.attisdropped and a.attgenerated = ''
+           join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum
+          order by 1",
+    )
+    .persistent(false)
+    .bind(&tables)
+    .bind(&columns)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| internal("list the defaults of the secret columns", e))?;
+    for row in rows {
+        run(conn, "drop the default of a secret column", row.get(0)).await?;
+    }
+    leave_catalog_path(conn, &old).await
+}
+
 /// Refuses a `masked` or `schema_only` copy that holds a foreign table or a foreign server
 /// (Kimi review of D-3b on `main`, finding 3). A foreign table reads rows outside the
 /// database: the catalog gives it no columns to classify, so no plan masks it, and the copy's
@@ -916,6 +951,23 @@ async fn refuse_foreign_data(conn: &mut PgConnection) -> Result<(), EngineError>
 /// its statistics, or it is not made.
 async fn clear_statistics(conn: &mut PgConnection) -> Result<(), EngineError> {
     let old = enter_catalog_path(conn).await?;
+    // The statistics targets of index columns (`ALTER INDEX ... ALTER COLUMN n SET STATISTICS`)
+    // are not part of `pg_get_indexdef`: an index made again below (or by `ALTER COLUMN TYPE`)
+    // gets them back by name at the end (Kimi re-check of the D-3b fixes, N2).
+    let index_targets: Vec<String> = sqlx::query_scalar(
+        "select format('alter index %I.%I alter column %s set statistics %s',
+                       n.nspname, x.relname, a.attnum, a.attstattarget)
+           from pg_attribute a
+           join pg_class x on x.oid = a.attrelid and x.relkind in ('i', 'I')
+           join pg_namespace n on n.oid = x.relnamespace
+          where n.nspname = 'public' and a.attnum > 0
+            and a.attstattarget is not null and a.attstattarget >= 0
+          order by 1",
+    )
+    .persistent(false)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| internal("list the statistics targets of the indexes", e))?;
     // 1. Extended statistics (`pg_statistic_ext_data` is readable only by a superuser, so
     // every object of the own schema is made again).
     let objects = sqlx::query(
@@ -1035,6 +1087,14 @@ async fn clear_statistics(conn: &mut PgConnection) -> Result<(), EngineError> {
         let (drop, make): (String, String) = (row.get(0), row.get(1));
         run(conn, "drop an index with statistics", drop).await?;
         run(conn, "make an index again", make).await?;
+    }
+    for target in index_targets {
+        run(
+            conn,
+            "set the statistics target of an index column again",
+            target,
+        )
+        .await?;
     }
     // 4. Nothing is left, or the copy is refused.
     let left: String = sqlx::query_scalar(
@@ -2065,7 +2125,7 @@ pub(crate) async fn copy_database(
     }
     let how = match data {
         CopyData::Full => Data::Keep,
-        CopyData::SchemaOnly => Data::SchemaOnly,
+        CopyData::SchemaOnly(plan) => Data::SchemaOnly(plan),
         CopyData::Masked(plan) => Data::Masked(plan, source_key),
     };
     let left_out =

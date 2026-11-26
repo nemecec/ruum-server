@@ -416,7 +416,7 @@ impl DatabaseEngine for MemoryEngine {
     ) -> Result<CreatedDatabase, EngineError> {
         let (with_rows, mask) = match data {
             CopyData::Full => (true, None),
-            CopyData::SchemaOnly => (false, None),
+            CopyData::SchemaOnly(_) => (false, None),
             // The rows go with the dump and are masked in the copy before it is registered:
             // no session ever reaches the copy with values in clear.
             CopyData::Masked(plan) => (true, Some((plan.clone(), source_key.clone()))),

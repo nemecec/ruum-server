@@ -158,7 +158,7 @@ async fn a_copy_runs_no_tenant_trigger_or_rule_with_platform_rights() {
     };
     for data in [
         CopyData::Full,
-        CopyData::SchemaOnly,
+        CopyData::SchemaOnly(MaskPlan::default()),
         CopyData::Masked(plan()),
     ] {
         let (key, _) = conformance::test_key();
@@ -238,7 +238,7 @@ async fn a_copy_runs_no_tenant_trigger_or_rule_with_platform_rights() {
         .unwrap();
         let expected = match data {
             CopyData::Full => "tok_h:al,-:-/tok_kept/tok_locked",
-            CopyData::SchemaOnly => "",
+            CopyData::SchemaOnly(_) => "",
             CopyData::Masked(_) => "-:p_,-:-/-/-",
         };
         assert_eq!(rows, expected, "{data:?}: the data of the copy");
@@ -582,7 +582,7 @@ async fn platform_steps_run_no_tenant_operator() {
     };
     for data in [
         CopyData::Full,
-        CopyData::SchemaOnly,
+        CopyData::SchemaOnly(MaskPlan::default()),
         CopyData::Masked(masked),
     ] {
         let (key, _) = conformance::test_key();
@@ -1343,7 +1343,7 @@ async fn a_copy_of_a_database_with_an_event_trigger_is_refused() {
         return;
     };
     let (key, _) = conformance::test_key();
-    for data in [CopyData::Full, CopyData::SchemaOnly] {
+    for data in [CopyData::Full, CopyData::SchemaOnly(MaskPlan::default())] {
         let err = engine
             .copy_database(
                 f.db(),
@@ -1380,9 +1380,9 @@ async fn a_copy_of_a_database_with_an_event_trigger_is_refused() {
 /// hold nothing of the source outside the rows either. The source has a secret default, comments
 /// on a table, a column and a function, a large object, and sequences set to marker values (a
 /// standalone one, one owned by a personal integer column, and the `serial` of a normal `id`).
-/// In both copies there is no large object and no comment, and no sequence holds a marker; in
-/// the masked copy the secret column has no default, and the `serial` of `id` continues after
-/// the copy's highest `id`. A full copy keeps all of it (control).
+/// In both copies there is no large object and no comment, no sequence holds a marker, and the
+/// secret column has no default; in the masked copy the `serial` of `id` continues after the
+/// copy's highest `id`. A full copy keeps all of it (control).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_masked_or_schema_only_copy_keeps_no_text_object_or_sequence_state_of_the_source() {
     let Some(engine) = engine().await else { return };
@@ -1453,8 +1453,8 @@ async fn a_masked_or_schema_only_copy_keeps_no_text_object_or_sequence_state_of_
              loose=424242,people_id_seq=5000,pid_seq=777001",
         ),
         (
-            CopyData::SchemaOnly,
-            "0|-|nextval('people_id_seq'::regclass),nextval('pid_seq'::regclass),'tok_default_marker'::text|\
+            CopyData::SchemaOnly(plan.clone()),
+            "0|-|nextval('people_id_seq'::regclass),nextval('pid_seq'::regclass)|\
              loose=new,people_id_seq=new,pid_seq=new",
         ),
         (
@@ -1523,7 +1523,8 @@ async fn a_schema_only_copy_keeps_no_statistics_of_the_source() {
            'tok_secret_' || (g % 10) FROM generate_series(1, 200) g; \
          REFRESH MATERIALIZED VIEW mv; \
          ANALYZE people; ANALYZE mv; \
-         ALTER TABLE people ALTER COLUMN token SET STATISTICS 0",
+         ALTER TABLE people ALTER COLUMN token SET STATISTICS 0; \
+         ALTER INDEX people_lower ALTER COLUMN 1 SET STATISTICS 0",
     )
     .await
     .unwrap();
@@ -1539,7 +1540,7 @@ async fn a_schema_only_copy_keeps_no_statistics_of_the_source() {
             f.db(),
             &f.key,
             &conformance::new_database(f.db().tenant_id),
-            &CopyData::SchemaOnly,
+            &CopyData::SchemaOnly(MaskPlan::default()),
             &key,
         )
         .await
@@ -1558,12 +1559,14 @@ async fn a_schema_only_copy_keeps_no_statistics_of_the_source() {
                     (select count(*) from pg_statistic_ext where stxname = 'people_grp_token')::text || '|' || \
                     (select count(*) from pg_indexes where indexname = 'people_lower')::text || '|' || \
                     (select attstattarget::text from pg_attribute \
-                      where attrelid = 'people'::regclass and attname = 'token')",
+                      where attrelid = 'people'::regclass and attname = 'token') || '|' || \
+                    (select attstattarget::text from pg_attribute \
+                      where attrelid = 'people_lower'::regclass and attnum = 1)",
         )
         .await
         .unwrap(),
-        "0|0|1|1|0",
-        "the schema is whole: the view, the statistics object, the index and the target"
+        "0|0|1|1|0|0",
+        "the schema is whole: the view, the statistics object, the index and the targets"
     );
     close(owner).await;
 }
@@ -1656,7 +1659,10 @@ async fn a_masked_or_schema_only_copy_of_foreign_data_is_refused() {
         let engine = &engine;
         let f = &f;
         async move {
-            for data in [CopyData::SchemaOnly, CopyData::Masked(plan())] {
+            for data in [
+                CopyData::SchemaOnly(MaskPlan::default()),
+                CopyData::Masked(plan()),
+            ] {
                 let (key, _) = conformance::test_key();
                 let err = engine
                     .copy_database(

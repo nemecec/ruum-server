@@ -1136,7 +1136,7 @@ pub async fn branch(engine: &dyn DatabaseEngine) {
             f.db(),
             &f.key,
             &new_database(tenant),
-            &CopyData::SchemaOnly,
+            &CopyData::SchemaOnly(MaskPlan::default()),
             &branch_key,
         )
         .await
