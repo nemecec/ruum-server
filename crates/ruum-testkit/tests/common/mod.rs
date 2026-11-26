@@ -58,16 +58,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// `RUUM_REQUIRE_IMPLEMENTED=1`). The card named last unblocks the case and removes its line.
 ///
 /// Card P-3 added the typed-node rules to the node stores (decisions 0004-6, 0004-7 and
-/// 0004-18) and removed its entries. The cases below need database branches, which card D-3
-/// makes (`createDatabaseBranch`); their typed-node rules (a branch stays with its database, a
-/// copy takes no branch, trash and purge take the branches along) are P-3's and are built.
+/// 0004-18) and removed its entries. The branch cases (cards D-3 and D-3b) left the list when
+/// D-2 landed after D-3b (backlog T-77): with migrations and masked and full branches they run.
 pub const PENDING: &[(&str, &str)] = &[
-    ("a_branch_cannot_move_away", "needs branches: D-3"),
-    ("copy_of_a_database_copies_no_branch", "needs branches: D-3"),
-    (
-        "trash_and_purge_take_the_branches_along",
-        "needs branches: D-3",
-    ),
     // Card D-2 removed the planned marks of the migration operations; these cases also need
     // the work of other cards.
     (
@@ -85,26 +78,6 @@ pub const PENDING: &[(&str, &str)] = &[
     (
         "waiting_for_you_across_the_tenant",
         "needs an agent's destructive statement through queryDatabase (card A-2w, the statement path of A-2; it answers 501 until then)",
-    ),
-    (
-        "a_full_branch_is_no_draft_branch",
-        "needs masked and full branches (card D-3b, the second part of D-3)",
-    ),
-    (
-        "agents_dry_run_only_on_draft_branches",
-        "needs masked and full branches (card D-3b, the second part of D-3)",
-    ),
-    (
-        "a_branch_of_a_branch_is_a_conflict",
-        "needs masked and full branches (card D-3b, the second part of D-3)",
-    ),
-    (
-        "copy_of_a_database_never_raises_the_copiers_rights",
-        "needs masked copies of a database (card D-3b with the SQLite lens of Q-3): the memory engine refuses a masked copy, so the copy stays provisioning",
-    ),
-    (
-        "guests_branch_a_database_only_with_the_policy",
-        "needs masked and full branches (card D-3b, the second part of D-3)",
     ),
 ];
 
