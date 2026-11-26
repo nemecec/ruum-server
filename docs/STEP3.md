@@ -263,7 +263,9 @@ secret.
       (see "Turning the Kubernetes driver on").
    2. Empties `/dev/termination-log`, then reads the launch data **once** (below) and checks it:
       at most 256 values, 16 KiB per value, 256 KiB in all (the limits of `ruum-core`'s
-      redactor), environment names as the spec's, a command.
+      redactor), plus at most 16 workload tokens (the current one and the earlier ones that are
+      still valid; so at most 272 entries to redact, and the driver never leaves a valid earlier
+      token out to fit), environment names as the spec's, a command.
    3. With a PID limit in the launch data: `setrlimit(RLIMIT_NPROC)` for itself and its children
       (a failure ends the run). Linux counts every thread of the user in the user namespace;
       gVisor counts in its own kernel, one per sandbox. The Docker driver keeps the engine's
@@ -347,7 +349,9 @@ secret.
      `uid` is not the sealed one.
    - **The fetch, once.** The supervisor `POST`s to the server's supervisor listener
      (`RUUM_KUBE_SUPERVISOR_LISTEN`, its own port, reached through a Service at an address the
-     driver resolves and passes as an argument, because the sandbox has no DNS) with
+     driver resolves and passes as an argument, because the sandbox has no DNS; the listener has
+     its own connection caps, because sandbox code is untrusted: 1024 connections in all, 4 per
+     peer address, the headers within 5 s, every connection closed after 30 s) with
      `Authorization: Bearer <projected token>`. `/v1/launch` answers the launch data once per pod
      `uid`: the server seals the pod's `uid` into the list of launched pods before it answers, and
      refuses a second launch for that `uid` (the app, which can read the projected token, starts
@@ -362,7 +366,9 @@ secret.
      the pod of that name exists now, has that `uid`, is not being deleted, and one of its
      `status.podIPs` equals the connection's peer address (the socket's, never a header; IPv4
      mapped forms canonicalized); the record unseals, its digest matches, its sealed run and pod
-     `uid` are this pod's, and its generation is not below the highest this process saw; and the
+     `uid` are this pod's, and its generation is not below the highest this process saw (a read
+     that is older is read again, because another request of this process can have written in
+     between; only a seal that stays older over every try is refused as put back, T-85); and the
      stored pod is the pod the driver makes for that record (`pod::verify`, an exhaustive check:
      every key of the pod spec and of each container must be one the driver sets or one of a
      fixed list of API server defaults, and every value the driver sets must be equal: images by

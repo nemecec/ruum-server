@@ -668,7 +668,11 @@ The orchestrator (cards first, then the platform step):
    built and merged before the first real tenant's secret runs on Kubernetes. Staging runs two
    server replicas behind the Service `ruum-supervisor`, so the rollback residual of
    `docs/STEP3.md` "Rollback" applies there. Until then only test values run on the driver.
-   Also I620-1 to I620-3 (the published image, encrypted node traffic, the gVisor proofs).
+   Also I620-1 to I620-3 (the published image, encrypted node traffic, the gVisor proofs) and
+   I620-12 (a bound on the TokenReviews of all sandboxes together, and a cheap check before
+   one). Done before this gate (Kimi run 16 re-check of I6-20): T-85 (a same-process reseal
+   race refused a legitimate rotation; `docs/backlog/2026-11-26-run16.md`) and I620-13 (the
+   supervisor listener's own connection caps and header timeout).
 6. **I6-19**: the kubelet's `podPidsLimit` in the Talos machine config (the hard PID bound of a
    sandbox), with its live fork check in `ops/gvisor-check.sh`.
 7. **The record key**: `deploy/staging/secrets-init.sh` (adds `STG_RUUM_RUNTIME_RECORD_KEY`, 64

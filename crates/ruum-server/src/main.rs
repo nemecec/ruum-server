@@ -220,14 +220,14 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .with_context(|| format!("bind {bind} (RUUM_KUBE_SUPERVISOR_LISTEN)"))?;
             tracing::info!(addr = %bind, "supervisor listener (sandboxes only) listening");
-            Some(
-                axum::serve(
-                    listener,
-                    supervisor::router(driver.clone())
-                        .into_make_service_with_connect_info::<std::net::SocketAddr>(),
-                )
-                .with_graceful_shutdown(stop.clone().stopped()),
-            )
+            // Its own connection caps: the callers run untrusted code (Kimi re-check of I6-20
+            // in run 16, defect 4).
+            Some(supervisor::serve(
+                listener,
+                supervisor::router(driver.clone()),
+                supervisor::Caps::default(),
+                stop.clone().stopped(),
+            ))
         }
         None => None,
     };

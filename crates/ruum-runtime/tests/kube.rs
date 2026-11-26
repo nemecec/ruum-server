@@ -1532,6 +1532,117 @@ async fn a_rotation_reseals_and_an_older_seal_is_refused() {
     );
 }
 
+/// Waits until the fake kubelet gave `pod` an address (it runs).
+async fn wait_pod_ip(w: &World, pod: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while w
+        .fake
+        .pod(NS, pod)
+        .and_then(|p| p.pointer("/status/podIP").cloned())
+        .is_none()
+    {
+        assert!(Instant::now() < deadline, "the pod {pod} did not run");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The launch of `pod` as its supervisor asks for it: again while the server answers "not
+/// ready".
+async fn launch_when_ready(
+    d: &KubeDriver,
+    tok: &str,
+    ip: std::net::IpAddr,
+) -> Result<Vec<u8>, LaunchRefusal> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match d.supervisor_launch(tok, ip).await {
+            Err(LaunchRefusal::NotReady) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            r => return r,
+        }
+    }
+}
+
+/// T-85: a token rotation reads the seal (generation N), then the pod's launch in the same
+/// process writes N+1 before the rotation goes on. The rotation reads the record again and
+/// seals the new token; it does not take its own stale read for an older seal put back (which
+/// refused the rotation: `a_woken_pod_redacts_the_earlier_tokens` failed so under load).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rotation_that_read_before_a_launch_wrote_reads_again() {
+    let w = world(false).await;
+    let d = w.quiet_driver();
+    let id = identity();
+    w.fake.skip_launch_once.store(true, Ordering::SeqCst);
+    let s = d.start(w.service(id, None)).await.unwrap();
+    let pod_n = ruum_runtime::kube::pod_name(s.id, 1);
+    wait_pod_ip(&w, &pod_n).await;
+    let (tok, ip) = w.pod_token(&pod_n);
+    // The rotation reads the record twice: its state check, then the reseal. Hold the second.
+    w.fake
+        .hold_config_map_get(&ruum_runtime::kube::object_name(s.id), 1);
+    let new = format!("tok-rotated-{}", uuid::Uuid::now_v7().simple());
+    let rotation = {
+        let (d, new) = (d.clone(), new.clone());
+        tokio::spawn(async move { d.rotate_token(id.tenant, s.id, SecretValue::new(new)).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), w.fake.get_held.notified())
+        .await
+        .expect("the rotation's reseal did not read the record");
+    // Meanwhile the launch seals the pod's uid into the launched list: one generation up.
+    let answer = launch_when_ready(&d, &tok, ip).await.expect("the launch");
+    let answer: serde_json::Value = serde_json::from_slice(&answer).unwrap();
+    assert_ne!(answer["token"], serde_json::json!(new));
+    w.fake.get_release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), rotation)
+        .await
+        .expect("the rotation did not end")
+        .unwrap()
+        .expect("the rotation after a launch in the same process");
+    let answer = d.supervisor_token(&tok, ip).await.expect("the token");
+    let answer: serde_json::Value = serde_json::from_slice(&answer).unwrap();
+    assert_eq!(answer["token"], serde_json::json!(new));
+    d.stop(id.tenant, s.id).await.unwrap();
+}
+
+/// T-85, the other order: the launch reads the seal (generation N), then a token rotation in
+/// the same process writes N+1. The launch reads the record again and answers with the new
+/// token; it does not refuse the pod for an older seal put back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_that_read_before_a_rotation_wrote_reads_again() {
+    let w = world(false).await;
+    let d = w.quiet_driver();
+    let id = identity();
+    w.fake.skip_launch_once.store(true, Ordering::SeqCst);
+    let s = d.start(w.service(id, None)).await.unwrap();
+    let pod_n = ruum_runtime::kube::pod_name(s.id, 1);
+    wait_pod_ip(&w, &pod_n).await;
+    let (tok, ip) = w.pod_token(&pod_n);
+    // The launch reads the record once per try (a try that is not ready stops before it).
+    w.fake
+        .hold_config_map_get(&ruum_runtime::kube::object_name(s.id), 0);
+    let launch = {
+        let (d, tok) = (d.clone(), tok.clone());
+        tokio::spawn(async move { launch_when_ready(&d, &tok, ip).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), w.fake.get_held.notified())
+        .await
+        .expect("the launch did not read the record");
+    let new = format!("tok-rotated-{}", uuid::Uuid::now_v7().simple());
+    d.rotate_token(id.tenant, s.id, SecretValue::new(new.clone()))
+        .await
+        .expect("the rotation");
+    w.fake.get_release.notify_one();
+    let answer = tokio::time::timeout(Duration::from_secs(10), launch)
+        .await
+        .expect("the launch did not end")
+        .unwrap()
+        .expect("the launch after a rotation in the same process");
+    let answer: serde_json::Value = serde_json::from_slice(&answer).unwrap();
+    assert_eq!(answer["token"], serde_json::json!(new));
+    d.stop(id.tenant, s.id).await.unwrap();
+}
+
 /// S-91: the running instances' log rings of one process stay within the live budget and each
 /// tenant's share as lines arrive; the sweep brings the total under the budget by taking from
 /// the tenant with the most bytes, so a quiet tenant keeps its lines.

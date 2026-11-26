@@ -36,6 +36,12 @@ pub const EXIT_NOT_STARTED: i32 = 127;
 /// The longest line the supervisor lets out (the drivers' cap): a longer one is cut by the
 /// redactor before its check.
 pub const MAX_LINE_BYTES: usize = 16 * 1024;
+/// The most entries of [`Launch::redact`]: the secret limit plus the kept tokens, the same
+/// allowance as the check of all values together. A spec has at most `MAX_SECRET_VALUES` values
+/// (its current token among them); after rotations the driver adds up to `MAX_KEPT_TOKENS - 1`
+/// earlier tokens, which stay valid until they expire, so a lower cap would leave one out (Kimi
+/// re-check of I6-20 in run 16, defect 3).
+pub const MAX_REDACT: usize = MAX_SECRET_VALUES + MAX_KEPT_TOKENS;
 /// The largest launch answer the supervisor reads (values, tokens and the command, as JSON).
 pub const MAX_LAUNCH_BYTES: usize = 2 * 1024 * 1024;
 /// The most arguments of the app's command, and their bytes in all.
@@ -140,7 +146,8 @@ impl Launch {
 
     /// The checks before anything starts: the version, a command, environment names, and the
     /// redactor's limits (`ruum-core` `runtime::redact`: at most 256 values, 16 KiB each and
-    /// 256 KiB in all, at most 16 tokens). `Err` names the rule, never a value.
+    /// 256 KiB in all, plus at most 16 tokens; [`MAX_REDACT`] entries to redact). `Err` names
+    /// the rule, never a value.
     pub fn check(&self) -> Result<(), String> {
         if self.v != LAUNCH_VERSION {
             return Err(format!(
@@ -172,7 +179,7 @@ impl Launch {
         for v in self.redact.iter().chain(self.token.iter()) {
             value_ok(v)?;
         }
-        if self.redact.len() > MAX_SECRET_VALUES {
+        if self.redact.len() > MAX_REDACT {
             return Err("too many values to redact".to_owned());
         }
         let values = self.values();
@@ -257,14 +264,39 @@ mod tests {
         l.env[0].1 = "x".repeat(MAX_SECRET_VALUE_BYTES + 1);
         assert!(l.check().is_err());
         let mut l = launch();
-        l.redact = (0..=MAX_SECRET_VALUES).map(|i| format!("v{i}")).collect();
-        assert!(l.check().is_err());
+        l.redact = (0..=MAX_REDACT).map(|i| format!("v{i}")).collect();
+        assert!(l.check().is_err(), "more entries to redact than the cap");
+        let mut l = launch();
+        l.redact = (0..MAX_REDACT).map(|i| format!("v{i}")).collect();
+        assert!(
+            l.check().is_err(),
+            "more values together than the secret limit and the tokens"
+        );
         let mut l = launch();
         l.pids_limit = Some(3);
         assert!(l.check().is_err());
         let mut l = launch();
         l.argv.push("a\0b".into());
         assert!(l.check().is_err());
+    }
+
+    /// The largest valid spec (255 previous values and its token) after 15 rotations: every
+    /// earlier token fits (Kimi re-check of I6-20 in run 16, defect 3).
+    #[test]
+    fn the_largest_spec_with_every_kept_token_passes() {
+        let l = Launch {
+            v: LAUNCH_VERSION,
+            argv: vec!["/app".into()],
+            env: Vec::new(),
+            redact: (0..MAX_SECRET_VALUES - 1)
+                .map(|i| format!("previous-{i}"))
+                .chain((0..MAX_KEPT_TOKENS - 1).map(|i| format!("earlier-token-{i}")))
+                .collect(),
+            token: Some("current-token".into()),
+            pids_limit: None,
+            token_poll_secs: None,
+        };
+        assert_eq!(l.check(), Ok(()));
     }
 
     #[test]

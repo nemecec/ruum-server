@@ -39,6 +39,11 @@ futures.workspace = true
 http-body-util.workspace = true
 # The drop reasons' snake_case names in OTLP partial-success messages.
 serde_json.workspace = true
+# The supervisor listener's own connections (Kimi re-check of I6-20 in run 16, defect 4):
+# hyper's HTTP/1 connections with a header read timeout, as `ruum-runtime-api` serves its API.
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio", "service"] }
+tower.workspace = true
 
 [dev-dependencies]
 # The telemetry receiver tests (card O-1b): HTTP clients from a chosen loopback address.
@@ -46,6 +51,5 @@ reqwest.workspace = true
 # `#[sqlx::test]` (one database per test) needs the `macros` feature. No `query!` macros are used.
 sqlx = { workspace = true, features = ["macros"] }
 serde_json.workspace = true
-tower.workspace = true
 # Deployment IDs in the static bucket test (decision 0008-4).
 uuid.workspace = true

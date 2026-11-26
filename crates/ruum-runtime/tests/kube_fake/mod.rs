@@ -146,6 +146,18 @@ pub struct Fake {
     /// RuntimeClass admission plugin writes it into a pod without one and refuses a pod with
     /// another (review of I6-20, required change 1).
     pub runtime_class_overhead: Mutex<BTreeMap<String, String>>,
+    /// A held read of one ConfigMap (T-85): set by [`Fake::hold_config_map_get`].
+    hold_get: Mutex<Option<HoldGet>>,
+    /// Told when the held read has its answer (from before any later write).
+    pub get_held: Notify,
+    /// Lets the held read answer.
+    pub get_release: Notify,
+}
+
+/// A ConfigMap read to hold: the name, and how many reads of it pass first.
+struct HoldGet {
+    name: String,
+    skip: u32,
 }
 
 /// The `overhead.podFixed` of staging's RuntimeClass `gvisor` (`k8s/manifests/runtimeclass.yaml`).
@@ -303,6 +315,9 @@ impl Fake {
             log_not_ready_once: AtomicBool::new(false),
             gc_delay_ms: AtomicU64::new(0),
             runtime_class_overhead: Mutex::new(staging_runtime_class_overhead()),
+            hold_get: Mutex::new(None),
+            get_held: Notify::new(),
+            get_release: Notify::new(),
         });
         let app = Router::new()
             .route(
@@ -329,6 +344,16 @@ impl Fake {
             axum::serve(listener, app).await.unwrap();
         });
         (fake, url)
+    }
+
+    /// The read of the ConfigMap `name` after `skip` more reads of it takes its answer, then
+    /// waits (after [`Fake::get_held`]) until [`Fake::get_release`]: a reader paused between its
+    /// read and its use while another writer goes on (T-85).
+    pub fn hold_config_map_get(&self, name: &str, skip: u32) {
+        *self.hold_get.lock().unwrap() = Some(HoldGet {
+            name: name.to_owned(),
+            skip,
+        });
     }
 
     /// Makes an image known to the registry.
@@ -963,13 +988,33 @@ async fn object_get(
     if let Err(r) = f.allow(&headers, &ns, "get", &kind) {
         return r;
     }
-    let key = (ns, name);
-    let o = f.objs.lock().unwrap();
-    let v = match kind.as_str() {
-        "pods" => o.pods.get(&key).map(|p| p.obj.clone()),
-        "configmaps" => o.cms.get(&key).cloned(),
-        _ => o.secrets.get(&key).cloned(),
+    let hold = kind == "configmaps" && {
+        let mut h = f.hold_get.lock().unwrap();
+        match h.as_mut() {
+            Some(x) if x.name == name && x.skip > 0 => {
+                x.skip -= 1;
+                false
+            }
+            Some(x) if x.name == name => {
+                *h = None;
+                true
+            }
+            _ => false,
+        }
     };
+    let key = (ns, name);
+    let v = {
+        let o = f.objs.lock().unwrap();
+        match kind.as_str() {
+            "pods" => o.pods.get(&key).map(|p| p.obj.clone()),
+            "configmaps" => o.cms.get(&key).cloned(),
+            _ => o.secrets.get(&key).cloned(),
+        }
+    };
+    if hold {
+        f.get_held.notify_one();
+        f.get_release.notified().await;
+    }
     match v {
         Some(v) => axum::Json(v).into_response(),
         None => status(StatusCode::NOT_FOUND, "NotFound"),

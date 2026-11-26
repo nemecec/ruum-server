@@ -967,7 +967,9 @@ impl Inner {
         fresh: Option<&Sealed>,
         change: impl Fn(&Record, &mut Sealed) -> bool,
     ) -> Result<(), RuntimeError> {
+        let mut stale = false;
         for _ in 0..SEAL_TRIES {
+            stale = false;
             let (mut rec, rv, uid) = self.record_with_uid(id).await?;
             let mut s = match (rec.sealed.is_some(), fresh) {
                 (true, _) => self
@@ -983,12 +985,13 @@ impl Inner {
                     });
                 }
             };
-            // A seal older than one this process saw was put back: never build on it (Kimi review
-            // of I6-20, finding 2).
+            // A seal older than one this process saw: never build on it (Kimi review of I6-20,
+            // finding 2). It can be a read from before another write of this process (a launch,
+            // a rotation, a new run) that the generation check saw first: read again (T-85).
+            // Only a seal that stays older over every try was put back.
             if rec.sealed.is_some() && !self.fresh_gen(id, s.generation) {
-                return Err(RuntimeError::Internal {
-                    reason: "an older seal of the instance record was put back".to_owned(),
-                });
+                stale = true;
+                continue;
             }
             if !change(&rec, &mut s) {
                 return Err(RuntimeError::Unavailable {
@@ -1005,6 +1008,11 @@ impl Inner {
                 self.fresh_gen(id, s.generation);
                 return Ok(());
             }
+        }
+        if stale {
+            return Err(RuntimeError::Internal {
+                reason: "an older seal of the instance record was put back".to_owned(),
+            });
         }
         Err(RuntimeError::Unavailable {
             reason: "the instance record changes too often".to_owned(),
@@ -1794,23 +1802,35 @@ impl Inner {
         if !ips.iter().any(|ip| canonical(*ip) == peer) {
             return Err(refuse("the request does not come from the pod's address"));
         }
-        let (rec, rv, rec_uid) = match self.record_with_uid(id).await {
-            Ok(r) => r,
-            Err(RuntimeError::NotFound { .. }) => return Err(refuse("the instance has no record")),
-            Err(_) => return Err(not_ready("the record cannot be read")),
+        // A seal older than one this process saw can be a read from before another write of
+        // this process (a rotation, a new run): read again (T-85). Only a seal that stays older
+        // over every try was put back.
+        let mut tries = 0;
+        let (rec, rv, rec_uid, s) = loop {
+            let (rec, rv, rec_uid) = match self.record_with_uid(id).await {
+                Ok(r) => r,
+                Err(RuntimeError::NotFound { .. }) => {
+                    return Err(refuse("the instance has no record"));
+                }
+                Err(_) => return Err(not_ready("the record cannot be read")),
+            };
+            if rec.instance != id {
+                return Err(refuse("the record is another instance's"));
+            }
+            if rec.sealed.is_none() {
+                return Err(not_ready("the record is not sealed yet"));
+            }
+            let s = self
+                .unsealed(&rec, &rec_uid)
+                .ok_or_else(|| refuse("the seal does not open or does not match the record"))?;
+            if self.fresh_gen(id, s.generation) {
+                break (rec, rv, rec_uid, s);
+            }
+            tries += 1;
+            if tries >= SEAL_TRIES {
+                return Err(refuse("an older seal was put back"));
+            }
         };
-        if rec.instance != id {
-            return Err(refuse("the record is another instance's"));
-        }
-        if rec.sealed.is_none() {
-            return Err(not_ready("the record is not sealed yet"));
-        }
-        let s = self
-            .unsealed(&rec, &rec_uid)
-            .ok_or_else(|| refuse("the seal does not open or does not match the record"))?;
-        if !self.fresh_gen(id, s.generation) {
-            return Err(refuse("an older seal was put back"));
-        }
         if s.pod_uid.as_deref() != Some(pod_uid) {
             // The record's run counter names this pod's run, whose seal comes right after the
             // pod: wait. (A writer of the record can make that so for a pod of its own; it then
@@ -2302,7 +2322,7 @@ impl RuntimeDriver for KubeDriver {
             v: LAUNCH_VERSION,
             argv: fresh.argv.clone(),
             env: fresh.env.clone(),
-            redact: fresh.previous.clone(),
+            redact: launch_redact(&fresh),
             token: Some(token.clone()),
             pids_limit: inner.cfg.pids_limit,
             token_poll_secs: Some(TOKEN_POLL_SECS),
@@ -2671,22 +2691,37 @@ impl RuntimeDriver for KubeDriver {
 }
 
 /// The values a launch answer redacts besides the secret values and the current token: the
-/// previous values, then the earlier tokens newest first as far as the supervisor's limits allow
-/// (`Launch::check`: at most `MAX_SECRET_VALUES` values to redact, and the bytes of the secret
-/// set plus the kept tokens). A token left out is one the driver's own redactor still has.
+/// previous values, then the earlier tokens newest first, each once. A valid spec (at most
+/// `MAX_SECRET_VALUES` values, its token among them) with at most `MAX_KEPT_TOKENS - 1` earlier
+/// tokens always fits the supervisor's limits (`Launch::check`: `MAX_REDACT` entries, the bytes
+/// of the secret set plus the kept tokens), so no earlier token that is still valid is left out
+/// (Kimi re-check of I6-20 in run 16, defect 3). The limits stay as a guard here: a token left
+/// out is one the driver's own redactor still has.
 fn launch_redact(s: &Sealed) -> Vec<String> {
-    use ruum_core::runtime::redact::{
-        MAX_SECRET_TOTAL_BYTES, MAX_SECRET_VALUE_BYTES, MAX_SECRET_VALUES,
-    };
-    let mut out = s.previous.clone();
-    let mut bytes: usize = s.env.iter().map(|(_, v)| v.len()).sum::<usize>()
-        + out.iter().map(String::len).sum::<usize>()
-        + s.token.len();
+    use ruum_core::runtime::redact::{MAX_SECRET_TOTAL_BYTES, MAX_SECRET_VALUE_BYTES};
+    use ruum_supervisor::protocol::MAX_REDACT;
+    let mut seen: std::collections::HashSet<&str> = s
+        .env
+        .iter()
+        .map(|(_, v)| v.as_str())
+        .chain(std::iter::once(s.token.as_str()))
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    for v in &s.previous {
+        if !v.is_empty() && seen.insert(v.as_str()) {
+            out.push(v.clone());
+        }
+    }
+    let mut bytes: usize = seen.iter().map(|v| v.len()).sum();
     let budget = MAX_SECRET_TOTAL_BYTES + MAX_KEPT_TOKENS * MAX_SECRET_VALUE_BYTES;
     for t in s.earlier_tokens.iter().rev() {
-        if out.len() >= MAX_SECRET_VALUES || bytes + t.len() > budget || t.is_empty() {
+        if t.is_empty() || seen.contains(t.as_str()) {
+            continue;
+        }
+        if out.len() >= MAX_REDACT || bytes + t.len() > budget {
             break;
         }
+        seen.insert(t.as_str());
         bytes += t.len();
         out.push(t.clone());
     }
@@ -2728,5 +2763,92 @@ fn static_status(id: InstanceId, s: &StaticInst) -> InstanceStatus {
             limits: s.limits,
         },
         started_at: s.started_at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ruum_core::runtime::redact::MAX_SECRET_VALUES;
+
+    /// The largest valid spec: no secret environment value, 255 previous values and the token.
+    fn largest(token: &str, earlier: &[&str]) -> Sealed {
+        Sealed {
+            generation: 1,
+            digest: "d".into(),
+            argv: vec!["/app".into()],
+            env: Vec::new(),
+            previous: (0..MAX_SECRET_VALUES - 1)
+                .map(|i| format!("previous-{i}"))
+                .collect(),
+            token: token.into(),
+            earlier_tokens: earlier.iter().map(|t| (*t).to_owned()).collect(),
+            run: 1,
+            pod_uid: None,
+            launched: Vec::new(),
+        }
+    }
+
+    fn launch_of(s: &Sealed) -> Launch {
+        Launch {
+            v: LAUNCH_VERSION,
+            argv: s.argv.clone(),
+            env: s.env.clone(),
+            redact: launch_redact(s),
+            token: Some(s.token.clone()),
+            pids_limit: None,
+            token_poll_secs: Some(TOKEN_POLL_SECS),
+        }
+    }
+
+    /// Kimi re-check of I6-20 in run 16, defect 3: the largest valid spec, two rotations, then a
+    /// wake within the first token's lifetime. The launch answer names both earlier tokens (the
+    /// first one was left out at the old cap of 256 entries) and passes the supervisor's checks.
+    #[test]
+    fn a_wake_after_two_rotations_redacts_every_earlier_token() {
+        let s = largest("t2", &["t0", "t1"]);
+        let l = launch_of(&s);
+        assert!(
+            l.redact.iter().any(|v| v == "t0"),
+            "the first token is left out"
+        );
+        assert!(
+            l.redact.iter().any(|v| v == "t1"),
+            "the second token is left out"
+        );
+        assert_eq!(l.check(), Ok(()));
+    }
+
+    /// The same spec with every kept token (15 earlier ones): all of them, and the checks pass.
+    #[test]
+    fn every_kept_token_fits_the_largest_spec() {
+        let earlier: Vec<String> = (0..MAX_KEPT_TOKENS - 1).map(|i| format!("t{i}")).collect();
+        let refs: Vec<&str> = earlier.iter().map(String::as_str).collect();
+        let s = largest("current", &refs);
+        let l = launch_of(&s);
+        for t in &earlier {
+            assert!(l.redact.contains(t), "{t} is left out");
+        }
+        assert_eq!(l.check(), Ok(()));
+    }
+
+    /// A value given twice (a previous value repeated, a token that is a previous value) is
+    /// named once, so repeats never push a valid token out.
+    #[test]
+    fn repeated_values_are_named_once() {
+        let mut s = largest("t2", &["t0", "t1", "previous-3"]);
+        s.previous.extend(s.previous.clone());
+        s.previous.push("t2".into());
+        let l = launch_of(&s);
+        let mut sorted = l.redact.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), l.redact.len(), "a value is named twice");
+        assert!(
+            !l.redact.contains(&"t2".to_owned()),
+            "the token is in the list"
+        );
+        assert!(l.redact.contains(&"t0".to_owned()));
+        assert_eq!(l.check(), Ok(()));
     }
 }
