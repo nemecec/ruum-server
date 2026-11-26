@@ -111,7 +111,10 @@ fn canonical(ip: IpAddr) -> IpAddr {
 /// Serves `app` on `listener` (HTTP/1) with the connection caps until `stop` resolves: a
 /// connection over a cap is closed at once, one without its headers after
 /// [`Caps::header_timeout`], and every one after [`Caps::lifetime`]. The TCP peer of each
-/// request goes to the handlers as `ConnectInfo`.
+/// request goes to the handlers as `ConnectInfo`. After `stop` no connection is accepted, and
+/// the open ones may finish (at most [`Caps::lifetime`]) before this returns: a launch answer
+/// is sent after its pod is sealed as launched, so it must not be cut off (the shutdown drain,
+/// `shutdown.rs`, bounds the wait).
 pub async fn serve(
     listener: tokio::net::TcpListener,
     app: Router,
@@ -123,16 +126,18 @@ pub async fn serve(
     let peers: Arc<Peers> = Arc::default();
     tokio::pin!(stop);
     loop {
-        let (stream, peer) = tokio::select! {
-            () = &mut stop => return Ok(()),
-            r = listener.accept() => match r {
-                Ok(x) => x,
-                Err(e) => {
-                    tracing::warn!(error = %e, "supervisor listener: accept failed");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue;
-                }
-            },
+        let accepted = tokio::select! {
+            () = &mut stop => None,
+            r = listener.accept() => Some(r),
+        };
+        let (stream, peer) = match accepted {
+            None => break,
+            Some(Ok(x)) => x,
+            Some(Err(e)) => {
+                tracing::warn!(error = %e, "supervisor listener: accept failed");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
         };
         let Ok(permit) = all.clone().try_acquire_owned() else {
             tracing::warn!("supervisor listener: a connection was closed at the connection cap");
@@ -162,6 +167,11 @@ pub async fn serve(
             let _ = tokio::time::timeout(caps.lifetime, conn).await;
         });
     }
+    drop(listener);
+    // Every open connection holds a permit: all of them back means all are closed.
+    let n = u32::try_from(caps.connections).unwrap_or(u32::MAX);
+    let _ = all.acquire_many(n).await;
+    Ok(())
 }
 
 pub fn router(driver: Arc<KubeDriver>) -> Router {
@@ -335,6 +345,58 @@ mod tests {
         assert!(
             closed_within(&mut s, Duration::from_secs(5)).await,
             "a connection without its headers stays open"
+        );
+    }
+
+    /// A request in flight at the stop gets its answer, and `serve` returns after it (a launch
+    /// answer is sent after the pod is sealed as launched). No connection is accepted after the
+    /// stop.
+    #[tokio::test]
+    async fn a_request_in_flight_at_the_stop_gets_its_answer() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let entered = Arc::new(Mutex::new(Some(entered_tx)));
+        let app = Router::new().route(
+            "/v1/token",
+            post(move || {
+                let entered = entered.clone();
+                async move {
+                    if let Some(tx) = entered.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    "answer"
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve(l, app, Caps::default(), async move {
+            let _ = stop_rx.await;
+        }));
+        let client = tokio::spawn(post_token(addr));
+        entered_rx.await.unwrap();
+        stop_tx.send(()).unwrap();
+        // The handler takes 500 ms: `serve` waits for it (the process would exit after it).
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !server.is_finished(),
+            "serve returned with a request in flight"
+        );
+        let answer = tokio::time::timeout(Duration::from_secs(5), client)
+            .await
+            .expect("no answer")
+            .unwrap();
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(answer.ends_with("answer"), "{answer}");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("serve did not return after the stop")
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::net::TcpStream::connect(addr).await.is_err(),
+            "a connection is accepted after the stop"
         );
     }
 
