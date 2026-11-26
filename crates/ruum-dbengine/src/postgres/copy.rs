@@ -719,16 +719,27 @@ async fn change_data(
     let result = async {
         run(&mut conn, "begin", "begin".to_string()).await?;
         let parked = park_tenant_code(&mut conn).await?;
+        if !matches!(data, Data::Keep) {
+            refuse_foreign_data(&mut conn).await?;
+        }
         let out = match data {
             Data::Keep => MaskOutcome::default(),
             Data::SchemaOnly => {
                 empty_tables(&mut conn).await?;
+                clear_statistics(&mut conn).await?;
                 MaskOutcome::default()
             }
             Data::Masked(plan, _) => mask_columns(&mut conn, plan).await?,
         };
+        if !matches!(data, Data::Keep) {
+            scrub_outside_the_tables(&mut conn).await?;
+        }
         for sql in parked {
             run(&mut conn, "put the tenant code back", sql).await?;
+        }
+        #[cfg(test)]
+        if let Some(sql) = step_2_probe::take(new.node_id) {
+            run(&mut conn, "run the test probe of step 2", sql).await?;
         }
         run(&mut conn, "commit", "commit".to_string()).await?;
         Ok(out)
@@ -822,6 +833,415 @@ async fn empty_tables(conn: &mut PgConnection) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// Sets the `search_path` of the step-2 transaction to `pg_catalog, pg_temp` and returns the
+/// one it had, for [`leave_catalog_path`]. The statements of the copy's own cleanup
+/// ([`refuse_foreign_data`], [`clear_statistics`], [`scrub_outside_the_tables`]) then resolve
+/// no name, function or operator in `public`: an operator of the tenant that matches the
+/// argument types better than a built-in one would otherwise run as the owner, while a masked
+/// copy's owner may still call the `ruum_copy` pseudonym functions of the SOURCE key.
+async fn enter_catalog_path(conn: &mut PgConnection) -> Result<String, EngineError> {
+    let old: String = sqlx::query_scalar("select pg_catalog.current_setting('search_path')")
+        .persistent(false)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| internal("read the search path", e))?;
+    run(
+        conn,
+        "search only pg_catalog",
+        "set local search_path = pg_catalog, pg_temp".to_string(),
+    )
+    .await?;
+    Ok(old)
+}
+
+/// Puts back the `search_path` that [`enter_catalog_path`] returned.
+async fn leave_catalog_path(conn: &mut PgConnection, old: &str) -> Result<(), EngineError> {
+    sqlx::query("select pg_catalog.set_config('search_path', $1, true)")
+        .persistent(false)
+        .bind(old)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| internal("put the search path back", e))?;
+    Ok(())
+}
+
+/// Refuses a `masked` or `schema_only` copy that holds a foreign table or a foreign server
+/// (Kimi review of D-3b on `main`, finding 3). A foreign table reads rows outside the
+/// database: the catalog gives it no columns to classify, so no plan masks it, and the copy's
+/// app roles get `SELECT` on it. A server (with its user mappings) lets a migration of the copy
+/// make such a table again. Neither belongs to the copy alone (a server's options and mappings
+/// reach the same remote data as the source), so the copy changes neither and is refused:
+/// copy with `full` data, or drop them first.
+async fn refuse_foreign_data(conn: &mut PgConnection) -> Result<(), EngineError> {
+    let old = enter_catalog_path(conn).await?;
+    let names: String = sqlx::query_scalar(
+        "select coalesce(string_agg(x, ', ' order by x), '') from (
+           select format('foreign table %s', f.ftrelid::regclass) as x
+             from pg_foreign_table f
+           union all
+           select format('foreign server %I', s.srvname) from pg_foreign_server s) o",
+    )
+    .persistent(false)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| internal("list the foreign tables and servers", e))?;
+    leave_catalog_path(conn, &old).await?;
+    if names.is_empty() {
+        return Ok(());
+    }
+    Err(EngineError::Unsupported(format!(
+        "a masked or schema_only copy holds no foreign data, and this database has {names}: \
+         rows outside the database have no class; drop them first or copy with full data"
+    )))
+}
+
+/// The statistics of a `schema_only` copy (Kimi review of D-3b on `main`, finding 5). A
+/// `TEMPLATE` copy keeps the source's `pg_statistic` and `pg_statistic_ext_data` rows, and
+/// `pg_stats` shows their `most_common_vals` and `histogram_bounds` to every role with `SELECT`
+/// on the table (the copy's app roles, its `secret_read`). `TRUNCATE` keeps them, and
+/// `ANALYZE` of a table with no row keeps them too. So, as the copy's owner, on the empty
+/// tables:
+///
+/// - each extended statistics object is dropped and made again (with its statistics target);
+/// - each column with statistics goes through `ALTER COLUMN TYPE` to its own type, which drops
+///   its `pg_statistic` rows and builds its indexes again (so the statistics of index
+///   expressions on it go too); the views that read it, and every materialized view, are
+///   dropped first and made again after ([`dependent_views`]), unpopulated;
+/// - an index that still has statistics and backs no constraint is dropped and made again.
+///
+/// The tables are empty, so nothing of this evaluates tenant code on a row. A column that a
+/// policy, a generated column, a trigger's `WHEN`, a table's rule or a partition key reads
+/// cannot change its type: then, and when any statistic is left at the end, the copy is
+/// refused (`Unsupported`, with the names). A schema_only copy holds no value of the source in
+/// its statistics, or it is not made.
+async fn clear_statistics(conn: &mut PgConnection) -> Result<(), EngineError> {
+    let old = enter_catalog_path(conn).await?;
+    // 1. Extended statistics (`pg_statistic_ext_data` is readable only by a superuser, so
+    // every object of the own schema is made again).
+    let objects = sqlx::query(
+        "select format('drop statistics %I.%I', n.nspname, x.stxname),
+                pg_get_statisticsobjdef(x.oid),
+                case when x.stxstattarget is not null and x.stxstattarget >= 0
+                     then format('alter statistics %I.%I set statistics %s', n.nspname, x.stxname,
+                                 x.stxstattarget) end
+           from pg_statistic_ext x
+           join pg_namespace n on n.oid = x.stxnamespace
+          where n.nspname = 'public'
+          order by x.oid",
+    )
+    .persistent(false)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| internal("list the extended statistics", e))?;
+    for row in objects {
+        let (drop, make, target): (String, String, Option<String>) =
+            (row.get(0), row.get(1), row.get(2));
+        run(conn, "drop an extended statistics object", drop).await?;
+        run(conn, "make an extended statistics object again", make).await?;
+        if let Some(target) = target {
+            run(conn, "set the statistics target again", target).await?;
+        }
+    }
+    // 2. Columns with statistics (of tables; an inherited column goes with its parent's).
+    let columns = sqlx::query(
+        "select distinct c.relname::text, a.attname::text,
+                format_type(a.atttypid, a.atttypmod)
+                || case when a.attcollation <> 0 then ' collate ' || a.attcollation::regcollation::text
+                        else '' end,
+                a.attstattarget::int4
+           from pg_stats s
+           join pg_class c on c.relname = s.tablename and c.relnamespace = 'public'::regnamespace
+           join pg_attribute a on a.attrelid = c.oid and a.attname = s.attname
+          where s.schemaname = 'public' and c.relkind in ('r', 'p')
+            and a.attnum > 0 and not a.attisdropped and a.attinhcount = 0
+          order by 1, 2",
+    )
+    .persistent(false)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| internal("list the columns with statistics", e))?;
+    let mut found: Vec<(ColumnRef, String, Option<i32>)> = Vec::with_capacity(columns.len());
+    for row in columns {
+        found.push((
+            ColumnRef {
+                schema: "public".into(),
+                table: row.get(0),
+                column: row.get(1),
+            },
+            row.get(2),
+            row.get(3),
+        ));
+    }
+    let plan = MaskPlan {
+        columns: found
+            .iter()
+            .map(|(c, _, _)| (c.clone(), MaskAs::Null))
+            .collect(),
+        planned_from: None,
+    };
+    let views = dependent_views(conn, &plan).await?;
+    for v in views.iter().rev() {
+        run(
+            conn,
+            "drop a view that reads a column with statistics",
+            format!("drop {} {}", v.kind_word(), v.name),
+        )
+        .await
+        .map_err(|e| v.refusal(e))?;
+    }
+    for (column, own_type, target) in &found {
+        let (table, col) = (
+            format!("public.{}", ident(&column.table)),
+            ident(&column.column),
+        );
+        // The column's statistics target stays as it was.
+        let target = match target {
+            Some(n) if *n >= 0 => {
+                format!(";\nalter table {table} alter column {col} set statistics {n}")
+            }
+            _ => String::new(),
+        };
+        run(
+            conn,
+            "clear the statistics of a column",
+            format!("alter table {table} alter column {col} type {own_type}{target}"),
+        )
+        .await
+        .map_err(|e| {
+            EngineError::Unsupported(format!(
+                "a schema_only copy clears the statistics of {}.{}, and cannot: {e}",
+                column.table, column.column
+            ))
+        })?;
+    }
+    for v in &views {
+        v.make_again(conn).await?;
+    }
+    // 3. Indexes that still have statistics (an expression over a column with no statistics
+    // of its own) and back no constraint.
+    let indexes = sqlx::query(
+        "select distinct format('drop index %s', i.indexrelid::regclass), pg_get_indexdef(i.indexrelid)
+           from pg_stats s
+           join pg_class x on x.relname = s.tablename and x.relnamespace = 'public'::regnamespace
+           join pg_index i on i.indexrelid = x.oid
+          where s.schemaname = 'public' and x.relkind = 'i'
+            and not exists (select 1 from pg_constraint k where k.conindid = i.indexrelid)",
+    )
+    .persistent(false)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| internal("list the indexes with statistics", e))?;
+    for row in indexes {
+        let (drop, make): (String, String) = (row.get(0), row.get(1));
+        run(conn, "drop an index with statistics", drop).await?;
+        run(conn, "make an index again", make).await?;
+    }
+    // 4. Nothing is left, or the copy is refused.
+    let left: String = sqlx::query_scalar(
+        "select coalesce(string_agg(distinct x, ', '), '') from (
+           select format('%I.%I', s.tablename, s.attname) as x from pg_stats s
+            where s.schemaname = 'public'
+           union all
+           select format('statistics %I', e.statistics_name) from pg_stats_ext e
+            where e.statistics_schemaname = 'public'
+              and (e.n_distinct is not null or e.dependencies is not null
+                   or e.most_common_vals is not null)
+           union all
+           select format('statistics %I', e.statistics_name) from pg_stats_ext_exprs e
+            where e.statistics_schemaname = 'public'
+              and (e.most_common_vals is not null or e.histogram_bounds is not null)) o",
+    )
+    .persistent(false)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| internal("check the statistics", e))?;
+    leave_catalog_path(conn, &old).await?;
+    if left.is_empty() {
+        return Ok(());
+    }
+    Err(EngineError::Unsupported(format!(
+        "a schema_only copy keeps no statistics of the source, and cannot clear these: {left}"
+    )))
+}
+
+/// What a `masked` or `schema_only` copy clears outside its tables' rows (Kimi review of
+/// D-3b on `main`, findings 1, 2 and 4), as the copy's owner at the end of step 2:
+///
+/// - **large objects**: every one is unlinked. A `TEMPLATE` copy holds them byte for byte, and
+///   no plan masks them. A large object that the owner cannot unlink fails the copy.
+/// - **sequences**: the state of every sequence (`last_value`, `is_called`) is the source's
+///   and tells values that the masking removed (a personal ID column's highest value). Each one
+///   is restarted; one owned by an integer column (`serial`, identity) is then set to the
+///   highest value of that column in the copy, so new rows of the copy get new values. A
+///   masked personal column is `text` in the copy, and a masked secret column holds no value,
+///   so their sequences stay restarted.
+/// - **comments**: every comment on an object of the tenant is removed. A comment is free text
+///   that no class covers. One that the owner cannot remove fails the copy.
+async fn scrub_outside_the_tables(conn: &mut PgConnection) -> Result<(), EngineError> {
+    let old = enter_catalog_path(conn).await?;
+    // Large objects.
+    run(
+        conn,
+        "unlink the large objects",
+        "select count(lo_unlink(m.oid)) from pg_largeobject_metadata m".to_string(),
+    )
+    .await?;
+    let left: i64 = sqlx::query_scalar("select count(*) from pg_largeobject_metadata")
+        .persistent(false)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| internal("count the large objects", e))?;
+    if left > 0 {
+        return Err(EngineError::Internal(format!(
+            "{left} large objects of the copy are left after the unlink"
+        )));
+    }
+    // Sequences. int2, int4 and int8 are the OIDs 21, 23 and 20.
+    let sequences = sqlx::query(
+        "select format('alter sequence %s restart', s.seqrelid::regclass),
+                case when a.attnum is not null and a.atttypid = any ('{20,21,23}'::oid[])
+                     then format('select setval(%L::regclass, m) from (select max(%I) as m from %s) x \
+                                   where m is not null',
+                                 s.seqrelid::regclass::text, a.attname, a.attrelid::regclass) end
+           from pg_sequence s
+           join pg_class c on c.oid = s.seqrelid
+           join pg_namespace n on n.oid = c.relnamespace
+           left join pg_depend d
+             on d.classid = 'pg_class'::regclass and d.objid = s.seqrelid
+            and d.refclassid = 'pg_class'::regclass and d.refobjsubid > 0
+            and d.deptype in ('a', 'i')
+           left join pg_attribute a
+             on a.attrelid = d.refobjid and a.attnum = d.refobjsubid and not a.attisdropped
+          where n.nspname !~ '^(ruum_|pg_)' and n.nspname <> 'information_schema'
+          order by s.seqrelid",
+    )
+    .persistent(false)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| internal("list the sequences", e))?;
+    for row in sequences {
+        let (restart, highest): (String, Option<String>) = (row.get(0), row.get(1));
+        run(conn, "restart a sequence", restart).await?;
+        if let Some(highest) = highest {
+            run(conn, "set a sequence to the copy's highest value", highest).await?;
+        }
+    }
+    // Comments on the owner's objects.
+    let comments = sqlx::query(
+        "with me as (select oid from pg_roles where rolname = current_user)
+         select o.s from (
+           select format('comment on %s %s is null',
+                    case c.relkind when 'v' then 'view' when 'm' then 'materialized view'
+                      when 'f' then 'foreign table' when 'i' then 'index' when 'I' then 'index'
+                      when 'S' then 'sequence' when 'c' then 'type' else 'table' end,
+                    c.oid::regclass) as s, c.relowner as owner
+             from pg_description d join pg_class c on c.oid = d.objoid
+            where d.classoid = 'pg_class'::regclass and d.objsubid = 0
+           union all
+           select format('comment on column %s.%I is null', c.oid::regclass, a.attname), c.relowner
+             from pg_description d join pg_class c on c.oid = d.objoid
+             join pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid
+            where d.classoid = 'pg_class'::regclass and d.objsubid > 0
+           union all
+           select format('comment on %s %s is null',
+                    case p.prokind when 'p' then 'procedure' when 'a' then 'aggregate'
+                      else 'function' end, p.oid::regprocedure), p.proowner
+             from pg_description d join pg_proc p on p.oid = d.objoid
+            where d.classoid = 'pg_proc'::regclass
+           union all
+           select format('comment on %s %s is null',
+                    case t.typtype when 'd' then 'domain' else 'type' end, t.oid::regtype), t.typowner
+             from pg_description d join pg_type t on t.oid = d.objoid
+            where d.classoid = 'pg_type'::regclass
+           union all
+           select case when k.conrelid <> 0
+                       then format('comment on constraint %I on %s is null', k.conname, k.conrelid::regclass)
+                       else format('comment on constraint %I on domain %s is null', k.conname,
+                                   k.contypid::regtype) end,
+                  coalesce((select r.relowner from pg_class r where r.oid = k.conrelid),
+                           (select t.typowner from pg_type t where t.oid = k.contypid))
+             from pg_description d join pg_constraint k on k.oid = d.objoid
+            where d.classoid = 'pg_constraint'::regclass
+           union all
+           select format('comment on trigger %I on %s is null', g.tgname, g.tgrelid::regclass),
+                  (select r.relowner from pg_class r where r.oid = g.tgrelid)
+             from pg_description d join pg_trigger g on g.oid = d.objoid
+            where d.classoid = 'pg_trigger'::regclass
+           union all
+           select format('comment on policy %I on %s is null', y.polname, y.polrelid::regclass),
+                  (select r.relowner from pg_class r where r.oid = y.polrelid)
+             from pg_description d join pg_policy y on y.oid = d.objoid
+            where d.classoid = 'pg_policy'::regclass
+           union all
+           select format('comment on rule %I on %s is null', w.rulename, w.ev_class::regclass),
+                  (select r.relowner from pg_class r where r.oid = w.ev_class)
+             from pg_description d join pg_rewrite w on w.oid = d.objoid
+            where d.classoid = 'pg_rewrite'::regclass
+           union all
+           select format('comment on statistics %I.%I is null', n.nspname, x.stxname), x.stxowner
+             from pg_description d join pg_statistic_ext x on x.oid = d.objoid
+             join pg_namespace n on n.oid = x.stxnamespace
+            where d.classoid = 'pg_statistic_ext'::regclass) o
+          where o.owner = (select oid from me)
+          order by 1",
+    )
+    .persistent(false)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| internal("list the comments", e))?;
+    for row in comments {
+        run(conn, "remove a comment", row.get(0)).await?;
+    }
+    // Any comment left on an object of the tenant (not a built-in object, not an extension or
+    // a member of one, not in a Ruum schema) fails the copy.
+    let left: String = sqlx::query_scalar(
+        "select coalesce(string_agg(x, ', ' order by x), '') from (
+           select pg_describe_object(d.classoid, d.objoid, d.objsubid) as x
+             from pg_description d, pg_identify_object(d.classoid, d.objoid, d.objsubid) i
+            where d.objoid >= 16384::oid
+              and d.classoid <> 'pg_extension'::regclass
+              and not exists (select 1 from pg_depend e
+                               where e.classid = d.classoid and e.objid = d.objoid
+                                 and e.deptype = 'e')
+              and coalesce(i.schema, i.name) !~ '^ruum_') o",
+    )
+    .persistent(false)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| internal("check the comments", e))?;
+    leave_catalog_path(conn, &old).await?;
+    if !left.is_empty() {
+        return Err(EngineError::Unsupported(format!(
+            "a masked or schema_only copy keeps no comment (no class covers their text), and \
+             cannot remove these: {left}"
+        )));
+    }
+    Ok(())
+}
+
+/// A test-only probe: one statement that step 2 runs as the copy's owner, in its own
+/// transaction, after the data change and before the commit (so before step 3 drops the
+/// `ruum_copy` entry points). Keyed by the copy's node ID, so parallel tests do not share one
+/// (backlog 2026-11-26 T-90).
+#[cfg(test)]
+pub(crate) mod step_2_probe {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    use uuid::Uuid;
+
+    static PROBES: LazyLock<Mutex<HashMap<Uuid, String>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Step 2 of the copy with node ID `node` runs `sql`.
+    pub(crate) fn set(node: Uuid, sql: &str) {
+        PROBES.lock().unwrap().insert(node, sql.to_string());
+    }
+
+    pub(super) fn take(node: Uuid) -> Option<String> {
+        PROBES.lock().unwrap().remove(&node)
+    }
+}
+
 /// Masks the columns of the plan in a copy (decision 0004-25, 0004-17): a `personal` column
 /// becomes `text` holding its pseudonym under the key installed now (the source's), a `secret`
 /// column keeps its type and holds `NULL` for a non-empty value (its `NOT NULL` dropped).
@@ -838,9 +1258,9 @@ async fn empty_tables(conn: &mut PgConnection) -> Result<(), EngineError> {
 /// `ALTER COLUMN TYPE`, which drops its `pg_statistic` rows and empties the extended statistics
 /// on it, also for a statistics target of 0 and for a table with no row; then the masked tables
 /// are analyzed again (in step 4, [`finish_masking`]), so the statistics hold values of the masked rows, not of the source
-/// (review FU-1 required changes 1 and 2, second review required change 1). Limits: a
-/// `schema_only` copy masks no column, so it keeps the source's statistics; a column that a
-/// policy, a generated column or a trigger's `WHEN` reads, and a column that a partition or an
+/// (review FU-1 required changes 1 and 2, second review required change 1). A `schema_only`
+/// copy clears its statistics in [`clear_statistics`]. Limits: a column that a policy, a
+/// generated column or a trigger's `WHEN` reads, and a column that a partition or an
 /// inheritance child inherits, cannot change its type, so such a secret column fails the copy,
 /// as a personal column already did.
 async fn mask_columns(
@@ -848,9 +1268,9 @@ async fn mask_columns(
     plan: &MaskPlan,
 ) -> Result<MaskOutcome, EngineError> {
     check_planned_from(conn, plan).await?;
-    if plan.columns.is_empty() {
-        return Ok(MaskOutcome::default());
-    }
+    // No early return for a plan without columns (Kimi review of D-3b on `main`, finding 5):
+    // the materialized views are made again in every masked copy, so none keeps rows of the
+    // source (a stale fill can hold values the source's tables no longer have).
     let types = lens::pseudonym_types(conn).await?;
     // The views and materialized views of the tenant that read a masked column, also through
     // other views: dropped now and made again over the masked tables after (backlog 2026-11-09
@@ -1031,11 +1451,14 @@ async fn mask_columns(
                 // without data (review FU-1 second review, required change 1). `ANALYZE` alone
                 // keeps the source's rows of a column or statistics object whose target is 0,
                 // and of a table with no row; the copy is a `TEMPLATE` copy, so it has them.
+                // The default goes too (Kimi review of D-3b on `main`, finding 1): a secret
+                // default is a real value in the catalog, and new rows would get it.
                 run(
                     conn,
                     "mask a secret column",
                     format!(
-                        "alter table {table} alter column {col} drop not null;\n\
+                        "alter table {table} alter column {col} drop default;\n\
+                         alter table {table} alter column {col} drop not null;\n\
                          update {table} set {col} = null where {filled};\n\
                          alter table {table} alter column {col} type {own_type} using {col}"
                     ),
@@ -1566,9 +1989,8 @@ async fn dependent_views(
         .filter(|(c, _)| c.schema == "public")
         .map(|(c, _)| (format!("public.{}", ident(&c.table)), c.column.clone()))
         .unzip();
-    if tables.is_empty() {
-        return Ok(Vec::new());
-    }
+    // No early return without columns: every materialized view of the own schema is in the
+    // list (Kimi review of D-3b on `main`, finding 5).
     let rows = sqlx::query(
         "with recursive start as (
            select a.attrelid as rel, a.attnum as att

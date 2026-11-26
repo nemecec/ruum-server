@@ -108,6 +108,62 @@ pub(crate) fn mask(
 ) -> Result<Vec<String>, EngineError> {
     let catalog = super::conn::catalog(conn)?;
     check_planned_from(&catalog, plan)?;
+    let result = mask_columns(conn, &catalog, plan, source_key);
+    // After the masking: a masked row ID is a pseudonym number then.
+    result.and_then(|left_out| {
+        reset_sequences(conn)?;
+        Ok(left_out)
+    })
+}
+
+/// The `AUTOINCREMENT` counters of a masked copy (Kimi review of D-3b on `main`, finding 4).
+/// The dump carries the source's `sqlite_sequence`, the highest row ID a table ever had,
+/// which tells values that the masking removed (a masked row ID, the IDs of deleted rows).
+/// Each counter becomes the highest row ID of the copy's table (0 when it is empty).
+fn reset_sequences(conn: &Connection) -> Result<(), EngineError> {
+    let has: bool = conn
+        .query_row(
+            "SELECT count(*) > 0 FROM main.sqlite_schema WHERE name = 'sqlite_sequence'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(internal)?;
+    if !has {
+        return Ok(());
+    }
+    let names: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM main.sqlite_sequence")
+            .map_err(internal)?;
+        stmt.query_map([], |r| r.get(0))
+            .map_err(internal)?
+            .collect::<Result<_, _>>()
+            .map_err(internal)?
+    };
+    for name in names {
+        if super::dump::is_ruum_name(&name) {
+            continue;
+        }
+        conn.execute(
+            &format!(
+                "UPDATE main.sqlite_sequence SET seq = coalesce((SELECT max(rowid) FROM main.{}), 0) \
+                 WHERE name = ?1",
+                quote(&name)
+            ),
+            [&name],
+        )
+        .map_err(internal)?;
+    }
+    Ok(())
+}
+
+/// The masking of the columns of `plan` (see [`mask`]).
+fn mask_columns(
+    conn: &Connection,
+    catalog: &Catalog,
+    plan: &MaskPlan,
+    source_key: &PseudonymKey,
+) -> Result<Vec<String>, EngineError> {
     let columns: Vec<_> = plan
         .columns
         .iter()

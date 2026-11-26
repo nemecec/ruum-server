@@ -419,6 +419,71 @@ async fn a_masked_copy_masks_the_rows() {
     );
 }
 
+/// Kimi review of D-3b on `main`, finding 4: the `AUTOINCREMENT` counter of a masked copy is
+/// the highest row ID of the copy, not the source's counter (which tells the IDs of rows that
+/// are gone, or masked).
+#[tokio::test]
+async fn a_masked_copy_keeps_no_autoincrement_counter_of_the_source() {
+    let engine = MemoryEngine::new();
+    let f = Fixture::new(&engine).await;
+    f.migrate("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v text);")
+        .await
+        .unwrap();
+    for sql in [
+        "INSERT INTO t VALUES (1, 'kept'), (424242, 'gone')",
+        "DELETE FROM t WHERE id = 424242",
+    ] {
+        f.run(RoleKind::Owner, StatementMode::Write, sql, vec![])
+            .await
+            .unwrap();
+    }
+    let counter = |db: DatabaseRef, key: PseudonymKey| {
+        let engine = &engine;
+        async move {
+            engine
+                .execute(
+                    &RoleRef::new(db, RoleKind::Owner).unwrap(),
+                    &key,
+                    &StatementRequest {
+                        sql: "SELECT seq FROM sqlite_sequence WHERE name = 't'".into(),
+                        params: vec![],
+                        mode: StatementMode::Read,
+                        timeout: Duration::from_secs(5),
+                        max_rows: 10,
+                        max_bytes: None,
+                    },
+                )
+                .await
+                .unwrap()
+                .rows
+        }
+    };
+    assert_eq!(
+        counter(f.db().clone(), f.key.clone()).await,
+        vec![vec![Value::Int(424242)]],
+        "the source's counter"
+    );
+    let (key, _) = conformance::test_key();
+    let copy = engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &conformance::new_database(f.db().tenant_id),
+            &CopyData::Masked(MaskPlan {
+                columns: vec![],
+                planned_from: None,
+            }),
+            &key,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        counter(copy.database.clone(), key.clone()).await,
+        vec![vec![Value::Int(1)]],
+        "the copy's counter is its highest row ID"
+    );
+}
+
 /// A masked copy whose plan was made from other columns than the source has now is refused
 /// (`NotReady`, the platform tries again), and leaves no database.
 #[tokio::test]

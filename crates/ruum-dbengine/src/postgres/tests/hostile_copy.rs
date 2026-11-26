@@ -666,7 +666,8 @@ async fn dbhost_sessions_search_pg_catalog_only() {
 /// A masked copy of a database whose views read masked columns (backlog 2026-11-09 S-8): a
 /// view over a personal column blocked the `ALTER COLUMN TYPE` of the copy. The copy drops the
 /// views and materialized views that read a masked column (also through another view) and makes
-/// them again over the masked tables, with their options, comments and indexes. A materialized
+/// them again over the masked tables, with their options and indexes (and without comments,
+/// which a masked copy removes everywhere). A materialized
 /// view is filled from the masked tables, so it keeps no value of the source. A view that does
 /// not fit the masked columns (arithmetic on a personal number) refuses the copy with a clear
 /// error, and the source keeps working.
@@ -767,8 +768,8 @@ async fn a_masked_copy_makes_views_over_masked_columns_again() {
         "select (select email from v1) || '|' || (select e from v2) || '|' || \
                 (select age from vb) || '|' || \
                 (select coalesce(token, '-') || ',' || email from mv) || '|' || \
-                obj_description('v1'::regclass, 'pg_class') || ',' || \
-                obj_description('mv'::regclass, 'pg_class') || '|' || \
+                coalesce(obj_description('v1'::regclass, 'pg_class'), '-') || ',' || \
+                coalesce(obj_description('mv'::regclass, 'pg_class'), '-') || '|' || \
                 (select count(*) from pg_index where indrelid = 'mv'::regclass)::text || '|' || \
                 array_to_string((select reloptions from pg_class where oid = 'vb'::regclass), ',') || '|' || \
                 (select count(*) from plain)::text || '|' || \
@@ -791,7 +792,9 @@ async fn a_masked_copy_makes_views_over_masked_columns_again() {
         format!("-,{}", parts[0]),
         "the materialized view holds the masked values, not the source's: {out}"
     );
-    assert_eq!(parts[4], "emails,snapshot", "{out}");
+    // A masked copy removes every comment (Kimi review of D-3b on `main`, finding 1): no class
+    // covers their text.
+    assert_eq!(parts[4], "-,-", "{out}");
     assert_eq!(parts[5], "1", "the index of the materialized view: {out}");
     assert_eq!(parts[6], "security_barrier=true", "{out}");
     assert_eq!(parts[7], "1", "{out}");
@@ -1371,4 +1374,323 @@ async fn a_copy_of_a_database_with_an_event_trigger_is_refused() {
         &db,
         "DROP EVENT TRIGGER ruum_test_evt; DROP SCHEMA ruum_test_su CASCADE;",
     );
+}
+
+/// Kimi review of D-3b on `main`, findings 1, 2 and 4: a `masked` and a `schema_only` copy
+/// hold nothing of the source outside the rows either. The source has a secret default, comments
+/// on a table, a column and a function, a large object, and sequences set to marker values (a
+/// standalone one, one owned by a personal integer column, and the `serial` of a normal `id`).
+/// In both copies there is no large object and no comment, and no sequence holds a marker; in
+/// the masked copy the secret column has no default, and the `serial` of `id` continues after
+/// the copy's highest `id`. A full copy keeps all of it (control).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_masked_or_schema_only_copy_keeps_no_text_object_or_sequence_state_of_the_source() {
+    let Some(engine) = engine().await else { return };
+    let f = Fixture::new(&engine).await;
+    let sync = ClassSync {
+        personal: vec!["pid", "email"],
+        secret: vec!["token"],
+    };
+    engine
+        .apply_migration(
+            f.db(),
+            &f.key,
+            &MigrationRequest {
+                up: "CREATE TABLE people (id serial PRIMARY KEY, pid integer, email text,
+                       token text DEFAULT 'tok_default_marker');
+                     CREATE SEQUENCE pid_seq OWNED BY people.pid;
+                     ALTER TABLE people ALTER COLUMN pid SET DEFAULT nextval('pid_seq');
+                     CREATE SEQUENCE loose;
+                     CREATE FUNCTION f() RETURNS integer LANGUAGE sql IMMUTABLE AS $f$ SELECT 1 $f$;
+                     COMMENT ON TABLE people IS 'tok_comment_table';
+                     COMMENT ON COLUMN people.email IS 'tok_comment_column';
+                     COMMENT ON FUNCTION f() IS 'tok_comment_function';"
+                    .into(),
+                timeout: Duration::from_secs(10),
+                dry_run: false,
+            },
+            &sync,
+        )
+        .await
+        .expect("migration");
+    let mut source = session(&engine, f.db(), RoleKind::Owner).await;
+    psql(
+        &mut source,
+        "INSERT INTO people (id, pid, email, token) VALUES (1, 777001, 'alice@example.com', 'tok_alice');
+         SELECT setval('people_id_seq', 5000); SELECT setval('pid_seq', 777001);
+         SELECT setval('loose', 424242);
+         SELECT lo_from_bytea(0, convert_to('tok_large_object', 'UTF8'));",
+    )
+    .await
+    .unwrap();
+    close(source).await;
+    // (large objects, comments, defaults, sequences)
+    const OUTSIDE: &str = "select (select count(*) from pg_largeobject_metadata)::text || '|' || \
+         coalesce((select string_agg(description, ',' order by description) from pg_description \
+                    where description like 'tok_%'), '-') || '|' || \
+         coalesce((select string_agg(pg_get_expr(adbin, adrelid), ',' order by adnum) from pg_attrdef \
+                    where adrelid = 'people'::regclass), '-') || '|' || \
+         (select string_agg(sequencename || '=' || coalesce(last_value::text, 'new'), ',' \
+                            order by sequencename) from pg_sequences where schemaname = 'public')";
+    let column = |name: &str| ColumnRef {
+        schema: "public".into(),
+        table: "people".into(),
+        column: name.into(),
+    };
+    let plan = MaskPlan {
+        columns: vec![
+            (column("pid"), MaskAs::Pseudonym),
+            (column("email"), MaskAs::Pseudonym),
+            (column("token"), MaskAs::Null),
+        ],
+        planned_from: None,
+    };
+    for (data, want) in [
+        (
+            CopyData::Full,
+            "1|tok_comment_column,tok_comment_function,tok_comment_table|\
+             nextval('people_id_seq'::regclass),nextval('pid_seq'::regclass),'tok_default_marker'::text|\
+             loose=424242,people_id_seq=5000,pid_seq=777001",
+        ),
+        (
+            CopyData::SchemaOnly,
+            "0|-|nextval('people_id_seq'::regclass),nextval('pid_seq'::regclass),'tok_default_marker'::text|\
+             loose=new,people_id_seq=new,pid_seq=new",
+        ),
+        (
+            CopyData::Masked(plan),
+            "0|-|nextval('people_id_seq'::regclass)|loose=new,people_id_seq=1,pid_seq=new",
+        ),
+    ] {
+        let (key, _) = conformance::test_key();
+        let copy = engine
+            .copy_database(
+                f.db(),
+                &f.key,
+                &conformance::new_database(f.db().tenant_id),
+                &data,
+                &key,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{data:?}: the copy goes through: {e:?}"));
+        let mut owner = session(&engine, &copy.database, RoleKind::Owner).await;
+        let got = psql(&mut owner, OUTSIDE).await.unwrap();
+        close(owner).await;
+        assert_eq!(got, want, "{data:?}");
+    }
+}
+
+/// Kimi review of D-3b on `main`, finding 5: a `schema_only` copy keeps no statistics of the
+/// source. A `TEMPLATE` copy starts with the source's `pg_statistic` and
+/// `pg_statistic_ext_data`, and `TRUNCATE` and `ANALYZE` of an empty table keep them; here also
+/// for a column with a statistics target of 0, an extended statistics object, an index
+/// expression, a column that a view reads and a materialized view. The views work afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_schema_only_copy_keeps_no_statistics_of_the_source() {
+    let Some(engine) = engine().await else { return };
+    let f = Fixture::new(&engine).await;
+    let sync = ClassSync {
+        personal: vec!["email"],
+        secret: vec!["token"],
+    };
+    engine
+        .apply_migration(
+            f.db(),
+            &f.key,
+            &MigrationRequest {
+                up: "CREATE TABLE people (id integer PRIMARY KEY, email text, grp integer, token text);
+                     CREATE STATISTICS people_grp_token (mcv) ON grp, token FROM people;
+                     CREATE INDEX people_lower ON people (lower(email));
+                     CREATE VIEW v AS SELECT id, email FROM people;
+                     CREATE MATERIALIZED VIEW mv AS SELECT id, token FROM people;"
+                    .into(),
+                timeout: Duration::from_secs(10),
+                dry_run: false,
+            },
+            &sync,
+        )
+        .await
+        .expect("migration");
+    const STATS: &str = "select coalesce((select string_agg(coalesce(most_common_vals::text, '') \
+                           || coalesce(histogram_bounds::text, ''), ' ') \
+                           from pg_stats where schemaname = 'public'), '') || ' ' || \
+                         coalesce((select string_agg(coalesce(most_common_vals::text, ''), ' ') \
+                           from pg_stats_ext where schemaname = 'public'), '')";
+    let mut source = session(&engine, f.db(), RoleKind::Owner).await;
+    psql(
+        &mut source,
+        "INSERT INTO people SELECT g, 'user' || g || '@example.com', g % 10, \
+           'tok_secret_' || (g % 10) FROM generate_series(1, 200) g; \
+         REFRESH MATERIALIZED VIEW mv; \
+         ANALYZE people; ANALYZE mv; \
+         ALTER TABLE people ALTER COLUMN token SET STATISTICS 0",
+    )
+    .await
+    .unwrap();
+    let before = psql(&mut source, STATS).await.unwrap();
+    close(source).await;
+    assert!(
+        before.contains("tok_secret_") && before.contains("@example.com"),
+        "the source has statistics of its values: {before}"
+    );
+    let (key, _) = conformance::test_key();
+    let copy = engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &conformance::new_database(f.db().tenant_id),
+            &CopyData::SchemaOnly,
+            &key,
+        )
+        .await
+        .expect("the schema_only copy goes through");
+    let mut owner = session(&engine, &copy.database, RoleKind::Owner).await;
+    let after = psql(&mut owner, STATS).await.unwrap();
+    assert!(
+        !after.contains("tok_") && !after.contains("example.com"),
+        "no statistic of the copy holds a value of the source: {after}"
+    );
+    assert_eq!(
+        psql(
+            &mut owner,
+            "select (select count(*) from v)::text || '|' || \
+                    (select count(*) from pg_stats where schemaname = 'public')::text || '|' || \
+                    (select count(*) from pg_statistic_ext where stxname = 'people_grp_token')::text || '|' || \
+                    (select count(*) from pg_indexes where indexname = 'people_lower')::text || '|' || \
+                    (select attstattarget::text from pg_attribute \
+                      where attrelid = 'people'::regclass and attname = 'token')",
+        )
+        .await
+        .unwrap(),
+        "0|0|1|1|0",
+        "the schema is whole: the view, the statistics object, the index and the target"
+    );
+    close(owner).await;
+}
+
+/// Kimi review of D-3b on `main`, finding 5: a masked copy whose plan has no column still makes
+/// its materialized views again, so a stale fill (here a value the source's table no longer
+/// has) is not copied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_masked_copy_without_masked_columns_fills_its_materialized_views_again() {
+    let Some(engine) = engine().await else { return };
+    let f = Fixture::new(&engine).await;
+    f.migrate(
+        "CREATE TABLE t (id integer PRIMARY KEY, v text);
+         CREATE MATERIALIZED VIEW mv AS SELECT v FROM t WITH NO DATA;",
+    )
+    .await
+    .expect("migration");
+    for sql in [
+        "INSERT INTO t VALUES (1, 'tok_stale')",
+        "REFRESH MATERIALIZED VIEW mv",
+        "UPDATE t SET v = 'now' WHERE id = 1",
+    ] {
+        f.run(RoleKind::Owner, StatementMode::Write, sql, vec![])
+            .await
+            .expect(sql);
+    }
+    let (key, _) = conformance::test_key();
+    let copy = engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &conformance::new_database(f.db().tenant_id),
+            &CopyData::Masked(MaskPlan {
+                columns: vec![],
+                planned_from: None,
+            }),
+            &key,
+        )
+        .await
+        .expect("the masked copy goes through");
+    let mut owner = session(&engine, &copy.database, RoleKind::Owner).await;
+    assert_eq!(
+        psql(&mut owner, "select string_agg(v, ',') from mv")
+            .await
+            .unwrap(),
+        "now",
+        "the materialized view is filled again from the copy's tables"
+    );
+    close(owner).await;
+}
+
+/// Kimi review of D-3b on `main`, finding 3: a `masked` or `schema_only` copy of a database
+/// with a foreign table, or with a foreign server only, is refused: a foreign table reads rows
+/// outside the database that no class covers, and a server lets a migration of the copy make
+/// one again. Only a superuser can make a foreign data wrapper, so the superuser makes one
+/// without a handler (as `tenant_code::a_foreign_table_counts_as_tenant_code_and_stops_masked_writes` does).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_masked_or_schema_only_copy_of_foreign_data_is_refused() {
+    let Some(engine) = engine().await else { return };
+    let f = Fixture::new(&engine).await;
+    f.migrate("CREATE TABLE t (id integer PRIMARY KEY, v text);")
+        .await
+        .expect("migration");
+    let db = f.db().engine_name.clone();
+    let owner = role_name(&f.created, RoleKind::Owner);
+    let Some(_) = superuser(
+        &db,
+        &format!(
+            "CREATE FOREIGN DATA WRAPPER ruum_test_fdw;
+             CREATE SERVER ruum_test_srv FOREIGN DATA WRAPPER ruum_test_fdw;
+             CREATE FOREIGN TABLE public.remote (id integer) SERVER ruum_test_srv;
+             ALTER FOREIGN TABLE public.remote OWNER TO {};",
+            lens::ident(&owner)
+        ),
+    ) else {
+        return;
+    };
+    let plan = || MaskPlan {
+        columns: vec![(
+            ColumnRef {
+                schema: "public".into(),
+                table: "t".into(),
+                column: "v".into(),
+            },
+            MaskAs::Null,
+        )],
+        planned_from: None,
+    };
+    let refused = |what: &'static str| {
+        let engine = &engine;
+        let f = &f;
+        async move {
+            for data in [CopyData::SchemaOnly, CopyData::Masked(plan())] {
+                let (key, _) = conformance::test_key();
+                let err = engine
+                    .copy_database(
+                        f.db(),
+                        &f.key,
+                        &conformance::new_database(f.db().tenant_id),
+                        &data,
+                        &key,
+                    )
+                    .await
+                    .expect_err("the copy is refused");
+                assert!(
+                    matches!(&err, EngineError::Unsupported(m) if m.contains(what)),
+                    "{data:?}: {err:?}"
+                );
+            }
+        }
+    };
+    refused("foreign table public.remote").await;
+    superuser(&db, "DROP FOREIGN TABLE public.remote;");
+    refused("foreign server ruum_test_srv").await;
+    superuser(
+        &db,
+        "DROP SERVER ruum_test_srv; DROP FOREIGN DATA WRAPPER ruum_test_fdw;",
+    );
+    let (key, _) = conformance::test_key();
+    engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &conformance::new_database(f.db().tenant_id),
+            &CopyData::Masked(plan()),
+            &key,
+        )
+        .await
+        .expect("without foreign data the copy goes through");
 }

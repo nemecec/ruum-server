@@ -818,9 +818,188 @@ fn normalize_tokens(engine: EngineKind, tokens: &[Token]) -> String {
     out
 }
 
+/// The hint of a refused read of free-form catalog text ([`catalog_text_refusal`]).
+pub const HINT_CATALOG_TEXT: &str = "catalog_text_needs_manage";
+
+/// The relations and functions of the Postgres catalog that show free-form text of the
+/// database's schema: function bodies, view and rule definitions, defaults, check and index
+/// expressions, trigger arguments, policy expressions, comments, the initial values of
+/// aggregates, the missing values of added columns, and the state of sequences. Such text can
+/// hold real values (a token in a default, a name in a comment), and no class covers it.
+const CATALOG_TEXT_NAMES: &[&str] = &[
+    // Relations and views.
+    "pg_aggregate",
+    "pg_attrdef",
+    "pg_attribute",
+    "pg_constraint",
+    "pg_description",
+    "pg_foreign_server",
+    "pg_foreign_table",
+    "pg_index",
+    "pg_indexes",
+    "pg_largeobject",
+    "pg_matviews",
+    "pg_partitioned_table",
+    "pg_policies",
+    "pg_policy",
+    "pg_proc",
+    "pg_rewrite",
+    "pg_rules",
+    "pg_seclabel",
+    "pg_seclabels",
+    "pg_sequence",
+    "pg_sequences",
+    "pg_shdescription",
+    "pg_shseclabel",
+    "pg_statistic_ext",
+    "pg_statistic_ext_data",
+    "pg_trigger",
+    "pg_type",
+    "pg_user_mapping",
+    "pg_user_mappings",
+    "pg_views",
+    // Functions.
+    "col_description",
+    "obj_description",
+    "pg_get_constraintdef",
+    "pg_get_expr",
+    "pg_get_function_sqlbody",
+    "pg_get_functiondef",
+    "pg_get_indexdef",
+    "pg_get_partition_constraintdef",
+    "pg_get_partkeydef",
+    "pg_get_ruledef",
+    "pg_get_statisticsobjdef",
+    "pg_get_statisticsobjdef_columns",
+    "pg_get_statisticsobjdef_expressions",
+    "pg_get_triggerdef",
+    "pg_get_viewdef",
+    "pg_sequence_last_value",
+    "pg_sequence_parameters",
+    "shobj_description",
+];
+
+/// The views of `information_schema` that show such text (`column_default`,
+/// `routine_definition`, `view_definition`, `check_clause`, `action_statement`, ...).
+const INFORMATION_SCHEMA_TEXT: &[&str] = &[
+    "attributes",
+    "check_constraints",
+    "columns",
+    "domains",
+    "parameters",
+    "routines",
+    "triggers",
+    "views",
+];
+
+/// Refuses a Postgres statement that reads free-form text of the catalog (Kimi review of D-3b
+/// on `main`, finding 1), for a caller whose role kind is not `owner` or `secret_read` (every
+/// agent, and every person without `manage`): the names of [`CATALOG_TEXT_NAMES`] anywhere in
+/// the statement, the views of [`INFORMATION_SCHEMA_TEXT`] after `information_schema.`, and
+/// `table_to_xml*`, `schema_to_xml*` and `database_to_xml*` (stable built-ins that read a
+/// relation, a schema or the database that a string or an OID names, so a name check cannot see
+/// what they read). The functions that run a query given as text (`query_to_xml`, `ts_stat`,
+/// `ts_rewrite`, `cursor_to_xml`) are volatile, and the engine revokes them from every kind
+/// but `owner` (`setup::grants_sql`). Function bodies, defaults, comments and sequence
+/// states are text of the schema that no class covers: a default can be a token, a comment a
+/// name. Catalog values are not behind the lens (review-Q-2-s21-2 N-1), so these reads would
+/// show them as they are. `None` for SQLite, and when the statement names none of them. Like
+/// the other rules this is a check of names (a first line): a view of the database's own over
+/// the catalog is a relation of `public`, whose columns are masked by their classes.
+pub fn catalog_text_refusal(engine: EngineKind, sql: &str) -> Option<Refusal> {
+    if engine != EngineKind::Postgres {
+        return None;
+    }
+    let dialect = dialect(engine);
+    let Ok(tokens) = Tokenizer::new(&*dialect, sql)
+        .with_unescape(false)
+        .tokenize()
+    else {
+        return Some(unparsed());
+    };
+    let sig = significant(&tokens);
+    let refusal = |name: &str| {
+        Some(Refusal::not_allowed(
+            format!(
+                "{name} shows free-form text of the database's schema (definitions, defaults, \
+                 comments, sequence states), which can hold real values: only a person with \
+                 manage on the database reads it"
+            ),
+            Some(HINT_CATALOG_TEXT),
+        ))
+    };
+    for (i, t) in sig.iter().enumerate() {
+        let Token::Word(w) = t else { continue };
+        let lower = w.value.to_ascii_lowercase();
+        let dump = ["table_to_xml", "schema_to_xml", "database_to_xml"]
+            .iter()
+            .any(|p| lower.starts_with(p));
+        if CATALOG_TEXT_NAMES.contains(&lower.as_str()) || dump {
+            return refusal(&lower);
+        }
+        if lower == "information_schema"
+            && matches!(sig.get(i + 1), Some(Token::Period))
+            && let Some(Token::Word(next)) = sig.get(i + 2)
+        {
+            let view = next.value.to_ascii_lowercase();
+            if INFORMATION_SCHEMA_TEXT.contains(&view.as_str()) {
+                return refusal(&format!("information_schema.{view}"));
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Kimi review of D-3b on `main`, finding 1: the catalog's free-form text is refused for
+    /// callers without `manage`; the other catalog reads and plain statements are not.
+    #[test]
+    fn free_form_catalog_text_is_found() {
+        for text in [
+            "select prosrc from pg_proc",
+            "select p.prosrc from pg_catalog.pg_proc p",
+            "select pg_get_functiondef('f'::regproc)",
+            "select pg_get_viewdef('v')",
+            "select pg_get_expr(adbin, adrelid) from pg_attrdef",
+            "select description from pg_description",
+            "select obj_description('people'::regclass, 'pg_class')",
+            "select col_description('people'::regclass, 1)",
+            "select pg_get_constraintdef(oid) from pg_catalog.\"pg_constraint\"",
+            "select last_value from pg_sequences",
+            "select pg_sequence_last_value('s')",
+            "select attmissingval from pg_attribute",
+            "select typdefault from pg_type",
+            "select definition from pg_views",
+            "select column_default from information_schema.columns",
+            "select routine_definition from INFORMATION_SCHEMA.Routines",
+            "select view_definition from information_schema . views",
+            "select schema_to_xml('pg_catalog', true, false, '')",
+            "select database_to_xmlschema(true, false, '')",
+            "select table_to_xml('pg_catalog.pg_proc'::regclass, true, false, '')",
+        ] {
+            let r =
+                catalog_text_refusal(PG, text).unwrap_or_else(|| panic!("{text:?} was not found"));
+            assert_eq!(r.code, RefusalCode::StatementNotAllowed, "{text}");
+            assert_eq!(r.hint.as_deref(), Some(HINT_CATALOG_TEXT), "{text}");
+        }
+        for text in [
+            "select count(*) from plants",
+            "select relname from pg_class where relname = 'people'",
+            "select count(*) from pg_stats where tablename = 'people'",
+            "select table_name from information_schema.tables",
+            "select * from columns",
+            "select 'pg_proc' as name",
+            "select setting from pg_settings where name = 'work_mem'",
+            // Volatile: the engine revokes it from every kind but owner.
+            "select query_to_xml('select 1', true, false, '')",
+        ] {
+            assert_eq!(catalog_text_refusal(PG, text), None, "{text}");
+        }
+        assert_eq!(catalog_text_refusal(LITE, "select * from pg_proc"), None);
+    }
 
     const PG: EngineKind = EngineKind::Postgres;
     const LITE: EngineKind = EngineKind::Sqlite;

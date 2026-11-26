@@ -13,6 +13,10 @@
 //!    `schema_only` data; the kind follows the `read_personal` grant.
 //! 4. The request limits (`422`), then the statement rules of [`rules`] (`422
 //!    validation_failed` for no or two statements, `422 statement_not_allowed`).
+//! 4a. A caller whose kind is not `owner` or `secret_read` (every agent, every person without
+//!    `manage`) gets `422 statement_not_allowed`, hint `catalog_text_needs_manage`, for a read of
+//!    the catalog's free-form text ([`rules::catalog_text_refusal`]: function bodies, defaults,
+//!    comments, sequence states; Kimi review of D-3b on `main`, finding 1).
 //! 5. `mode: read` with a statement that writes is `400 read_only_query`, also when only the
 //!    engine finds it.
 //! 6. The role kind of the caller ([`person_kind`]): `view` reads as `read`, `edit` writes as
@@ -1173,6 +1177,13 @@ async fn run(
         return Err(validation_error("sql is empty", "/sql: send one SQL statement").into());
     }
     let statement = verdict.map_err(refusal_error)?;
+    // 4a. Free-form text of the catalog (function bodies, defaults, comments, sequence states)
+    // only for a person with manage (Kimi review of D-3b on `main`, finding 1).
+    if !matches!(kind, RoleKind::Owner | RoleKind::SecretRead)
+        && let Some(r) = rules::catalog_text_refusal(engine, &req.sql)
+    {
+        return Err(refusal_error(r).into());
+    }
     // 5. Read mode.
     if mode == StatementMode::Read && statement != rules::StatementKind::Read {
         return Err(read_only_error().into());
