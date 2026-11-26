@@ -674,6 +674,17 @@ async fn names_and_tree(w: &World, b: &dyn Backend) {
         s.ancestors(&m, plan.id).await.unwrap(),
         vec![w.root, docs.id]
     );
+    let up: Vec<(NodeId, String)> = s
+        .ancestor_nodes(&m, plan.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|n| (n.id, n.name))
+        .collect();
+    assert_eq!(
+        up,
+        vec![(w.root, up[0].1.clone()), (docs.id, "Docs".into())]
+    );
     assert_eq!(s.get(&m, plan.id).await.unwrap().revision, 1);
 
     // Children: folders first, by name; paging with a cursor.
@@ -1152,6 +1163,7 @@ async fn isolation(w: &World, b: &dyn Backend) {
         "404"
     );
     assert_eq!(code(s.ancestors(&ob, secret.id).await), "404");
+    assert_eq!(code(s.ancestor_nodes(&ob, secret.id).await), "404");
     assert_eq!(code(s.is_trashed(&ob, secret.id).await), "404");
     assert_eq!(code(s.trash(&ob, secret.id, None).await), "404");
     assert_eq!(

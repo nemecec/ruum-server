@@ -1900,4 +1900,15 @@ impl NodeStore for PgNodeStore {
     async fn is_trashed(&self, ctx: &Context, id: NodeId) -> Result<bool> {
         Ok(self.row(ctx, id).await?.node.trashed_at.is_some())
     }
+
+    async fn ancestor_nodes(&self, ctx: &Context, id: NodeId) -> Result<Vec<Node>> {
+        let mut c = self.conn(ctx).await?;
+        let up = ancestors_with_names(&mut c, ctx.tenant, id).await?;
+        let mut out = Vec::with_capacity(up.len());
+        for (a, _) in up {
+            out.push(load(&mut c, ctx.tenant, a, false).await?.node);
+        }
+        c.commit().await?;
+        Ok(out)
+    }
 }
