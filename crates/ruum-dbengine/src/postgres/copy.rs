@@ -1219,29 +1219,6 @@ async fn scrub_outside_the_tables(conn: &mut PgConnection) -> Result<(), EngineE
     Ok(())
 }
 
-/// A test-only probe: one statement that step 2 runs as the copy's owner, in its own
-/// transaction, after the data change and before the commit (so before step 3 drops the
-/// `ruum_copy` entry points). Keyed by the copy's node ID, so parallel tests do not share one
-/// (backlog 2026-11-26 T-90).
-#[cfg(test)]
-pub(crate) mod step_2_probe {
-    use std::collections::HashMap;
-    use std::sync::{LazyLock, Mutex};
-    use uuid::Uuid;
-
-    static PROBES: LazyLock<Mutex<HashMap<Uuid, String>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
-
-    /// Step 2 of the copy with node ID `node` runs `sql`.
-    pub(crate) fn set(node: Uuid, sql: &str) {
-        PROBES.lock().unwrap().insert(node, sql.to_string());
-    }
-
-    pub(super) fn take(node: Uuid) -> Option<String> {
-        PROBES.lock().unwrap().remove(&node)
-    }
-}
-
 /// Masks the columns of the plan in a copy (decision 0004-25, 0004-17): a `personal` column
 /// becomes `text` holding its pseudonym under the key installed now (the source's), a `secret`
 /// column keeps its type and holds `NULL` for a non-empty value (its `NOT NULL` dropped).
@@ -2503,4 +2480,27 @@ async fn drop_gone(engine: &PostgresEngine, db: &DatabaseRef) -> Result<(), Engi
         app_roles::drop_marked(engine, &db.engine_name).await?;
     }
     Err(EngineError::NotFound)
+}
+
+/// A test-only probe: one statement that step 2 runs as the copy's owner, in its own
+/// transaction, after the data change and before the commit (so before step 3 drops the
+/// `ruum_copy` entry points). Keyed by the copy's node ID, so parallel tests do not share one
+/// (backlog 2026-11-26 T-90).
+#[cfg(test)]
+pub(crate) mod step_2_probe {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    use uuid::Uuid;
+
+    static PROBES: LazyLock<Mutex<HashMap<Uuid, String>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Step 2 of the copy with node ID `node` runs `sql`.
+    pub(crate) fn set(node: Uuid, sql: &str) {
+        PROBES.lock().unwrap().insert(node, sql.to_string());
+    }
+
+    pub(super) fn take(node: Uuid) -> Option<String> {
+        PROBES.lock().unwrap().remove(&node)
+    }
 }
