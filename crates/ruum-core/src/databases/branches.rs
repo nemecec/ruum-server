@@ -250,21 +250,23 @@ pub(super) async fn make_branch(
         DataCopy::SchemaOnly => {
             // The classes, so the copy drops the defaults of the secret columns (Kimi review of
             // D-3b on `main`, finding 1).
+            // The plan is pinned and checked after the copy as for `Masked` (Kimi re-check of
+            // the D-3b fixes, N3).
             let catalog = engine
                 .catalog(&src.database_ref())
                 .await
                 .map_err(engine_error)?;
-            CopyData::SchemaOnly(
-                super::provider::current_mask_plan(
-                    deps,
-                    tenant,
-                    source,
-                    src.engine,
-                    engine.kind(),
-                    &catalog,
-                )
-                .await?,
+            let plan = super::provider::current_mask_plan(
+                deps,
+                tenant,
+                source,
+                src.engine,
+                engine.kind(),
+                &catalog,
             )
+            .await?;
+            masked_from = Some((catalog, plan.columns.clone()));
+            CopyData::SchemaOnly(plan)
         }
         DataCopy::Full => CopyData::Full,
         DataCopy::Masked => {

@@ -438,7 +438,7 @@ pub enum CopyData {
     Full,
     /// The schema, no rows. The plan's `secret` columns ([`MaskAs::Null`]) lose their
     /// defaults (Kimi review of D-3b on `main`, finding 1): a secret default is a real value.
-    /// Its `personal` columns and `planned_from` are not used.
+    /// Its `personal` columns are not used; `planned_from` is checked as for `Masked`.
     SchemaOnly(MaskPlan),
     /// `personal` columns as pseudonyms under the SOURCE key (retyped to `text`), `secret`
     /// columns as `NULL` (decision 0004-25; cards D-3, Q-2, Q-3).
