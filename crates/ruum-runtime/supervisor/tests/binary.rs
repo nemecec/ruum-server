@@ -16,9 +16,13 @@ fn dir(name: &str) -> PathBuf {
 }
 
 fn launch_json(script: &str, env: &[(&str, &str)]) -> Vec<u8> {
+    launch_argv(&["/bin/sh", "-c", script], env)
+}
+
+fn launch_argv(argv: &[&str], env: &[(&str, &str)]) -> Vec<u8> {
     let l = Launch {
         v: LAUNCH_VERSION,
-        argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+        argv: argv.iter().map(|a| (*a).into()).collect(),
         env: env
             .iter()
             .map(|(k, v)| ((*k).into(), (*v).into()))
@@ -78,6 +82,39 @@ fn sigterm_reaches_the_app() {
     assert_eq!(code, 0, "{out} {err}");
     assert!(out.contains("ready") && out.contains("got-term"), "{out:?}");
     assert!(start.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn the_app_starts_with_no_blocked_signal() {
+    // Review of I6-20 (Kimi re-check, finding 1): the supervisor blocks the forwarded signals in
+    // its threads, and std's `Command` keeps the mask in the child. A shell resets its own mask,
+    // so `sigterm_reaches_the_app` cannot see this: `cat` does not, and shows what it inherited.
+    let d = dir("sigmask");
+    let c = spawn(&d, &launch_argv(&["cat", "/proc/self/status"], &[]));
+    let (code, out, err) = finish(c);
+    assert_eq!(code, 0, "{err}");
+    let blocked = out
+        .lines()
+        .find_map(|l| l.strip_prefix("SigBlk:"))
+        .map(str::trim)
+        .unwrap_or_else(|| panic!("no SigBlk line: {out:?}"));
+    assert!(
+        blocked.chars().all(|c| c == '0'),
+        "the app inherited blocked signals: {blocked}"
+    );
+}
+
+#[test]
+fn a_missing_command_exits_127_in_init_mode() {
+    let d = dir("missing");
+    let c = spawn(
+        &d,
+        &launch_argv(&["/no/such/app"], &[("S", "missing-secret")]),
+    );
+    let (code, out, err) = finish(c);
+    assert_eq!(code, 127, "{out} {err}");
+    assert!(err.contains("did not start"), "{err}");
+    assert!(!out.contains("missing-secret") && !err.contains("missing-secret"));
 }
 
 #[test]

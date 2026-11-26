@@ -238,7 +238,8 @@ node's files clean and stop cross-tenant harm; they do not make a hostile app's 
 secret.
 
 1. **The binary.** Rust, built for `*-unknown-linux-musl` (static: no C library needed in the
-   image), with std, `nix` (safe wrappers of the process calls) and `serde_json` only: no async
+   image), with std, `nix` (safe wrappers of the process calls), `serde`/`serde_json` and `time`
+   only (all pure Rust): no async
    runtime, no TLS, no C code, no `unsafe`. Source: `crates/ruum-runtime/supervisor` (package
    `ruum-supervisor`, about 1 MiB). The redactor is the one of `ruum-core`
    (`runtime::redact::LineRedactor`, compiled into the supervisor from the same file, not a
@@ -271,7 +272,12 @@ secret.
       a second bound, proven live (a fork and a thread check) before it counts.
    4. Starts the app with the merged environment (the container's plain environment, then the
       secret values), standard input from `/dev/null`, standard output and standard error as two
-      pipes. No other file descriptor is inherited.
+      pipes. No other file descriptor is inherited. The supervisor blocks the forwarded signals
+      in its own threads, and a child inherits the signal mask (std's `Command` keeps it), so
+      the child first runs the supervisor's own `exec` step (`/proc/self/exe exec -- <argv>`),
+      which empties the mask and then replaces itself with the app: no `unsafe`, and an app
+      that never resets its mask still gets a forwarded `SIGTERM` (Kimi re-check of I6-20,
+      finding 1; `tests/binary.rs` reads the app's `SigBlk`).
    5. Reads both pipes, redacts each stream with its own `LineRedactor` (the values: the secret
       values, the previous values, the workload tokens it has seen), cuts lines at 16 KiB, and
       writes the redacted lines to its own standard output and standard error. A rotated token
@@ -304,7 +310,8 @@ secret.
        the seal's generation. So a seal does not move to another record, and a record deleted
        and made again under the same name (a new uid) does not take an old seal.
      - The sealed data: the secret environment values, the previous values, the current workload
-       token, the app's command, a SHA-256 digest of the record's fixed fields (identity, kind,
+       token and the tokens it replaced (at most 15, still valid until their expiry, so a pod
+       made by a wake redacts them too), the app's command, a SHA-256 digest of the record's fixed fields (identity, kind,
        routes, limits, image, command, plain environment, secret names; serialized as one JSON
        object in a fixed order), the **authorized run and the `uid` of its pod**, the uids of pods
        that already took their launch data, and the generation (one more at each seal).
@@ -325,7 +332,9 @@ secret.
        deployment is a new instance). A seal put back before the launch list can make another
        replica (or a restarted one) launch the same pod a second time; so a launch is also
        refused more than 120 s after the app container started (the kubelet's `startedAt`, which
-       the pod's creator cannot write). The residual: within those 120 s, a holder of the runtime
+       the pod's creator cannot write). The kubelet writes the status on its own schedule: while
+       the app container has no `startedAt` (and has not ended), or the pod no address, the
+       answer is `503` and the supervisor asks again; an ended app container is refused. The residual: within those 120 s, a holder of the runtime
        token together with the pod's own app can fetch that pod's launch data again (its previous
        values). A shared, server-side record of generations and launches closes it (backlog
        I620-9).
@@ -360,7 +369,12 @@ secret.
      digest, the init container's image, command and security context, the supervisor command,
      the mounts with every option, the projected volume's audience, expiry, path and mode, the
      service account, the runtime class, the limits, the host aliases, the termination message
-     path and policy, no lifecycle hooks or other probes). Any failure is `403` with no detail
+     path and policy, the runtime class's overhead (`RUUM_KUBE_RUNTIME_CLASS_OVERHEAD`, sent as
+     `spec.overhead`: the RuntimeClass admission plugin writes the class's into every pod), no
+     lifecycle hooks or other probes). The list of defaults is proven against the real API
+     server before the driver is turned on: `ops/gvisor-check.sh` sends the driver's sample pod
+     as a server-side dry run, and CI holds the committed answer to `pod::verify` (review of
+     I6-20, required change 2). Any failure is `403` with no detail
      (the server logs the reason, never a value); a pod whose seal is not written yet gets `503`
      and the supervisor tries again for 60 s. A positive `TokenReview` is kept for at most 60 s
      and never past the token's `exp`, 4096 entries at most; the pod, record and run checks run
@@ -385,7 +399,11 @@ secret.
      with the audience `ruum-supervisor` and `expirationSeconds: 600` (no Secret volume at all);
      no `valueFrom` and no `envFrom`; exactly one init container named `ruum-supervisor` that
      mounts only `ruum-bin`; no ephemeral containers; gVisor; for every container the
-     termination message path `/dev/termination-log` and the policy `File`.
+     termination message path `/dev/termination-log` and the policy `File`. The runtime
+     identity has no `update` or `patch` on `pods` or `pods/status` (`ops/rbac-check.sh` refuses
+     each): the launch decision trusts the pod's `status.podIPs` and its app container's
+     `startedAt`, so a write there would let a runtime-token holder move a victim pod's address
+     to its own.
 5. **Rotation and wake.** `rotate_token` runs in the process that follows the instance's log (as
    before): it adds the new token to that process's redactors, then seals it into the record. The
    supervisor gets it at its next `/v1/token`. `wake` makes the next pod, then seals the new run

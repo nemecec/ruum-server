@@ -329,6 +329,7 @@ pub fn kube_driver(
     cfg.supervisor_port = k.supervisor_service.1;
     cfg.network_encrypted = true;
     cfg.node_arch = k.node_arch.clone();
+    cfg.runtime_class_overhead = k.runtime_class_overhead.clone();
     if let Some((host, port)) = &k.egress_proxy {
         cfg.routes.insert(
             Route::EgressProxy,

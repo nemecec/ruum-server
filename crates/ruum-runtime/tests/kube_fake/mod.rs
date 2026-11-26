@@ -142,6 +142,40 @@ pub struct Fake {
     /// How long the garbage collector waits before it deletes the dependents of a deleted
     /// object (0: at once).
     pub gc_delay_ms: AtomicU64,
+    /// The `overhead.podFixed` of the runtime class (staging's, read from its manifest): the
+    /// RuntimeClass admission plugin writes it into a pod without one and refuses a pod with
+    /// another (review of I6-20, required change 1).
+    pub runtime_class_overhead: Mutex<BTreeMap<String, String>>,
+}
+
+/// The `overhead.podFixed` of staging's RuntimeClass `gvisor` (`k8s/manifests/runtimeclass.yaml`).
+pub fn staging_runtime_class_overhead() -> BTreeMap<String, String> {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/staging/k8s/manifests/runtimeclass.yaml"
+    );
+    let text = std::fs::read_to_string(path).expect("the RuntimeClass manifest");
+    let mut out = BTreeMap::new();
+    let mut in_fixed = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        if line.trim() == "podFixed:" {
+            in_fixed = true;
+            continue;
+        }
+        if in_fixed {
+            match line.trim().split_once(':') {
+                Some((k, v)) if line.starts_with("    ") => {
+                    out.insert(k.trim().to_owned(), v.trim().to_owned());
+                }
+                _ => in_fixed = false,
+            }
+        }
+    }
+    assert!(!out.is_empty(), "no overhead read from {path}");
+    out
 }
 
 /// The Role of the driver, read from the chart: `(resource, verbs)`.
@@ -268,6 +302,7 @@ impl Fake {
             hide_records_once: AtomicBool::new(false),
             log_not_ready_once: AtomicBool::new(false),
             gc_delay_ms: AtomicU64::new(0),
+            runtime_class_overhead: Mutex::new(staging_runtime_class_overhead()),
         });
         let app = Router::new()
             .route(
@@ -409,6 +444,11 @@ impl Fake {
         self.set_pod(&(ns.to_owned(), name.to_owned()), |p| {
             p["status"]["containerStatuses"][0]["state"]["running"]["startedAt"] = json!(t);
         });
+    }
+
+    /// Changes a stored pod's status as the kubelet would (a late or partial status write).
+    pub fn edit_pod_status(&self, ns: &str, name: &str, f: impl FnOnce(&mut Value)) {
+        self.set_pod(&(ns.to_owned(), name.to_owned()), |p| f(&mut p["status"]));
     }
 
     pub fn pods(&self) -> Vec<Value> {
@@ -772,6 +812,36 @@ async fn collection_post(
             (StatusCode::CREATED, axum::Json(obj)).into_response()
         }
         _ => {
+            // The RuntimeClass admission plugin (mutating, so before the validating policies):
+            // the class's overhead into a pod without one; a pod with another is refused.
+            let want = f.runtime_class_overhead.lock().unwrap().clone();
+            let canon = |o: &Value| -> Option<BTreeMap<String, String>> {
+                o.as_object().map(|m| {
+                    m.iter()
+                        .map(|(k, v)| {
+                            let v = v.as_str().unwrap_or_default();
+                            let v = if k == "memory" {
+                                canonical_bytes(v)
+                            } else {
+                                v.to_owned()
+                            };
+                            (k.clone(), v)
+                        })
+                        .collect()
+                })
+            };
+            let want_canon = canon(&json!(want)).unwrap_or_default();
+            match obj.pointer("/spec/overhead") {
+                Some(o) if want.is_empty() || canon(o) != Some(want_canon.clone()) => {
+                    return status(
+                        StatusCode::FORBIDDEN,
+                        "pod rejected: Pod's Overhead doesn't match RuntimeClass's defined Overhead",
+                    );
+                }
+                None if want.is_empty() => {}
+                // Stored in the API server's form.
+                _ => obj["spec"]["overhead"] = json!(want_canon),
+            }
             // Admission: the namespace's rules (backlog S-83).
             if let Err(why) = admit(&obj) {
                 return status(StatusCode::FORBIDDEN, &format!("admission: {why}"));

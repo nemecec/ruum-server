@@ -70,6 +70,11 @@ pub(crate) struct Sealed {
     pub previous: Vec<String>,
     /// The current workload token.
     pub token: String,
+    /// The tokens it replaced, newest last (at most `MAX_KEPT_TOKENS - 1`): still valid until
+    /// their expiry, so a new pod's supervisor redacts them too (Kimi re-check of I6-20, finding
+    /// 3). Absent in seals of the release before (expand: an older release ignores it).
+    #[serde(default)]
+    pub earlier_tokens: Vec<String>,
     /// The run whose pod may take the launch data, and that pod's uid (written after the driver
     /// created the pod; `None` until then).
     pub run: u32,
@@ -176,6 +181,7 @@ mod tests {
             run: 2,
             pod_uid: Some("uid-a".into()),
             launched: Vec::new(),
+            earlier_tokens: vec!["tok-0".into()],
         }
     }
 

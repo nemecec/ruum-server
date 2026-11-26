@@ -479,12 +479,64 @@ pub(crate) fn pod_body(
     if let Some(nodes) = &cfg.node_selector {
         spec["nodeSelector"] = json!(nodes);
     }
+    if !cfg.runtime_class_overhead.is_empty() {
+        spec["overhead"] = json!(cfg.runtime_class_overhead);
+    }
     json!({
         "apiVersion": "v1",
         "kind": "Pod",
         "metadata": { "name": pod_name(id, rec.run), "labels": labels },
         "spec": spec,
     })
+}
+
+/// The pod the driver makes for a fixed sample instance under `cfg`: a service with a health
+/// probe, a plain and a secret environment value, and every shared service of `cfg` (each at a
+/// documentation address, as the driver would resolve it). The enable check of the Kubernetes
+/// driver (review of I6-20, required change 2) sends it to the real API server as a server-side
+/// dry run and holds the answer to [`check_stored_sample`], so the defaults that the API server
+/// and its admission plugins add are known before a real pod is made.
+pub fn sample_pod(cfg: &KubeConfig) -> Value {
+    let routes: Vec<Route> = cfg.routes.keys().cloned().collect();
+    let rec: Record = serde_json::from_value(json!({
+        "v": 1,
+        "instance": "0190f0f0-0000-7000-8000-00000000c0de",
+        "identity": {
+            "tenant": "0190f0f0-0000-7000-8000-000000000001",
+            "app": "0190f0f0-0000-7000-8000-000000000002",
+            "deployment": "0190f0f0-0000-7000-8000-000000000003",
+            "environment": "live",
+        },
+        "kind": { "kind": "service", "port": 8080,
+            "health": { "path": "/healthz", "interval_ms": 5000, "failure_threshold": 3 },
+            "idle_timeout_ms": null },
+        "routes": routes,
+        "limits": { "cpu_millis": 250, "memory_bytes": 268435456, "disk_bytes": 67108864 },
+        "image": format!("{}/ruum/sample@sha256:{}",
+            cfg.registry.as_deref().unwrap_or("registry.invalid:5000"), "0".repeat(64)),
+        "command": ["node", "server.js"],
+        "env": [{ "name": "MODE", "value": "sample" }, { "name": "API_KEY" }],
+        "started_at_ms": 1, "state": { "state": "starting" }, "run": 1,
+        "run_started_ms": 1, "last_touch_ms": 1,
+    }))
+    .expect("the sample record parses");
+    let hosts: Vec<HostAlias> = cfg
+        .routes
+        .values()
+        .enumerate()
+        .map(|(i, s)| HostAlias {
+            ip: format!("192.0.2.{}", i + 10),
+            alias: s.alias.clone(),
+        })
+        .collect();
+    let launch = format!("http://192.0.2.1:{}", cfg.supervisor_port);
+    pod_body(cfg, &rec, &hosts, &launch)
+}
+
+/// The read-back of the driver ([`verify`]) of `stored`, the API server's answer to
+/// [`sample_pod`] of `cfg`. `Err` names the first setting that differs.
+pub fn check_stored_sample(cfg: &KubeConfig, stored: &Value) -> Result<(), String> {
+    verify(cfg, &sample_pod(cfg), stored)
 }
 
 /// A Kubernetes quantity in base units (bytes, or thousandths for `m`); `None` when it does not
@@ -528,6 +580,7 @@ fn cpu_millis(q: &str) -> Option<u128> {
 /// its canonical form).
 fn is_quantity(path: &str) -> bool {
     path.ends_with("/sizeLimit")
+        || path.starts_with("/spec/overhead/")
         || [
             "/limits/cpu",
             "/limits/memory",
@@ -1031,6 +1084,54 @@ mod tests {
             change(&mut p);
             assert!(verify(&cfg, &sent, &p).is_err(), "{what} was accepted");
         }
+    }
+
+    /// The runtime class's overhead (review of I6-20, required change 1): the RuntimeClass
+    /// admission plugin writes it into every pod of the class. The driver sends the configured
+    /// value, so a stored pod with that value (in the API server's form) passes, and one with
+    /// another value, an added resource or an overhead the driver did not send fails.
+    #[test]
+    fn the_runtime_class_overhead_must_be_the_configured_one() {
+        let mut cfg = config();
+        cfg.runtime_class_overhead = BTreeMap::from([
+            ("cpu".into(), "50m".into()),
+            ("memory".into(), "64Mi".into()),
+        ]);
+        let rec = record();
+        let sent = pod_body(&cfg, &rec, &[], "http://10.0.0.5:8091");
+        assert_eq!(
+            sent["spec"]["overhead"],
+            json!({ "cpu": "50m", "memory": "64Mi" })
+        );
+        let mut stored = sent.clone();
+        stored["spec"]["overhead"] = json!({ "cpu": "50m", "memory": "67108864" });
+        assert_eq!(verify(&cfg, &sent, &stored), Ok(()));
+        for other in [
+            json!({ "cpu": "50m", "memory": "128Mi" }),
+            json!({ "cpu": "1", "memory": "64Mi" }),
+            json!({ "cpu": "50m", "memory": "64Mi", "ephemeral-storage": "1Gi" }),
+            json!({ "cpu": "50m" }),
+        ] {
+            let mut p = sent.clone();
+            p["spec"]["overhead"] = other.clone();
+            assert!(verify(&cfg, &sent, &p).is_err(), "{other} was accepted");
+        }
+        // A driver that knows no overhead refuses a pod that has one (the class has one the
+        // setting does not name): every start fails closed, never with an unchecked field.
+        let plain = config();
+        let sent = pod_body(&plain, &rec, &[], "http://10.0.0.5:8091");
+        assert!(sent["spec"].get("overhead").is_none());
+        let mut p = sent.clone();
+        p["spec"]["overhead"] = json!({ "cpu": "50m", "memory": "64Mi" });
+        assert_eq!(verify(&plain, &sent, &p), Err("/spec/overhead".into()));
+        // The setting is checked.
+        let mut bad = config();
+        let overhead_refused = |c: &KubeConfig| matches!(c.check(), Err(ruum_core::runtime::RuntimeError::Internal { reason }) if reason.contains("overhead"));
+        assert!(!overhead_refused(&cfg));
+        bad.runtime_class_overhead = BTreeMap::from([("gpu".into(), "1".into())]);
+        assert!(overhead_refused(&bad));
+        bad.runtime_class_overhead = BTreeMap::from([("memory".into(), "lots".into())]);
+        assert!(overhead_refused(&bad));
     }
 
     /// The pod holds no secret value, takes values from no Secret, and the digest of the fixed

@@ -1157,6 +1157,12 @@ YAML
   grep -qF '{ name: RUUM_KUBE_SUPERVISOR_NETWORK, value: encrypted }' "$TMP/srv-apps.yaml" && grep -qF '{ name: RUUM_KUBE_SUPERVISOR_LISTEN, value: "0.0.0.0:8091" }' "$TMP/srv-apps.yaml" &&
     grep -qF 'secretName: ruum-runtime-record-key' "$TMP/srv-apps.yaml" && grep -qF '{ name: RUUM_KUBE_RECORD_KEY_FILE, value: /var/run/secrets/ruum-runtime/record-key }' "$TMP/srv-apps.yaml" &&
     ok "the driver gets the record key, the supervisor listener and the encrypted-network setting (S-89)" || bad "the driver lacks the supervisor settings"
+  # The runtime class's overhead the driver checks pods against is the manifest's (review of
+  # I6-20, required change 1): a drift would fail every sandbox start.
+  rc_cpu="$(awk '/podFixed:/ { f = 1; next } f && /cpu:/ { print $2; exit }' "$STG/k8s/manifests/runtimeclass.yaml")"
+  rc_mem="$(awk '/podFixed:/ { f = 1; next } f && /memory:/ { print $2; exit }' "$STG/k8s/manifests/runtimeclass.yaml")"
+  [[ -n "$rc_cpu" && -n "$rc_mem" ]] && grep -qF "{ name: RUUM_KUBE_RUNTIME_CLASS_OVERHEAD, value: \"cpu=$rc_cpu,memory=$rc_mem\" }" "$TMP/srv-apps.yaml" &&
+    ok "the driver knows the runtime class overhead of runtimeclass.yaml" || bad "RUUM_KUBE_RUNTIME_CLASS_OVERHEAD differs from runtimeclass.yaml's overhead.podFixed"
   grep -qF 'name: RUUM_REGISTRY' "$TMP/srv-apps.yaml" && bad "a registry is set although none is given" || ok "no registry unless one is given (app images fail closed)"
   grep -qF 'RUUM_RUNTIME_DRIVER' "$TMP/ruum.yaml" && bad "the Kubernetes driver renders without the app runtime" || ok "without the app runtime no Kubernetes driver"
   expect 0 "the server env with the app runtime is what the server reads" bash "$HERE/server-env.sh" "$TMP/ruum-apps.yaml"

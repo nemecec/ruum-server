@@ -4,11 +4,16 @@
 //! ruum-supervisor install <dest>
 //! ruum-supervisor run --launch-stdin --token-file <path>
 //! ruum-supervisor run --launch-url http://<ip>:<port> --identity-file <path> --token-file <path>
+//! ruum-supervisor exec -- <app argv...>
 //! ```
+//!
+//! `exec` is the supervisor's own step between the fork and the app: it empties the signal mask
+//! (the supervisor blocks the forwarded signals, and a child inherits the mask through the fork
+//! and `execve`), then replaces itself with the app.
 //!
 //! Arguments after these are ignored. Every message names a step or a rule, never a value.
 
-use ruum_supervisor::protocol::{EXIT_LAUNCH_FAILED, TERMINATION_LOG};
+use ruum_supervisor::protocol::{EXIT_LAUNCH_FAILED, EXIT_NOT_STARTED, TERMINATION_LOG};
 use ruum_supervisor::run::{self, Options, Source};
 use std::io::Write;
 use std::path::PathBuf;
@@ -26,6 +31,22 @@ fn main() {
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("exec") => {
+            let argv = match args.get(1).map(String::as_str) {
+                Some("--") => &args[2..],
+                _ => fail("exec needs -- and the app's command"),
+            };
+            if argv.is_empty() {
+                fail("exec needs the app's command");
+            }
+            let e = run::exec_app(argv);
+            let _ = writeln!(
+                std::io::stderr(),
+                "ruum-supervisor: the app's command did not start: {}",
+                e.kind()
+            );
+            std::process::exit(EXIT_NOT_STARTED);
+        }
         Some("install") => {
             let Some(dest) = args.get(1) else {
                 fail("install needs a destination");

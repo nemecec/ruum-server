@@ -154,6 +154,10 @@ spec:
             - { name: RUUM_KUBE_CA_FILE, value: /var/run/secrets/ruum-kube/ca.crt }
             - { name: RUUM_KUBE_NAMESPACE, value: ruum-apps }
             - { name: RUUM_KUBE_RUNTIME_CLASS, value: gvisor }
+            # overhead.podFixed of k8s/manifests/runtimeclass.yaml, exactly (tests/run.sh checks
+            # it): the RuntimeClass admission plugin writes it into every sandbox pod, and the
+            # driver's read-back refuses a pod with any other (review of I6-20).
+            - { name: RUUM_KUBE_RUNTIME_CLASS_OVERHEAD, value: "cpu=50m,memory=64Mi" }
             - { name: RUUM_KUBE_EGRESS_PROXY, value: "ruum-egress.ruum.svc.cluster.local:3128" }
             - { name: RUUM_KUBE_SPLIT_LOG_STREAMS, value: {{ ternary "on" "off" .Values.runtime.splitLogStreams | quote }} }
             {{- if .Values.runtime.registry }}
