@@ -1700,3 +1700,70 @@ async fn a_masked_or_schema_only_copy_of_foreign_data_is_refused() {
         .await
         .expect("without foreign data the copy goes through");
 }
+
+/// Kimi re-check of the D-3b fixes, N3: a `schema_only` copy drops the defaults of the plan's
+/// secret columns by name, so its plan must be of the columns the source has. A column added
+/// after the plan was made (here a second secret one, with a default) refuses the copy with
+/// `NotReady` (the platform tries again); with a plan of the columns as they are, it goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_schema_only_copy_refuses_a_column_that_its_plan_does_not_know() {
+    let Some(engine) = engine().await else { return };
+    let f = Fixture::new(&engine).await;
+    f.migrate("CREATE TABLE t (id integer PRIMARY KEY, token text DEFAULT 'tok_default');")
+        .await
+        .expect("migration");
+    let token = ColumnRef {
+        schema: "public".into(),
+        table: "t".into(),
+        column: "token".into(),
+    };
+    let then = pinned(&engine.catalog(f.db()).await.unwrap());
+    f.migrate("ALTER TABLE t ADD COLUMN code text DEFAULT 'tok_code';")
+        .await
+        .expect("a new column");
+    let (key, _) = conformance::test_key();
+    let err = engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &conformance::new_database(f.db().tenant_id),
+            &CopyData::SchemaOnly(MaskPlan {
+                columns: vec![(token.clone(), MaskAs::Null)],
+                planned_from: Some(then),
+            }),
+            &key,
+        )
+        .await
+        .expect_err("the copy is refused");
+    assert!(matches!(err, EngineError::NotReady), "{err:?}");
+    let code = ColumnRef {
+        column: "code".into(),
+        ..token.clone()
+    };
+    let now = pinned(&engine.catalog(f.db()).await.unwrap());
+    let copy = engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &conformance::new_database(f.db().tenant_id),
+            &CopyData::SchemaOnly(MaskPlan {
+                columns: vec![(token, MaskAs::Null), (code, MaskAs::Null)],
+                planned_from: Some(now),
+            }),
+            &key,
+        )
+        .await
+        .expect("with the current columns the copy goes through");
+    let mut owner = session(&engine, &copy.database, RoleKind::Owner).await;
+    assert_eq!(
+        psql(
+            &mut owner,
+            "select count(*) from pg_attrdef where adrelid = 't'::regclass"
+        )
+        .await
+        .unwrap(),
+        "0",
+        "no secret default is left"
+    );
+    close(owner).await;
+}

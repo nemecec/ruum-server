@@ -725,6 +725,9 @@ async fn change_data(
         let out = match data {
             Data::Keep => MaskOutcome::default(),
             Data::SchemaOnly(plan) => {
+                // The columns are those of the plan, or the secret defaults could be missed
+                // (Kimi re-check of the D-3b fixes, N3).
+                check_planned_from(&mut conn, plan).await?;
                 empty_tables(&mut conn).await?;
                 drop_secret_defaults(&mut conn, plan).await?;
                 clear_statistics(&mut conn).await?;
