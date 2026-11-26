@@ -1480,6 +1480,83 @@ async fn a_masked_or_schema_only_copy_keeps_no_text_object_or_sequence_state_of_
     }
 }
 
+/// Re-check of the D-3b fixes (review k16d3b, Kimi N1): a masked copy sets an owned sequence
+/// from the copy's rows in the sequence's own direction and within its bounds. A descending
+/// sequence (`INCREMENT BY -1`) takes the column's lowest value, so the copy's next row gets a
+/// new ID, not one that a row has already; a sequence whose column holds a value beyond its
+/// `MAXVALUE` (a row put in by hand) stops at the bound instead of refusing the copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_masked_copy_sets_owned_sequences_in_their_direction_and_bounds() {
+    let Some(engine) = engine().await else { return };
+    let f = Fixture::new(&engine).await;
+    let sync = ClassSync {
+        personal: vec![],
+        secret: vec![],
+    };
+    engine
+        .apply_migration(
+            f.db(),
+            &f.key,
+            &MigrationRequest {
+                up: "CREATE TABLE down (id integer PRIMARY KEY, v text);
+                     CREATE SEQUENCE down_seq INCREMENT BY -1 MAXVALUE 100 START 100 OWNED BY down.id;
+                     ALTER TABLE down ALTER COLUMN id SET DEFAULT nextval('down_seq');
+                     CREATE TABLE capped (id integer PRIMARY KEY, v text);
+                     CREATE SEQUENCE capped_seq MAXVALUE 10 OWNED BY capped.id;
+                     ALTER TABLE capped ALTER COLUMN id SET DEFAULT nextval('capped_seq');"
+                    .into(),
+                timeout: Duration::from_secs(10),
+                dry_run: false,
+            },
+            &sync,
+        )
+        .await
+        .expect("migration");
+    let mut source = session(&engine, f.db(), RoleKind::Owner).await;
+    psql(
+        &mut source,
+        "INSERT INTO down (v) VALUES ('a'), ('b'), ('c');
+         DELETE FROM down WHERE id = 98;
+         INSERT INTO capped (id, v) VALUES (5000, 'by hand');",
+    )
+    .await
+    .unwrap();
+    close(source).await;
+    let (key, _) = conformance::test_key();
+    let copy = engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &conformance::new_database(f.db().tenant_id),
+            &CopyData::Masked(MaskPlan::default()),
+            &key,
+        )
+        .await
+        .expect("the masked copy goes through");
+    let mut owner = session(&engine, &copy.database, RoleKind::Owner).await;
+    assert_eq!(
+        psql(
+            &mut owner,
+            "select (select last_value from pg_sequences where sequencename = 'capped_seq')::text"
+        )
+        .await
+        .unwrap(),
+        "10",
+        "the sequence stops at its MAXVALUE"
+    );
+    assert_eq!(
+        psql(
+            &mut owner,
+            "INSERT INTO down (v) VALUES ('new') RETURNING id"
+        )
+        .await
+        .unwrap(),
+        "98",
+        "the copy's next row continues below its lowest ID (99)"
+    );
+    close(owner).await;
+}
+
 /// Kimi review of D-3b on `main`, finding 5: a `schema_only` copy keeps no statistics of the
 /// source. A `TEMPLATE` copy starts with the source's `pg_statistic` and
 /// `pg_statistic_ext_data`, and `TRUNCATE` and `ANALYZE` of an empty table keep them; here also
