@@ -723,7 +723,7 @@ async fn step_2_of_a_masked_copy_has_no_right_on_ruum_mask() {
 /// refusal stays as a second line. The copy goes through, the view is filled, and no object
 /// points into the platform's schemas.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_masked_copy_refuses_an_object_that_points_into_the_lens_schemas() {
+async fn a_view_filled_after_the_masking_cannot_reach_ruum_copy() {
     let Some(engine) = engine().await else { return };
     let f = planting_source(
         &engine,
@@ -767,6 +767,72 @@ async fn a_masked_copy_refuses_an_object_that_points_into_the_lens_schemas() {
         "the source has no such view"
     );
     close(host).await;
+}
+
+/// `ANALYZE` of the masked tables evaluates the expressions of extended statistics as the copy's
+/// owner, so it runs only in step 4, after step 3 dropped the entry points of `ruum_copy`
+/// (review-d3b required change 1). A statistics expression over `stat_plant` (falsely marked
+/// `IMMUTABLE`) tries to compute a pseudonym of the source's key and records whether it could:
+/// it runs, and it could not. Before, step 2 ran the `ANALYZE` while the entry points existed,
+/// and the copy's `seen` held `stats|planted` (a dictionary oracle on the masked values).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_analyze_of_the_masked_tables_cannot_reach_ruum_copy() {
+    let Some(engine) = engine().await else { return };
+    let f = planting_source(&engine, "SELECT 1").await;
+    let sync = ClassSync {
+        personal: vec![],
+        secret: vec!["sec"],
+    };
+    engine
+        .apply_migration(
+            f.db(),
+            &f.key,
+            &MigrationRequest {
+                up: "CREATE FUNCTION public.stat_leak(public.mood) RETURNS text LANGUAGE plpgsql AS $f$
+                     DECLARE planted text := 'planted';
+                     BEGIN
+                       BEGIN
+                         PERFORM ruum_copy.pseudonym('guess'::text);
+                       EXCEPTION WHEN OTHERS THEN planted := 'denied';
+                       END;
+                       INSERT INTO public.seen VALUES ('stats|' || planted);
+                       RETURN 'x';
+                     END $f$;
+                     CREATE FUNCTION public.stat_plant(public.mood) RETURNS text LANGUAGE plpgsql
+                       IMMUTABLE AS $f$ BEGIN RETURN public.stat_leak($1); END $f$;
+                     CREATE STATISTICS public.t_stat ON (public.stat_plant(sec)) FROM public.t;"
+                    .into(),
+                timeout: Duration::from_secs(10),
+                dry_run: false,
+            },
+            &sync,
+        )
+        .await
+        .expect("migration");
+    for sql in [
+        "INSERT INTO t VALUES (2, 'sad'), (3, 'happy')",
+        "DELETE FROM public.seen",
+    ] {
+        f.run(RoleKind::Owner, StatementMode::Write, sql, vec![])
+            .await
+            .expect("the source's rows");
+    }
+    let copy = masked_copy_of_planting(&engine, &f)
+        .await
+        .expect("the copy goes through");
+    let mut owner = session(&engine, &copy.database, RoleKind::Owner).await;
+    assert_eq!(
+        psql(
+            &mut owner,
+            "select coalesce(string_agg(distinct what, ','), '-') from public.seen \
+              where what like 'stats|%'",
+        )
+        .await
+        .unwrap(),
+        "stats|denied",
+        "the statistics expression ran in the copy's ANALYZE and could not reach ruum_copy"
+    );
+    close(owner).await;
 }
 
 /// A secret column of a composite type whose fields are all `NULL` shows the constant, in the

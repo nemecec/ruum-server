@@ -505,10 +505,11 @@ async fn hand_over(
     .await;
     let _ = conn.close().await;
     result?;
-    // 4. The copy's owner fills the materialized views that step 2 made again, now that the
-    // `ruum_copy` functions (the pseudonyms of the SOURCE key) are gone (Kimi re-check of D-3b).
-    if !masked_out.refresh.is_empty() {
-        refresh_views(engine, name, new, new_roles, &masked_out.refresh).await?;
+    // 4. The copy's owner fills the materialized views that step 2 made again and analyzes the
+    // masked tables, now that the `ruum_copy` functions (the pseudonyms of the SOURCE key) are
+    // gone (Kimi re-check of D-3b; review-d3b required change 1).
+    if !masked_out.refresh.is_empty() || masked_out.analyze.is_some() {
+        finish_masking(engine, name, new, new_roles, &masked_out).await?;
     }
     setup::grant_connect(engine, name, new_roles).await?;
     Ok(masked_out.left_out)
@@ -521,20 +522,23 @@ struct MaskOutcome {
     left_out: Vec<String>,
     /// The materialized views made again unpopulated, in the order they can be filled.
     refresh: Vec<String>,
+    /// The masked tables (a list for `ANALYZE`), analyzed in step 4.
+    analyze: Option<String>,
 }
 
 /// Step 4 of a masked copy, in a session of the copy's `owner`: fills each materialized view
-/// that the masking made again (`refresh`), from the masked tables. A view whose query fails
-/// stays unpopulated; it never holds a value of the source. This runs after step 3 has dropped
-/// the `ruum_copy` entry points, so tenant code in a view's query or in an index of it can no
-/// longer compute pseudonyms of the source's key (a dictionary attack on the masked values,
-/// Kimi re-check of D-3b).
-async fn refresh_views(
+/// that the masking made again (`refresh`), from the masked tables, and analyzes the masked
+/// tables (`analyze`). A view whose query fails stays unpopulated; it never holds a value of the
+/// source. This runs after step 3 has dropped the `ruum_copy` entry points, so tenant code in a
+/// view's query or in an index of it (Kimi re-check of D-3b), or in an extended-statistics
+/// expression that `ANALYZE` evaluates (review-d3b required change 1), can no longer compute
+/// pseudonyms of the source's key (a dictionary attack on the masked values).
+async fn finish_masking(
     engine: &PostgresEngine,
     name: &str,
     new: &NewDatabase,
     new_roles: &[EngineRole],
-    refresh: &[String],
+    masked: &MaskOutcome,
 ) -> Result<(), EngineError> {
     let state = DbState::new(
         name.to_string(),
@@ -547,11 +551,24 @@ async fn refresh_views(
     let (mut conn, _) = engine.pool(&state, RoleKind::Owner).open(engine).await?;
     let result = async {
         run(&mut conn, "begin", "begin".to_string()).await?;
-        for view in refresh {
+        for view in &masked.refresh {
             build_again(
                 &mut conn,
                 "fill a materialized view again",
                 format!("refresh materialized view {view}"),
+            )
+            .await?;
+        }
+        // The statistics of the masked tables (review FU-1 required change 2): the `ALTER
+        // COLUMN TYPE` of step 2 removed the source's `most_common_vals` and `histogram_bounds`
+        // of each masked column from `pg_statistic` and `pg_statistic_ext_data`, which
+        // `pg_stats` shows to the copy's owner. `ANALYZE` computes them again from the masked
+        // rows.
+        if let Some(list) = &masked.analyze {
+            run(
+                &mut conn,
+                "analyze the masked tables",
+                format!("analyze {list}"),
             )
             .await?;
         }
@@ -820,7 +837,7 @@ async fn empty_tables(conn: &mut PgConnection) -> Result<(), EngineError> {
 /// from the masked tables ([`dependent_views`]). Every masked column goes through
 /// `ALTER COLUMN TYPE`, which drops its `pg_statistic` rows and empties the extended statistics
 /// on it, also for a statistics target of 0 and for a table with no row; then the masked tables
-/// are analyzed again, so the statistics hold values of the masked rows, not of the source
+/// are analyzed again (in step 4, [`finish_masking`]), so the statistics hold values of the masked rows, not of the source
 /// (review FU-1 required changes 1 and 2, second review required change 1). Limits: a
 /// `schema_only` copy masks no column, so it keeps the source's statistics; a column that a
 /// policy, a generated column or a trigger's `WHEN` reads, and a column that a partition or an
@@ -1061,10 +1078,10 @@ async fn mask_columns(
             left_out.push(format!("{rel_name}.{name}"));
         }
     }
-    // The statistics of the masked tables (review FU-1 required change 2): the `ALTER COLUMN
-    // TYPE` above removed the source's `most_common_vals` and `histogram_bounds` of each masked
-    // column from `pg_statistic` and `pg_statistic_ext_data`, which `pg_stats` shows to the
-    // copy's owner. `ANALYZE` computes them again from the masked rows.
+    // The masked tables, analyzed in step 4 ([`finish_masking`]), not here: `ANALYZE`
+    // evaluates the expressions of extended statistics (`pg_statistic_ext.stxexprs`) as the
+    // owner, and here the owner may still call the `ruum_copy` pseudonym functions under the
+    // SOURCE key (review-d3b required change 1).
     let tables: Vec<String> = plan
         .columns
         .iter()
@@ -1081,12 +1098,13 @@ async fn mask_columns(
     .fetch_one(&mut *conn)
     .await
     .map_err(|e| internal("list the masked tables", e))?;
-    if let Some(list) = list {
-        run(conn, "analyze the masked tables", format!("analyze {list}")).await?;
-    }
     left_out.sort();
     left_out.dedup();
-    Ok(MaskOutcome { left_out, refresh })
+    Ok(MaskOutcome {
+        left_out,
+        refresh,
+        analyze: list,
+    })
 }
 
 /// A key, a `UNIQUE` or exclusion constraint or a unique index that [`mask_columns`] dropped
@@ -1472,7 +1490,7 @@ impl DependentView {
     /// masked columns (for example arithmetic on a personal number, which is now a pseudonym)
     /// refuses the copy. A materialized view is made again unpopulated: step 4 of the hand-over
     /// fills it from the masked tables after the `ruum_copy` functions are gone
-    /// ([`refresh_views`]), or leaves it unpopulated when its query fails on them. It never
+    /// ([`finish_masking`]), or leaves it unpopulated when its query fails on them. It never
     /// keeps a value of the source.
     async fn make_again(&self, conn: &mut PgConnection) -> Result<(), EngineError> {
         let with = if self.options.is_empty() {
