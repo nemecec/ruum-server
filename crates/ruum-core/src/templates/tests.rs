@@ -1249,6 +1249,36 @@ async fn project(w: &World) -> Project {
         let f = w.mkdir(root, name, Some(t)).await;
         w.file(f, "private.txt", "text/plain", b"private transcript\n")
             .await;
+        if t == "sessions" {
+            // A session as design 11.1 names it: a file of type agent_session.
+            w.file(
+                f,
+                "Sortable plant list",
+                "agent_session",
+                b"session in Sessions\n",
+            )
+            .await;
+        }
+    }
+    // A session loose in an ordinary folder, and the workspace's shared memory (design 11.1:
+    // `./.agents/memory/`, a path, not a type) at the root and in a nested folder.
+    w.file(
+        docs,
+        "Fix sign-in",
+        "agent_session",
+        b"loose session transcript\n",
+    )
+    .await;
+    for parent in [root, docs] {
+        let agents = w.mkdir(parent, ".agents", None).await;
+        let memory = w.mkdir(agents, "memory", None).await;
+        w.file(
+            memory,
+            "notes.md",
+            "text/markdown",
+            b"shared agent memory notes\n",
+        )
+        .await;
     }
     // An issue folder with an issue and a report attachment, an issue template, a smart folder.
     let issues = w.mkdir(root, "Issues", Some("issues")).await;
@@ -1342,6 +1372,14 @@ async fn create_template_copies_by_the_rules() {
     let docs = w.child(root, "Docs").await.unwrap();
     let plan = w.child(docs.id, "plan.txt").await.unwrap();
     assert_eq!(w.content(plan.id).await, b"plan v1\n");
+    // Neither the loose agent_session file nor the nested .agents folder came along.
+    let in_docs: Vec<String> = w
+        .children(&w.m(), docs.id)
+        .await
+        .into_iter()
+        .map(|n| n.name)
+        .collect();
+    assert_eq!(in_docs, ["plan.txt"]);
     // The app archive: the live archive's bytes.
     let tar = w.child(root, "shop.tar.gz").await.unwrap();
     assert_eq!(w.content(tar.id).await, p.archive);
@@ -1421,13 +1459,26 @@ async fn create_template_copies_by_the_rules() {
         LIVE_SECRET,
         "private transcript",
         "PNG attachment",
-    ] {
+    ]
+    .into_iter()
+    .chain(AGENT_TEXTS)
+    {
         assert!(!all.contains(s), "{s} leaked");
     }
     // Positive control of the search: the source project holds the private files.
     let source = everything(&w, p.root, usize::MAX, &Value::Null).await;
     assert!(source.contains("private transcript") && source.contains("PNG attachment"));
+    for s in AGENT_TEXTS {
+        assert!(source.contains(s), "{s} is in the source");
+    }
 }
+
+/// The contents of the fixture's agent sessions and agent memory (design 11.1).
+const AGENT_TEXTS: [&str; 3] = [
+    "session in Sessions",
+    "loose session transcript",
+    "shared agent memory notes",
+];
 
 #[tokio::test]
 async fn include_takes_issues_without_attachments_and_never_sessions() {
@@ -1487,6 +1538,14 @@ async fn include_takes_issues_without_attachments_and_never_sessions() {
     assert!(setup.contains(
         &json!({ "folder": { "path": "Board", "from": "Board", "type": "smart_folder" } })
     ));
+    // Every include, and still no session, agent memory, log or attachment.
+    let all = everything(&w, root, usize::MAX, &serde_json::to_value(&t).unwrap()).await;
+    for s in ["private transcript", "PNG attachment"]
+        .into_iter()
+        .chain(AGENT_TEXTS)
+    {
+        assert!(!all.contains(s), "{s} leaked");
+    }
 }
 
 #[tokio::test]
@@ -2237,4 +2296,117 @@ async fn a_caller_with_edit_only_frees_the_name_of_a_failed_copy() {
         .await
         .unwrap();
     assert!(p.items.is_empty());
+}
+
+/// Review fix 2 (card L-1): an issue schema that passes the request's checks but whose
+/// template.yaml the reader would refuse (more than 20 000 values, nesting deeper than 32) is
+/// refused with `422` before anything is written.
+#[tokio::test]
+async fn an_issue_schema_that_cannot_be_read_back_is_refused() {
+    let w = world().await;
+    // About 60 KiB compact (under the 64 KiB of check_issue), over 20 000 values.
+    let long_enum = json!({
+        "type": "object",
+        "properties": { "a": { "enum": vec![0; 30_000] } },
+    });
+    assert!(serde_json::to_string(&long_enum).unwrap().len() < 64 * 1024);
+    // Nested 20 levels of properties: within serde's limits, over the reader's 32.
+    let mut deep = json!({ "type": "string" });
+    for _ in 0..20 {
+        deep = json!({ "type": "object", "properties": { "a": deep } });
+    }
+    for (i, schema) in [long_enum, deep].into_iter().enumerate() {
+        assert!(
+            manifest::check_issue(&schema, None, "/issue").is_ok(),
+            "case {i} passes the request's own check"
+        );
+        let before = w.h.journal.entries(w.team.id).len();
+        let kids = w.children(&w.m(), w.projects).await.len();
+        let e = api(w
+            .t()
+            .create(
+                &w.s,
+                &w.m(),
+                w.issue(&format!("Unreadable {i}"), schema, None),
+            )
+            .await
+            .unwrap_err());
+        assert_eq!((e.0, e.1.as_str()), (422, "validation_failed"), "case {i}");
+        assert_eq!(e.3.unwrap()["pointer"], "/issue/schema", "case {i}");
+        assert_eq!(
+            w.h.journal.entries(w.team.id).len(),
+            before,
+            "nothing written"
+        );
+        assert_eq!(w.children(&w.m(), w.projects).await.len(), kids);
+    }
+    // Positive control through the same path: the gallery's four issue schemas read back.
+    let g = load_gallery();
+    for slug in [
+        "issue-bug",
+        "issue-feature",
+        "issue-question",
+        "issue-error",
+    ] {
+        let t = g.get(slug).unwrap();
+        let made = w
+            .t()
+            .create(
+                &w.s,
+                &w.m(),
+                w.issue(
+                    &format!("{slug} again"),
+                    t.manifest["issue"]["schema"].clone(),
+                    t.manifest["issue"].get("layout").cloned(),
+                ),
+            )
+            .await
+            .unwrap()
+            .value;
+        create::read_back(&made.manifest).unwrap();
+        let got = w
+            .t()
+            .get(&w.s, &w.m(), &made.node_id.unwrap().to_string())
+            .await
+            .unwrap();
+        assert_eq!(got.manifest, made.manifest);
+    }
+}
+
+/// Review fix 3 (card L-1): an app beside a file `<app>.tar.gz` (the archive it was deployed
+/// from). The source file keeps its name and bytes; the generated archive takes a free name,
+/// and the setup step names it.
+#[tokio::test]
+async fn an_app_beside_its_uploaded_archive_is_copied() {
+    let w = world().await;
+    let src = w.mkdir(w.projects, "Shop with upload", None).await;
+    w.file(
+        src,
+        "shop.tar.gz",
+        "application/gzip",
+        b"the uploaded archive bytes",
+    )
+    .await;
+    let archive = secret_app_archive();
+    w.app(src, "shop", &archive).await;
+    let t = w
+        .t()
+        .create(&w.s, &w.m(), w.project("Upload kit", src, vec![]))
+        .await
+        .unwrap()
+        .value;
+    let root = t.node_id.unwrap();
+    let uploaded = w.child(root, "shop.tar.gz").await.unwrap();
+    assert_eq!(w.content(uploaded.id).await, b"the uploaded archive bytes");
+    let setup = t.manifest["setup"].as_array().unwrap();
+    assert_eq!(setup.len(), 1);
+    let named = setup[0]["app"]["archive"].as_str().unwrap();
+    assert_ne!(named, "shop.tar.gz");
+    let generated = w.child(root, named).await.unwrap();
+    assert_eq!(w.content(generated.id).await, archive);
+    assert_eq!(
+        w.children(&w.m(), root).await.len(),
+        3,
+        "two archives and template.yaml"
+    );
 }

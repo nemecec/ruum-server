@@ -20,7 +20,7 @@
 //! |---|---|
 //! | folder, file | a new folder with the same name and type; a file through `copyNode` (head content, chunks shared) |
 //! | link (`shortcut`, `member`) | left out (provisional decision L1-D1) |
-//! | folder or file of a type in [`NEVER_TYPES`] (sessions, agent memory, logs) | never, also with `include` |
+//! | folder or file of a type in [`NEVER_TYPES`] (sessions, `agent_session` files, agent memory, logs), a folder named [`AGENTS_FOLDER`] (`.agents/memory/`, design 11.1) | never, also with `include` |
 //! | folder of type `issues` | left out unless `include` has `issues`; then the folder and only its files of type `issue` (their head content), never anything else in it (report attachments) |
 //! | file of type `issue` elsewhere, `issue_template` file, `smart_folder` folder | left out unless `include` names them |
 //! | web app | a file `<app name>.tar.gz` with the live deployment's archive (the same chunks, so the same bytes), and a setup step `app`; no secret, domain, role grant or binding |
@@ -63,8 +63,10 @@ pub const MAX_PATH_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_SETUP_STEPS: usize = 50;
 /// The most nodes that the scan reads (copied or left out).
 pub const MAX_SCANNED: usize = 4 * MAX_COPY_NODES;
-/// Folder and file types that are never in a template: sessions, agent memory and logs.
+/// Folder and file types that are never in a template: sessions, agent memory and logs. A
+/// session is a file of type `agent_session` (design 11.1).
 pub const NEVER_TYPES: &[&str] = &[
+    "agent_session",
     "sessions",
     "session",
     "agent_memory",
@@ -72,6 +74,9 @@ pub const NEVER_TYPES: &[&str] = &[
     "logs",
     "log",
 ];
+/// The folder of a workspace's agent files (design 11.1: the shared memory is
+/// `./.agents/memory/`): left out by name at every level, whatever its type.
+pub const AGENTS_FOLDER: &str = ".agents";
 /// The folder type of an issue folder.
 pub const ISSUES_TYPE: &str = "issues";
 /// The file type of an issue.
@@ -255,6 +260,17 @@ async fn create_issue(
         let pointer = p.pointer.clone();
         manifest::Problem::new(pointer, p.message).into_error()
     })?;
+    // The file as written must read back (the YAML reader's size, depth and value limits are
+    // tighter than the request's checks): refused before anything is written.
+    read_back(&manifest).map_err(|p| {
+        invalid(
+            "/issue/schema",
+            format!(
+                "the schema is too large or too deeply nested for template.yaml: {}",
+                p.message
+            ),
+        )
+    })?;
     let root = make_root(s, ctx, req.parent_id, &name).await?;
     let done = write_manifest(s, ctx, &root, &manifest).await;
     finish(s, ctx, root, manifest, done).await
@@ -304,11 +320,13 @@ async fn create_project(
             m.insert("placeholders".into(), Value::Object(placeholders));
         }
         let manifest = Value::Object(m);
-        manifest::check(&manifest).map_err(|p| {
-            Error::Internal(format!(
-                "templates: a generated template.yaml is not valid: {p}"
-            ))
-        })?;
+        manifest::check(&manifest)
+            .and_then(|()| read_back(&manifest))
+            .map_err(|p| {
+                Error::Internal(format!(
+                    "templates: a generated template.yaml is not valid: {p}"
+                ))
+            })?;
         let w = write_manifest(s, ctx, &root, &manifest).await?;
         Ok((w, manifest))
     }
@@ -479,7 +497,9 @@ async fn scan(
                     }
                 },
                 NodeKind::Folder => {
-                    if NEVER_TYPES.contains(&t.as_str()) {
+                    if NEVER_TYPES.contains(&t.as_str())
+                        || crate::nodes::name_key(&child.name) == AGENTS_FOLDER
+                    {
                         continue;
                     }
                     match t.as_str() {
@@ -748,7 +768,14 @@ async fn copy_entries(
     map.insert(source.id, root);
     let mut folders: Vec<Value> = Vec::new();
     let mut apps: Vec<Value> = Vec::new();
-    for e in &scan.entries {
+    // The app archives come after every other entry (they need only their parent's copy): a
+    // source file `<app>.tar.gz` beside the app keeps its name, and the generated archive takes
+    // a free one (`OnConflict::Rename`; the setup step names the file as written).
+    let (rest, app_entries): (Vec<&Entry>, Vec<&Entry>) = scan
+        .entries
+        .iter()
+        .partition(|e| !matches!(e.what, What::App(_)));
+    for e in rest.into_iter().chain(app_entries) {
         let parent = *map
             .get(&e.parent)
             .ok_or_else(|| Error::Internal("templates: a copy without its parent".into()))?;
@@ -859,6 +886,21 @@ pub fn manifest_text(manifest: &Value) -> String {
         "# template.yaml, made by createTemplate (contracts/manifests/template.schema.json)\n{}\n",
         serde_json::to_string_pretty(manifest).unwrap_or_default()
     )
+}
+
+/// Whether the text of `manifest` (as [`write_manifest`] writes it) reads back as a valid
+/// manifest equal to it: the reader of `getTemplate` and `listTemplates` refuses files over
+/// 256 KiB, nesting deeper than 32 and more than 20 000 values.
+pub fn read_back(manifest: &Value) -> std::result::Result<(), manifest::Problem> {
+    let back = manifest::parse(manifest_text(manifest).as_bytes())?;
+    manifest::check(&back)?;
+    if &back != manifest {
+        return Err(manifest::Problem::new(
+            "",
+            "template.yaml does not read back as written",
+        ));
+    }
+    Ok(())
 }
 
 /// Writes `template.yaml` into the template folder (last, so the template is complete when it

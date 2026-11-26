@@ -8,7 +8,7 @@ fields:
   - name: path
     kind: log_field
     class: normal
-    reason: the route of the request, without the query
+    reason: the matched route ("/", "/notes" or "other"), never the raw path
   - name: status
     kind: log_field
     class: normal
