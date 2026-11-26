@@ -440,4 +440,14 @@ pub trait NodeStore: Send + Sync {
             "nodes: is_trashed is not supported here".into(),
         ))
     }
+    /// The ancestors of a node of the context's tenant as nodes, root first, without the node.
+    /// No permission check: for the server's own refusals (`createTemplate` refuses a source
+    /// inside `.agents`, a session, log or memory folder or an issue folder), never for an
+    /// answer. Stores that do not answer it refuse (fail closed).
+    async fn ancestor_nodes(&self, ctx: &Context, id: NodeId) -> Result<Vec<Node>> {
+        let _ = (ctx, id);
+        Err(crate::error::Error::Internal(
+            "nodes: ancestor_nodes is not supported here".into(),
+        ))
+    }
 }

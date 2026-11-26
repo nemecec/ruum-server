@@ -1548,6 +1548,97 @@ async fn include_takes_issues_without_attachments_and_never_sessions() {
     }
 }
 
+/// Kimi run 16, L-1 findings 1 and 2 (S-95): the copy rules leave out issue folders (their
+/// report attachments), `.agents` and the session, log and memory folders below the source; the
+/// source itself, or a source inside one of them, is refused before anything is written, with
+/// every `include` and for a caller with `view` only on the source (not on its ancestors).
+#[tokio::test]
+async fn a_source_that_is_or_is_inside_an_excluded_folder_is_refused() {
+    let w = world().await;
+    let p = project(&w).await;
+    let issues = w.child(p.root, "Issues").await.unwrap().id;
+    let old = w.mkdir(issues, "Old", None).await;
+    w.file(old, "trace.png", "image/png", b"\x89PNG nested attachment")
+        .await;
+    let agents = w.child(p.root, ".agents").await.unwrap().id;
+    let memory = w.child(agents, "memory").await.unwrap().id;
+    let sessions = w.child(p.root, "Sessions").await.unwrap().id;
+    let year = w.mkdir(sessions, "2026", None).await;
+    w.file(year, "old.txt", "text/plain", b"private transcript\n")
+        .await;
+    let logs = w.child(p.root, "Logs").await.unwrap().id;
+    let week = w.mkdir(logs, "week", None).await;
+
+    // A guest with edit on its own folder and view only on the source.
+    let gf = w.mkdir(w.projects, "Guest space", None).await;
+    w.s.sharing
+        .add_grant(&w.o(), gf, Grantee::User { id: w.guest }, Role::Edit)
+        .await
+        .unwrap();
+    for src in [issues, memory] {
+        w.s.sharing
+            .add_grant(&w.o(), src, Grantee::User { id: w.guest }, Role::View)
+            .await
+            .unwrap();
+    }
+    let guest = ctx(w.team.id, w.guest);
+
+    let includes = [
+        vec![],
+        vec![Include::Issues],
+        vec![
+            Include::Issues,
+            Include::IssueTemplates,
+            Include::SmartFolders,
+        ],
+    ];
+    let journal = |w: &World| w.h.journal.entries(w.team.id).len();
+    for (what, src) in [
+        ("the issue folder", issues),
+        ("a folder inside the issue folder", old),
+        ("the .agents folder", agents),
+        ("the agent memory inside .agents", memory),
+        ("a folder inside Sessions", year),
+        ("a folder inside Logs", week),
+    ] {
+        for include in &includes {
+            for (who, c, parent) in [("member", w.m(), w.projects), ("guest", guest.clone(), gf)] {
+                if who == "guest" && ![issues, memory].contains(&src) {
+                    continue;
+                }
+                let mut req = w.project("Excluded kit", src, include.clone());
+                req.parent_id = parent;
+                let before = journal(&w);
+                let kids = w.children(&w.o(), parent).await.len();
+                let e = api(w.t().create(&w.s, &c, req).await.unwrap_err());
+                assert_eq!(
+                    (e.0, e.1.as_str()),
+                    (422, "validation_failed"),
+                    "{what}, {who}, {include:?}"
+                );
+                assert_eq!(journal(&w), before, "{what}: nothing written");
+                assert_eq!(w.children(&w.o(), parent).await.len(), kids);
+            }
+        }
+    }
+
+    // Positive controls: an ordinary folder beside them, and one whose name only looks alike,
+    // are saved; the guest saves an ordinary folder it can view (`project` gives it `comment`
+    // on Docs).
+    let lookalike = w.mkdir(p.root, ".agents-notes", None).await;
+    w.file(lookalike, "n.txt", "text/plain", b"n").await;
+    for (i, src) in [p.docs, lookalike].into_iter().enumerate() {
+        let name = format!("Plain kit {i}");
+        w.t()
+            .create(&w.s, &w.m(), w.project(&name, src, vec![Include::Issues]))
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+    }
+    let mut req = w.project("Guest kit", p.docs, vec![]);
+    req.parent_id = gf;
+    w.t().create(&w.s, &guest, req).await.unwrap();
+}
+
 #[tokio::test]
 async fn a_database_is_refused_and_nothing_is_written() {
     let w = world().await;
@@ -2057,6 +2148,9 @@ impl crate::nodes::NodeStore for Leaky {
     }
     async fn ancestors(&self, c: &Context, id: NodeId) -> Result<Vec<NodeId>> {
         self.inner.ancestors(c, id).await
+    }
+    async fn ancestor_nodes(&self, c: &Context, id: NodeId) -> Result<Vec<Node>> {
+        self.inner.ancestor_nodes(c, id).await
     }
 }
 

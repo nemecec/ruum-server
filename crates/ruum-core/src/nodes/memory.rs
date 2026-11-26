@@ -1608,6 +1608,14 @@ impl NodeStore for MemoryNodeStore {
     async fn is_trashed(&self, ctx: &Context, id: NodeId) -> Result<bool> {
         Ok(self.st().row(ctx.tenant, id)?.node.trashed_at.is_some())
     }
+
+    async fn ancestor_nodes(&self, ctx: &Context, id: NodeId) -> Result<Vec<Node>> {
+        let st = self.st();
+        st.ancestors(ctx.tenant, id)?
+            .into_iter()
+            .map(|a| st.row(ctx.tenant, a).map(|r| r.node.clone()))
+            .collect()
+    }
 }
 
 /// A `ChangeInfo` without a journal entry (a write that changed nothing).

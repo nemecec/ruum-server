@@ -5,7 +5,9 @@
 //! - `edit` on `parent_id` (agents within their scope); for `kind: project`, `view` on
 //!   `source_id`, which must be a live folder of the caller's tenant (`404` otherwise, no
 //!   existence leak; `422` for a node that is not a folder, or a folder that can never be in a
-//!   template). The parent may not be the source or inside it (`422`).
+//!   template: a folder of a type in [`NEVER_TYPES`] or of type `issues`, a folder named
+//!   [`AGENTS_FOLDER`], or a folder inside one of these). The parent may not be the source or
+//!   inside it (`422`).
 //! - `kind: issue`: `issue` is required and follows [`super::manifest::check_issue`]; `source_id`
 //!   and `include` are refused (`422`). The template folder holds only `template.yaml`.
 //! - `kind: project`: the source's live subtree is scanned with the rules below. A database is
@@ -371,6 +373,29 @@ async fn source_folder(s: &Services, ctx: &Context, id: NodeId) -> Result<Node> 
         return Err(invalid(
             "/source_id",
             "sessions, agent memory and logs are never saved as a template",
+        ));
+    }
+    // The copy rules leave these folders out below the source; the source itself and its
+    // ancestors must not be one either, or choosing the excluded folder (or a folder inside
+    // it) as the source would copy what the rules never copy: agent memory, sessions, logs,
+    // and an issue folder's report attachments (Kimi run 16, L-1 findings 1 and 2; S-95).
+    let excluded = |n: &Node| {
+        let t = type_of(n);
+        NEVER_TYPES.contains(&t)
+            || t == ISSUES_TYPE
+            || crate::nodes::name_key(&n.name) == AGENTS_FOLDER
+    };
+    if excluded(&node)
+        || s.nodes
+            .ancestor_nodes(ctx, node.id)
+            .await?
+            .iter()
+            .any(excluded)
+    {
+        return Err(invalid(
+            "/source_id",
+            "a .agents folder, a session, log, memory or issue folder, or a folder inside one, \
+             is never saved as a template; save the project folder instead",
         ));
     }
     Ok(node)
