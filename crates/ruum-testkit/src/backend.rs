@@ -220,7 +220,7 @@ impl Backend {
     /// tenants are new, so worlds do not meet.
     pub async fn app_state(&self) -> AppState {
         with_gallery(match &self.pg {
-            None => AppState::in_memory(),
+            None => with_database_bindings(AppState::in_memory()),
             Some(pg) => {
                 let pool = pg
                     .run_pool
@@ -238,7 +238,10 @@ impl Backend {
     /// services. Call [`WorldDb::finish`] on the database when the world is done.
     pub async fn world(&self) -> (AppState, Option<WorldDb>) {
         match &self.pg {
-            None => (with_gallery(AppState::in_memory()), None),
+            None => (
+                with_gallery(with_database_bindings(AppState::in_memory())),
+                None,
+            ),
             Some(pg) => {
                 let n = pg.worlds.fetch_add(1, Ordering::Relaxed);
                 let database = pg.copy(&format!("w{n}")).await;
@@ -327,7 +330,15 @@ impl Pg {
         };
         let memory = Engines::memory();
         let postgres = match PostgresConfig::from_env() {
-            Some(config) => match PostgresEngine::connect(config).await {
+            Some(mut config) => match PostgresEngine::connect({
+                // The suites' databases and the app roles of their bindings (card B-1d) stay
+                // in the shared data cluster, as in the engine tests: they do not count
+                // against the app connection budget.
+                config.app_connection_budget = Some(1_000_000);
+                config
+            })
+            .await
+            {
                 Ok(e) => Some(Arc::new(e) as Arc<dyn DatabaseEngine>),
                 Err(e) => {
                     eprintln!(
@@ -479,6 +490,13 @@ impl Pg {
 
 /// The services with the repository's gallery (card L-1), loaded once per process: the
 /// suites see the gallery templates in `listTemplates` as the server does.
+/// The in-memory services with the database bindings of apps on (card B-1d), as `ruum-server`
+/// has them: the memory store of app roles over the memory database rows.
+fn with_database_bindings(state: AppState) -> AppState {
+    ruum_core::apps::install_database_bindings(&state.services, None);
+    state
+}
+
 fn with_gallery(mut state: AppState) -> AppState {
     use ruum_core::templates::{DirTemplateSource, LoadOptions, TemplateService};
     static GALLERY: std::sync::OnceLock<Arc<TemplateService>> = std::sync::OnceLock::new();

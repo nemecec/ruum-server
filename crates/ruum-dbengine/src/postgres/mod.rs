@@ -95,6 +95,16 @@ pub struct PostgresConfig {
     /// `ruum_dbhost` may not set `temp_file_limit` (backlog D5-3): without it one app could
     /// fill the cluster's disk. `false` only where that is accepted (tests, the laptop).
     pub app_require_temp_file_limit: bool,
+    /// The host that the credentials of an app name (`RUUM_DATA_APP_HOST`); `None`: the host of
+    /// `dbhost_url`. The pooler of backlog D5-4 sets it later (card B-1d).
+    pub app_host: Option<String>,
+    /// The port that the credentials of an app name (`RUUM_DATA_APP_PORT`); `None`: the port of
+    /// `dbhost_url` (card B-1d).
+    pub app_port: Option<u16>,
+    /// The most connections that the app roles of one tenant may have together (the sum of
+    /// their limits, `RUUM_DATA_APP_TENANT_SHARE`); `None`: a tenth of the app budget (backlog
+    /// D5-10, card B-1d). A new app role over it is refused like one over the budget.
+    pub app_tenant_share: Option<u32>,
 }
 
 impl std::fmt::Debug for PostgresConfig {
@@ -124,11 +134,14 @@ impl PostgresConfig {
             app_idle_in_transaction_timeout: Duration::from_secs(60),
             app_temp_file_limit_kb: 1024 * 1024,
             app_require_temp_file_limit: true,
+            app_host: None,
+            app_port: None,
+            app_tenant_share: None,
         }
     }
 
     /// The settings from the environment: `RUUM_DBHOST_URL` (required), `RUUM_DATA_CLUSTER`,
-    /// `RUUM_PG_DUMP`.
+    /// `RUUM_PG_DUMP`, `RUUM_DATA_APP_HOST`, `RUUM_DATA_APP_PORT`, `RUUM_DATA_APP_TENANT_SHARE`.
     pub fn from_env() -> Option<PostgresConfig> {
         let url = std::env::var("RUUM_DBHOST_URL")
             .ok()
@@ -143,6 +156,23 @@ impl PostgresConfig {
             && !p.is_empty()
         {
             config.pg_dump = p;
+        }
+        if let Ok(h) = std::env::var("RUUM_DATA_APP_HOST")
+            && !h.is_empty()
+        {
+            config.app_host = Some(h);
+        }
+        if let Some(p) = std::env::var("RUUM_DATA_APP_PORT")
+            .ok()
+            .and_then(|p| p.trim().parse::<u16>().ok())
+        {
+            config.app_port = Some(p);
+        }
+        if let Some(n) = std::env::var("RUUM_DATA_APP_TENANT_SHARE")
+            .ok()
+            .and_then(|n| n.trim().parse::<u32>().ok())
+        {
+            config.app_tenant_share = Some(n);
         }
         Some(config)
     }

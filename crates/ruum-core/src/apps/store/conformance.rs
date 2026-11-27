@@ -1092,6 +1092,67 @@ pub(crate) async fn bindings_stay_in_their_tenant(h: &dyn Harness) {
     assert_eq!(s.list_bindings(a, &all).await.unwrap().len(), 1);
 }
 
+/// Card B-1d: the active `database_branch` rows of an app's binding by the draft label of
+/// their preview, in their tenant only (another tenant, another name, another label, another
+/// kind and a revoked row are not found).
+pub(crate) async fn draft_branch_bindings_stay_in_their_tenant(h: &dyn Harness) {
+    let s = h.store();
+    let authz = crate::authz::memory::MemoryAuthz::default();
+    let (a, ua) = h.tenant().await;
+    let (b, _) = h.tenant().await;
+    let n = h.app_node(a, ua).await;
+    let ca = ctx(a, ua);
+    s.insert_app(&ca, app(n, &unique("drafted")))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut d = deployment(n, Environment::Preview, DeploymentState::Ready);
+    d.draft = Some("main".into());
+    let p = s.insert_deployment(&ca, d).await.unwrap();
+    let branch = NewBinding {
+        kind: BindingKind::DatabaseBranch,
+        role: Some(crate::authz::Role::Edit),
+        ..new_binding(n, p.id, "shop", n)
+    };
+    let rows = s
+        .grant_bindings(&ca, &authz, vec![branch, new_binding(n, p.id, "docs", n)])
+        .await
+        .unwrap();
+    let found = s
+        .draft_branch_bindings(a, n, "shop", "main", 10)
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, rows[0].id);
+    assert!(
+        s.draft_branch_bindings(b, n, "shop", "main", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        s.draft_branch_bindings(a, n, "shop", "other", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        s.draft_branch_bindings(a, n, "docs", "main", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    s.revoke_bindings(&ca, &authz, &[rows[0].id], RevokeReason::PreviewExpired)
+        .await
+        .unwrap();
+    assert!(
+        s.draft_branch_bindings(a, n, "shop", "main", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 /// Card I-6: the edge's question before a certificate. A live host is known only while its app
 /// has a live deployment; a preview host only with the short ID of a pending, running or ready
 /// preview of that app that has not expired (review of I-6 1). Another tenant's app slug or short
@@ -1260,6 +1321,7 @@ pub(crate) async fn run_all(h: &dyn Harness) {
     purge_pages_stay_in_their_app(h).await;
     bindings_rows_and_their_end(h).await;
     bindings_stay_in_their_tenant(h).await;
+    draft_branch_bindings_stay_in_their_tenant(h).await;
     app_hosts_are_known_only_for_real_apps(h).await;
 }
 
@@ -1972,5 +2034,6 @@ pub(crate) mod tests {
         deployments_stay_in_their_tenant(&h).await;
         purge_pages_stay_in_their_app(&h).await;
         bindings_stay_in_their_tenant(&h).await;
+        draft_branch_bindings_stay_in_their_tenant(&h).await;
     }
 }

@@ -1551,6 +1551,34 @@ impl AppStore for PgAppStore {
         rows.iter().map(binding_row).collect()
     }
 
+    async fn draft_branch_bindings(
+        &self,
+        tenant: TenantId,
+        app: NodeId,
+        name: &str,
+        draft: &str,
+        limit: u32,
+    ) -> Result<Vec<BindingRow>> {
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "select {} from app_bindings b join app_deployments d \
+             on d.tenant_id = b.tenant_id and d.id = b.deployment_id \
+             where b.tenant_id = $1 and d.tenant_id = $1 and b.app_node_id = $2 \
+             and b.name = $3 and b.kind = 'database_branch' and b.revoked_at is null \
+             and d.draft = $4 order by b.id limit $5",
+            binding_columns("b.")
+        )))
+        .bind(tenant)
+        .bind(app)
+        .bind(name)
+        .bind(draft)
+        .bind(i64::from(limit))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter().map(binding_row).collect()
+    }
+
     async fn ended_preview_bindings(
         &self,
         tenant: TenantId,

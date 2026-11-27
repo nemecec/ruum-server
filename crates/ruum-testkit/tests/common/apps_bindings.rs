@@ -1,9 +1,11 @@
-//! App cases of card B-1: bindings without database bindings (`docs/STEP3.md` rules 5 and 6,
-//! decisions 0006-3 and 0006-5). A folder binding is granted to the preview principal and,
+//! App cases of cards B-1 and B-1d: bindings (`docs/STEP3.md` rules 5 and 6, decisions 0006-3
+//! and 0006-5). A folder binding is granted to the preview principal and,
 //! at publish, to the live principal; a dropped binding loses its tuple; a superseded preview
 //! and a trashed app lose theirs; an API binding passes its check and waits for card B-3, a
-//! preview getting only the called API's `preview_scopes`. The tuples are read from the
-//! engine of the services (memory or SpiceDB). See [`super::apps`].
+//! preview getting only the called API's `preview_scopes`. A database binding (card B-1d)
+//! gives a preview a role on a masked branch of its own and the live app a role on the live
+//! database; a SQLite database is refused. The tuples are read from the engine of the services
+//! (memory or SpiceDB). See [`super::apps`].
 
 use super::apps::*;
 use super::{Case, Ctx, Fail};
@@ -94,6 +96,11 @@ async fn rows_on(cx: &Ctx, target: &str) -> Result<Vec<ruum_core::apps::store::B
 /// A manifest with the node binding `docs` (`view`) to `node`.
 fn bound(node: &str) -> String {
     format!("runtime: static\nbindings:\n  docs:\n    node: \"{node}\"\n    role: view\n")
+}
+
+/// A manifest with the database binding `shop` (`role`) to `node`.
+fn db_bound(node: &str, role: &str) -> String {
+    format!("runtime: static\nbindings:\n  shop:\n    node: \"node:{node}\"\n    role: {role}\n")
 }
 
 /// A manifest with the API binding `shop` to the fixture app's API `orders`.
@@ -463,6 +470,155 @@ pub fn cases() -> Vec<Case> {
                     );
                 }
                 Ok(())
+            }
+        ),
+        case!(
+            "database_binding_previews_on_a_masked_branch_then_binds_the_live_database",
+            [
+                "createDatabase",
+                "getDatabase",
+                "createApp",
+                "createNode",
+                "putContent",
+                "createAppDeployment",
+                "getAppDeployment",
+                "publishAppDeployment"
+            ],
+            "member binds a postgres database (edit) as shop: the preview is ready with the \
+             stage bindings done; its row is database_branch on a branch of the database \
+             (getDatabase: branch_of the database, branch_data masked) that app:<preview> can \
+             edit, and app:<preview> has no right on the live database; after the publish \
+             app:<app> can edit the live database; a release without the binding takes that \
+             away (card B-1d, decision 0006-5)",
+            |cx| {
+                let db = super::api::new_database(
+                    &cx,
+                    Who::Member,
+                    cx.a().projects,
+                    "bound shop db",
+                    super::api::Engine::Postgres,
+                )
+                .await?;
+                let app = app_id(&new_app(&cx, Who::Member, cx.a().projects, "db app").await?)?;
+                let s = site(
+                    &cx,
+                    Who::Member,
+                    cx.a().projects,
+                    "db site",
+                    &db_bound(&db, "edit"),
+                )
+                .await?;
+                let p = preview(&cx, Who::Member, &app, from_folder(&s.folder, None)).await?;
+                let pid = str_at(&p, "/id")?;
+                check!(
+                    stage_state(&p, "bindings") == "done",
+                    "stage bindings: {}",
+                    p["stages"]
+                );
+                let rows: Vec<_> = cx
+                    .state
+                    .services
+                    .apps
+                    .store()
+                    .list_bindings(
+                        cx.a().id,
+                        &ruum_core::apps::store::BindingQuery {
+                            principal: Some(uuid_of(&pid)?),
+                            active_only: true,
+                            limit: 10,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|e| Fail::Failed(format!("binding rows: {e}")))?;
+                check!(rows.len() == 1, "the preview's rows: {rows:?}");
+                check!(
+                    rows[0].kind == ruum_core::apps::store::BindingKind::DatabaseBranch,
+                    "not a database_branch row: {rows:?}"
+                );
+                let branch = rows[0].target_node_id.to_string();
+                check!(branch != db, "the preview is bound to the live database");
+                let b = cx
+                    .ok(Who::Member, super::api::get_database(&cx, &branch), &[200])
+                    .await?;
+                check!(
+                    b["branch_of"] == db.as_str() && b["branch_data"] == "masked",
+                    "the preview's branch: {b}"
+                );
+                check!(
+                    app_sees(&cx, &pid, &branch).await?,
+                    "app:<preview> cannot reach its branch"
+                );
+                check!(
+                    !app_sees(&cx, &pid, &db).await?,
+                    "app:<preview> reaches the live database"
+                );
+                go_live(&cx, Who::Member, &app, &pid).await?;
+                check!(
+                    app_sees(&cx, &app, &db).await?,
+                    "app:<app> cannot reach the live database after the publish"
+                );
+                let none = site(
+                    &cx,
+                    Who::Member,
+                    cx.a().projects,
+                    "db site without",
+                    "runtime: static\n",
+                )
+                .await?;
+                let p2 = preview(&cx, Who::Member, &app, from_folder(&none.folder, None)).await?;
+                go_live(&cx, Who::Member, &app, &str_at(&p2, "/id")?).await?;
+                check!(
+                    !app_sees(&cx, &app, &db).await?,
+                    "app:<app> keeps the live database after a release without the binding"
+                );
+                Ok(())
+            }
+        ),
+        case!(
+            "database_binding_of_a_sqlite_database_is_refused",
+            [
+                "createDatabase",
+                "getDatabase",
+                "createApp",
+                "createNode",
+                "putContent",
+                "createAppDeployment",
+                "listAppDeployments"
+            ],
+            "member binds a SQLite database: 422 validation_failed at /bindings/shop/node, with \
+             no deployment left (an app cannot bind a SQLite database yet; backlog D5-2)",
+            |cx| {
+                let db = super::api::new_database(
+                    &cx,
+                    Who::Member,
+                    cx.a().projects,
+                    "bound lite db",
+                    super::api::Engine::Sqlite,
+                )
+                .await?;
+                let app = app_id(&new_app(&cx, Who::Member, cx.a().projects, "lite app").await?)?;
+                let s = site(
+                    &cx,
+                    Who::Member,
+                    cx.a().projects,
+                    "lite site",
+                    &db_bound(&db, "view"),
+                )
+                .await?;
+                let err = cx
+                    .refused(
+                        Who::Member,
+                        create_deployment(&cx, &app, from_folder(&s.folder, None)),
+                        422,
+                        &["validation_failed"],
+                    )
+                    .await?;
+                check!(
+                    err["details"]["pointer"] == "/bindings/shop/node",
+                    "error.details: {err}"
+                );
+                no_new_deployment(&cx, &app, &[], "a SQLite binding").await
             }
         ),
         case!(

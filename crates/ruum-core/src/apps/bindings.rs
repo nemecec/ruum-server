@@ -1,9 +1,10 @@
 //! Bindings of web apps (card B-1; `docs/STEP3.md` "How an app runs" rules 5 and 6, design 9.4
 //! and 9.10, decisions 0006-3 and 0006-5): the resolution of the targets at deploy time, the
 //! deployer check, the rows of `app_bindings` and their tuples for the live and the preview
-//! principals, and the end of bindings. Database bindings wait for card B-1d (after step 2
-//! card D-5); the scope tuples of API bindings, the network rule and the gateway headers are
-//! card B-3's.
+//! principals, and the end of bindings. Database bindings (card B-1d, after step 2 card D-5)
+//! are in [`database`]: a masked branch per preview, an app role per binding, short-lived
+//! credentials at start. The scope tuples of API bindings, the network rule and the gateway
+//! headers are card B-3's.
 //!
 //! # Resolution
 //!
@@ -35,8 +36,13 @@
 //!   `node:N#viewer@app:<principal>`: the principal is the app node ID for the live app and the
 //!   deployment ID for a preview. A preview's node bindings are capped at `view`
 //!   ([`preview_role`]).
-//! - A **database** binding runs the deployer check, then `409 conflict`, hint
-//!   `bindings_not_ready`, `error.details.binding`, until card B-1d.
+//! - A **database** binding runs the deployer check on the live database (a database in the
+//!   trash fails like a missing node; a branch as the target and a SQLite database are `422`
+//!   with the pointer `/bindings/<name>/node`). A preview gets the binding's role on a masked
+//!   branch of its own, the live principal a `node` row on the database; each row gets an app
+//!   role on the data cluster ([`database`]). While the server's database bindings are off
+//!   ([`super::install_database_bindings`] did not run) it is `409 conflict`, hint
+//!   `bindings_not_ready` (fail closed).
 //! - An **API** binding resolves the called app (a web app node, same rules; another node type
 //!   is `422`, pointer `/bindings/<name>/node`), checks the API and each scope against the called
 //!   app's live manifest (`422`, pointers `/bindings/<name>/api` and
@@ -93,8 +99,12 @@
 //! that races the delete branch loses its tuple until the next round (fail closed).
 //!
 //! The repair deletes every `node#viewer|editor@app:*` tuple on a bound target that no active
-//! row implies. Only this module writes such tuples today; a later card that writes them
-//! (B-1d, R-3) must write a row for each, or the repair removes it.
+//! row implies. Only this module writes such tuples today; a later card that writes them (R-3)
+//! must write a row for each, or the repair removes it. On a database target the repair also
+//! makes the app roles follow the active rows ([`database::DatabaseBindings::repair_target`]).
+//!
+//! Every end drops the app roles of its database rows before the rows end, and trashes the
+//! preview branches that no active row uses any more ([`Ends`]).
 
 use super::store::{BindingKind, BindingQuery, BindingRow, Environment, NewBinding, RevokeReason};
 use super::{AppService, NODE_TYPE};
@@ -108,6 +118,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+pub mod database;
+#[cfg(test)]
+mod database_tests;
 #[cfg(test)]
 mod tests;
 
@@ -217,17 +230,28 @@ pub struct Resolved {
     /// The scopes the principal gets (after the preview cap).
     pub scopes: Vec<String>,
     pub on_behalf_of_user: bool,
+    /// The binding waits for a card: an API binding (card B-3), a database binding while the
+    /// database bindings are off ([`refuse_not_ready`]).
+    pub pending: bool,
 }
 
 impl Resolved {
-    /// The same grant as the row `b` (the row of the same principal stays at a publish).
+    /// The same grant as the row `b` (the row of the same principal stays at a publish). A
+    /// live database binding is a `node` row on the database (card B-1d).
     fn same_as(&self, b: &BindingRow) -> bool {
-        self.kind == ResolvedKind::Node
+        self.grants_role()
             && b.kind == BindingKind::Node
             && b.name == self.name
             && b.target_node_id == self.target
             && b.role == self.role
             && b.on_behalf_of_user == self.on_behalf_of_user
+    }
+}
+
+impl Resolved {
+    /// A node or a database binding: a role on its target, a row of the principal.
+    pub fn grants_role(&self) -> bool {
+        matches!(self.kind, ResolvedKind::Node | ResolvedKind::Database) && !self.pending
     }
 }
 
@@ -355,10 +379,14 @@ fn token(s: &str) -> String {
     s.replace('~', "~0").replace('/', "~1")
 }
 
-/// `409 conflict`, hint `bindings_not_ready`, for the first database or API binding: database
-/// bindings wait for card B-1d, API bindings for card B-3 (fail closed). Node bindings pass.
+/// `409 conflict`, hint `bindings_not_ready`, for the first pending binding: API bindings wait
+/// for card B-3, database bindings for a server whose database bindings are on (card B-1d;
+/// fail closed). Node bindings pass.
 pub fn refuse_not_ready(resolved: &[Resolved]) -> Result<()> {
     for r in resolved {
+        if !r.pending {
+            continue;
+        }
         let (what, mut details) = match r.kind {
             ResolvedKind::Node => continue,
             ResolvedKind::Database => (
@@ -688,6 +716,17 @@ impl AppService {
         } else {
             ResolvedKind::Node
         };
+        // A database binding (card B-1d): the live database of the tenant, a postgres one.
+        let pending = match (kind, self.db()) {
+            (ResolvedKind::Database, Some(db)) => {
+                db.check_target(ctx.tenant, name, node.id).await?;
+                false
+            }
+            (ResolvedKind::Database, None) => true,
+            _ => false,
+        };
+        // A preview's node bindings are capped at `view`; a preview's database binding keeps
+        // its role, on a masked branch of its own.
         let granted = match (env, kind) {
             (Environment::Preview, ResolvedKind::Node) => preview_role(role),
             _ => role,
@@ -703,6 +742,7 @@ impl AppService {
                 .get("on_behalf_of_user")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            pending,
         })
     }
 
@@ -798,6 +838,7 @@ impl AppService {
             api: Some(api.to_string()),
             scopes,
             on_behalf_of_user: false,
+            pending: true,
         })
     }
 
@@ -850,7 +891,39 @@ impl AppService {
             .check_bindings(ctx, app, manifest, Environment::Preview, &BTreeMap::new())
             .await?;
         refuse_not_ready(&resolved)?;
-        let granted = self.grant_preview(ctx, app, deployment, &resolved).await?;
+        let mut granted = self.grant_preview(ctx, app, deployment, &resolved).await?;
+        // The database bindings (card B-1d): a masked branch each, its row and its role. A
+        // failure ends what was written (the role before the row, an unused branch trashed).
+        if let Some(db) = self.db()
+            && resolved.iter().any(|r| r.kind == ResolvedKind::Database)
+        {
+            let draft = self
+                .deps()
+                .store
+                .get_deployment(ctx.tenant, app, deployment)
+                .await?
+                .and_then(|d| d.draft);
+            for r in resolved.iter().filter(|r| r.kind == ResolvedKind::Database) {
+                match self
+                    .grant_preview_database(ctx, &db, app, deployment, draft.as_deref(), r)
+                    .await
+                {
+                    Ok(row) => granted.push(row),
+                    Err(e) => {
+                        // The row of this binding, if it was written, ends with the others.
+                        let mine = self.preview_rows(ctx.tenant, deployment).await?;
+                        self.ends()
+                            .revoke(
+                                &app_ctx(ctx.tenant, app),
+                                &mine,
+                                RevokeReason::PreviewExpired,
+                            )
+                            .await?;
+                        return Err(e);
+                    }
+                }
+            }
+        }
         let user_ctx = Context {
             scope: None,
             ..ctx.clone()
@@ -860,13 +933,10 @@ impl AppService {
                 .resolve_target(&user_ctx, app, "", Some(b.target_node_id))
                 .await?;
             if live.is_none() {
-                let ids: Vec<Uuid> = granted.iter().map(|g| g.id).collect();
-                self.deps()
-                    .store
-                    .revoke_bindings(
+                self.ends()
+                    .revoke(
                         &app_ctx(ctx.tenant, app),
-                        &*self.deps().authz,
-                        &ids,
+                        &granted,
                         RevokeReason::PreviewExpired,
                     )
                     .await?;
@@ -902,10 +972,14 @@ impl AppService {
                 },
             )
             .await?;
+        // A preview's database binding recorded its branch: the live principal binds the
+        // branch's source, the live database (card B-1d).
+        let sources = self.branch_sources(ctx.tenant, &rows).await?;
         let known: BTreeMap<String, NodeId> = rows
             .into_iter()
-            .filter(|b| b.kind != BindingKind::Api)
+            .filter(|b| b.kind == BindingKind::Node)
             .map(|b| (b.name, b.target_node_id))
+            .chain(sources)
             .collect();
         self.check_bindings(ctx, app, manifest, Environment::Live, &known)
             .await
@@ -944,10 +1018,9 @@ impl AppService {
         app: NodeId,
         planned: &[Resolved],
     ) -> Result<()> {
-        let d = self.deps();
         let implied: std::collections::HashSet<Relationship> = planned
             .iter()
-            .filter(|r| r.kind == ResolvedKind::Node)
+            .filter(|r| r.grants_role())
             .filter_map(|r| {
                 Some(Relationship {
                     object: ObjectRef::node(r.target),
@@ -956,16 +1029,16 @@ impl AppService {
                 })
             })
             .collect();
-        let dropped: Vec<Uuid> = self
+        let dropped: Vec<BindingRow> = self
             .active_live_rows(ctx.tenant, app)
             .await?
-            .iter()
+            .into_iter()
             .filter(|a| binding_tuple(a).is_none_or(|t| !implied.contains(&t)))
-            .map(|a| a.id)
             .collect();
         if !dropped.is_empty() {
-            d.store
-                .revoke_bindings(ctx, &*d.authz, &dropped, RevokeReason::Dropped)
+            // A database row's role is dropped before its row ends (card B-1d).
+            self.ends()
+                .revoke(ctx, &dropped, RevokeReason::Dropped)
                 .await?;
         }
         Ok(())
@@ -987,7 +1060,7 @@ impl AppService {
         let active = self.active_live_rows(ctx.tenant, app).await?;
         let mut kept: Vec<Uuid> = Vec::new();
         let mut new = Vec::new();
-        for r in planned.iter().filter(|r| r.kind == ResolvedKind::Node) {
+        for r in planned.iter().filter(|r| r.grants_role()) {
             match active
                 .iter()
                 .find(|a| r.same_as(a) && !kept.contains(&a.id))
@@ -1008,17 +1081,27 @@ impl AppService {
                 }),
             }
         }
-        if !new.is_empty() {
-            d.store.grant_bindings(ctx, &*d.authz, new).await?;
-        }
-        let dropped: Vec<Uuid> = active
+        let databases: std::collections::HashSet<String> = planned
             .iter()
+            .filter(|r| r.kind == ResolvedKind::Database && r.grants_role())
+            .map(|r| r.name.clone())
+            .collect();
+        if !new.is_empty() {
+            let made = d.store.grant_bindings(ctx, &*d.authz, new).await?;
+            // The app role of each new database row, after its row (card B-1d).
+            if let Some(db) = self.db() {
+                for b in made.iter().filter(|b| databases.contains(&b.name)) {
+                    db.ensure_role(b).await?;
+                }
+            }
+        }
+        let dropped: Vec<BindingRow> = active
+            .into_iter()
             .filter(|a| !kept.contains(&a.id))
-            .map(|a| a.id)
             .collect();
         if !dropped.is_empty() {
-            d.store
-                .revoke_bindings(ctx, &*d.authz, &dropped, RevokeReason::Dropped)
+            self.ends()
+                .revoke(ctx, &dropped, RevokeReason::Dropped)
                 .await?;
         }
         Ok(())
@@ -1071,7 +1154,18 @@ impl AppService {
         tenant: TenantId,
         app: Option<NodeId>,
     ) -> Result<usize> {
-        end_preview_rows(&*self.deps().store, &*self.deps().authz, tenant, app).await
+        end_preview_rows(&self.ends(), tenant, app).await
+    }
+
+    /// How this service ends rows ([`Ends`]).
+    pub(crate) fn ends(&self) -> Ends<'_> {
+        let d = self.deps();
+        Ends {
+            store: &*d.store,
+            authz: &*d.authz,
+            nodes: &*d.nodes,
+            db: self.db(),
+        }
     }
 
     /// One round of the repair pass for one tenant (see the module docs), over at most
@@ -1149,6 +1243,16 @@ impl AppService {
                 if active.is_empty() {
                     fixed += self.repair_target(tenant, b.target_node_id).await?;
                     repaired += 1;
+                    // A preview's branch that its end could not trash (card B-1d).
+                    if let Some(db) = self.db() {
+                        db.trash_unused_branches(
+                            &**store,
+                            &*self.deps().nodes,
+                            tenant,
+                            std::slice::from_ref(b),
+                        )
+                        .await;
+                    }
                 }
             }
             last = Some(b.id);
@@ -1215,14 +1319,8 @@ impl AppService {
             {
                 Ok(_) => {}
                 Err(Error::Api(e)) if e.code == ErrorCode::NotFound => {
-                    return revoke_grouped(
-                        &*d.store,
-                        &*d.authz,
-                        tenant,
-                        &rows,
-                        RevokeReason::TargetGone,
-                    )
-                    .await;
+                    return revoke_grouped(&self.ends(), tenant, &rows, RevokeReason::TargetGone)
+                        .await;
                 }
                 Err(e) => return Err(e),
             }
@@ -1232,14 +1330,8 @@ impl AppService {
         let trashed = self.rows_of_trashed_apps(tenant, &rows).await?;
         let mut fixed = 0;
         if !trashed.is_empty() {
-            fixed += revoke_grouped(
-                &*d.store,
-                &*d.authz,
-                tenant,
-                &trashed,
-                RevokeReason::AppTrashed,
-            )
-            .await?;
+            fixed +=
+                revoke_grouped(&self.ends(), tenant, &trashed, RevokeReason::AppTrashed).await?;
             rows = self.active_on(tenant, target).await?;
         }
         // Rows of a live principal that its live manifest no longer plans (a release whose
@@ -1284,7 +1376,12 @@ impl AppService {
                 d.authz.write(undo).await?;
             }
         }
-        Ok(fixed + n)
+        // The app roles of a database target follow its active rows (card B-1d, D5-8).
+        let roles = match self.db() {
+            Some(db) => db.repair_target(&*d.store, tenant, target).await?,
+            None => 0,
+        };
+        Ok(fixed + n + roles)
     }
 
     /// Ends the rows of `stale` (found by [`Self::unplanned_live_rows`] without a lock) that
@@ -1297,7 +1394,6 @@ impl AppService {
         tenant: TenantId,
         stale: &[BindingRow],
     ) -> Result<usize> {
-        let d = self.deps();
         let mut by_app: BTreeMap<NodeId, std::collections::HashSet<Uuid>> = BTreeMap::new();
         for b in stale {
             by_app.entry(b.app_node_id).or_default().insert(b.id);
@@ -1313,8 +1409,7 @@ impl AppService {
                 .collect();
             let still = self.unplanned_live_rows(tenant, &current).await?;
             if !still.is_empty() {
-                n += revoke_grouped(&*d.store, &*d.authz, tenant, &still, RevokeReason::Dropped)
-                    .await?;
+                n += revoke_grouped(&self.ends(), tenant, &still, RevokeReason::Dropped).await?;
             }
         }
         Ok(n)
@@ -1444,6 +1539,8 @@ impl AppService {
         BindingHooks {
             store: self.deps().store.clone(),
             authz: self.deps().authz.clone(),
+            nodes: self.deps().nodes.clone(),
+            db: self.db_bindings.clone(),
         }
     }
 }
@@ -1513,43 +1610,75 @@ fn typed_type(n: &Node) -> Option<String> {
         .flatten()
 }
 
+/// How rows end: the app roles of database rows first (card B-1d: the role goes before its
+/// row), then the rows and their tuples ([`super::store::AppStore::revoke_bindings`]), then the
+/// preview branches that no active row uses any more (trashed by the platform).
+pub(crate) struct Ends<'a> {
+    store: &'a dyn super::store::AppStore,
+    authz: &'a dyn authz::Authz,
+    nodes: &'a dyn crate::nodes::NodeStore,
+    db: Option<Arc<database::DatabaseBindings>>,
+}
+
+impl Ends<'_> {
+    /// Ends `rows` (those still active) with `ctx` as the actor. Returns the rows it ended.
+    pub(crate) async fn revoke(
+        &self,
+        ctx: &Context,
+        rows: &[BindingRow],
+        reason: RevokeReason,
+    ) -> Result<Vec<BindingRow>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(db) = &self.db {
+            db.drop_roles(ctx.tenant, rows).await?;
+        }
+        let ids: Vec<Uuid> = rows.iter().map(|b| b.id).collect();
+        let ended = self
+            .store
+            .revoke_bindings(ctx, self.authz, &ids, reason)
+            .await?;
+        if let Some(db) = &self.db {
+            db.trash_unused_branches(self.store, self.nodes, ctx.tenant, &ended)
+                .await;
+        }
+        Ok(ended)
+    }
+}
+
 /// Revokes `rows` per app (each with the app as actor). Returns how many ended.
 async fn revoke_grouped(
-    store: &dyn super::store::AppStore,
-    authz: &dyn authz::Authz,
+    ends: &Ends<'_>,
     tenant: TenantId,
     rows: &[BindingRow],
     reason: RevokeReason,
 ) -> Result<usize> {
-    let mut by_app: BTreeMap<NodeId, Vec<Uuid>> = BTreeMap::new();
+    let mut by_app: BTreeMap<NodeId, Vec<BindingRow>> = BTreeMap::new();
     for b in rows {
-        by_app.entry(b.app_node_id).or_default().push(b.id);
+        by_app.entry(b.app_node_id).or_default().push(b.clone());
     }
     let mut n = 0;
-    for (app, ids) in by_app {
-        n += store
-            .revoke_bindings(&app_ctx(tenant, app), authz, &ids, reason)
+    for (app, rows) in by_app {
+        n += ends
+            .revoke(&app_ctx(tenant, app), &rows, reason)
             .await?
             .len();
     }
     Ok(n)
 }
 
-async fn end_preview_rows(
-    store: &dyn super::store::AppStore,
-    authz: &dyn authz::Authz,
-    tenant: TenantId,
-    app: Option<NodeId>,
-) -> Result<usize> {
+async fn end_preview_rows(ends: &Ends<'_>, tenant: TenantId, app: Option<NodeId>) -> Result<usize> {
     let mut n = 0;
     for _ in 0..PAGES_PER_CALL {
-        let rows = store
+        let rows = ends
+            .store
             .ended_preview_bindings(tenant, app, ROWS_PER_QUERY)
             .await?;
         if rows.is_empty() {
             break;
         }
-        n += revoke_grouped(store, authz, tenant, &rows, RevokeReason::PreviewExpired).await?;
+        n += revoke_grouped(ends, tenant, &rows, RevokeReason::PreviewExpired).await?;
         if (rows.len() as u32) < ROWS_PER_QUERY {
             break;
         }
@@ -1561,6 +1690,19 @@ async fn end_preview_rows(
 pub struct BindingHooks {
     store: Arc<dyn super::store::AppStore>,
     authz: Arc<dyn authz::Authz>,
+    nodes: Arc<dyn crate::nodes::NodeStore>,
+    db: database::DbSlot,
+}
+
+impl BindingHooks {
+    fn ends(&self) -> Ends<'_> {
+        Ends {
+            store: &*self.store,
+            authz: &*self.authz,
+            nodes: &*self.nodes,
+            db: self.db.read().unwrap_or_else(|e| e.into_inner()).clone(),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -1583,14 +1725,7 @@ impl super::provider::LifecycleHook for BindingHooks {
             if rows.is_empty() {
                 return Ok(());
             }
-            revoke_grouped(
-                &*self.store,
-                &*self.authz,
-                tenant,
-                &rows,
-                RevokeReason::AppTrashed,
-            )
-            .await?;
+            revoke_grouped(&self.ends(), tenant, &rows, RevokeReason::AppTrashed).await?;
         }
         Err(Error::Internal(
             "the trash of an app did not end all its bindings; the hook runs again".into(),
@@ -1606,7 +1741,32 @@ impl super::provider::LifecycleHook for BindingHooks {
 #[async_trait::async_trait]
 impl super::provider::PurgeHook for BindingHooks {
     /// Deletes the rows in bounded batches, each in its own transaction, until none is left.
+    /// The app roles of the active rows go first (card B-1d; after the trash hook there are
+    /// none, unless that hook did not run).
     async fn app_purged(&self, tenant: TenantId, app: NodeId) -> Result<()> {
+        if let Some(db) = self.ends().db {
+            let mut after = None;
+            loop {
+                let rows = self
+                    .store
+                    .list_bindings(
+                        tenant,
+                        &BindingQuery {
+                            app: Some(app),
+                            active_only: true,
+                            after,
+                            limit: ROWS_PER_QUERY,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                db.drop_roles(tenant, &rows).await?;
+                if (rows.len() as u32) < ROWS_PER_QUERY {
+                    break;
+                }
+                after = rows.last().map(|b| b.id);
+            }
+        }
         loop {
             let n = self
                 .store

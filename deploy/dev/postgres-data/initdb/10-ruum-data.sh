@@ -4,7 +4,8 @@
 # changed RUUM_DBHOST_PASSWORD in deploy/dev/.env reaches the role).
 #
 # - ruum_dbhost: CREATEDB and CREATEROLE, no superuser. The engine creates every database and its
-#   per-database roles as ruum_dbhost.
+#   per-database roles as ruum_dbhost. It may SET temp_file_limit (a superuser setting), so the
+#   app roles of bindings get a limit they cannot raise (backlog D5-3).
 # - No role but ruum_dbhost may connect to postgres; nobody may connect to template1.
 # - template1 has no extension (besides plpgsql) and PUBLIC has no right on its schema public, so
 #   each new database starts empty and closed.
@@ -100,6 +101,10 @@ SELECT format('ALTER ROLE ruum_dbhost LOGIN NOSUPERUSER CREATEDB CREATEROLE NORE
 REVOKE CONNECT, TEMPORARY ON DATABASE postgres FROM PUBLIC;
 REVOKE CONNECT, TEMPORARY ON DATABASE template1 FROM PUBLIC;
 GRANT CONNECT ON DATABASE postgres TO ruum_dbhost;
+-- temp_file_limit is a superuser setting: with SET on it ruum_dbhost sets the limit of every app
+-- role, which the app cannot raise (backlog D5-3, card B-1d). Without it the engine issues no
+-- app credentials. GRANT is idempotent.
+GRANT SET ON PARAMETER temp_file_limit TO ruum_dbhost;
 SQL
 
 psql -v ON_ERROR_STOP=1 -X -q --username "${POSTGRES_USER:-postgres}" --dbname template1 \
