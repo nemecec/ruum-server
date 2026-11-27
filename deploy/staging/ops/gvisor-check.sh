@@ -45,7 +45,8 @@
 #    supervisor's standard input (kubectl attach), and the pod's log (the kubelet's CRI file)
 #    must show the value only as "<hidden secret>", the app could not open /proc/1/fd/1,
 #    /proc/1/mem or /proc/1/environ (but its own /proc/self/mem: the control), and the app
-#    started fewer than 64 processes and threads (at least one Node.js worker, not all 200).
+#    started fewer than 64 processes and threads (all 200 Node.js worker attempts settled, at
+#    least one started and at least one was refused).
 #    Last the app sends PID 1 SIGSTOP and SIGKILL: on Linux PID 1 ignores both; gVisor delivers
 #    them (backlog I620-15), and then the whole sandbox must end (137) with nothing written after
 #    the SIGSTOP in the log. The same script runs on the build server under
@@ -285,19 +286,26 @@ echo "raw-$S" > /proc/1/fd/1 2>/dev/null && echo fd1-open || echo fd1-refused
 cat /proc/1/environ >/dev/null 2>&1 && echo environ-read || echo environ-refused
 node -e '
 const { Worker } = require("worker_threads");
-let online = 0;
+let online = 0, failed = 0;
 for (let i = 0; i < 200; i++) {
+  let settled = false;
+  const settle = (ok) => { if (!settled) { settled = true; if (ok) online++; else failed++; } };
   try {
-    const w = new Worker("setTimeout(() => {}, 3000)", { eval: true });
-    w.on("online", () => { online++; });
-    w.on("error", () => {});
-  } catch (e) {}
+    const w = new Worker("setTimeout(() => {}, 60000)", { eval: true });
+    w.on("online", () => settle(true));
+    w.on("error", () => settle(false));
+    w.on("exit", () => settle(false));
+  } catch (e) { settle(false); }
 }
-setTimeout(() => {
+const start = Date.now();
+const wait = setInterval(() => {
+  if (online + failed < 200 && Date.now() - start < 30000) return;
+  clearInterval(wait);
   console.log("workers=" + online);
+  console.log("worker-failures=" + failed);
   console.log("threads=" + require("fs").readdirSync("/proc/self/task").length);
   process.exit(0);
-}, 1500);
+}, 100);
 ' 2>/dev/null || echo threads-failed
 ( n=0; while [ $n -lt 200 ]; do sleep 2 & n=$((n+1)); echo "started=$n"; done ) 2>/dev/null | tail -n 1
 echo done
@@ -387,14 +395,17 @@ else
     started="$(sed -n 's/^started=//p' <<<"$logs")"
     [[ "$started" =~ ^[0-9]+$ && "$started" -lt $SUP_PIDS ]] &&
       pass "under gVisor RLIMIT_NPROC bounds the app's processes ($started started of 200 tried, limit $SUP_PIDS)" || bad "the fork check: '${started:-none}' processes started under RLIMIT_NPROC $SUP_PIDS"
-    # Node.js ran, at least one worker started, and the limit refused the rest of the 200 (Kimi,
-    # run 17, finding 6: no pass when Node.js did not run).
+    # Node.js ran, all 200 worker attempts settled, at least one started and at least one was
+    # refused (Kimi, run 17, finding 6 and its re-check: no pass when Node.js did not run or
+    # the attempts had not settled).
     workers="$(sed -n 's/^workers=//p' <<<"$logs")"
+    wfail="$(sed -n 's/^worker-failures=//p' <<<"$logs")"
     threads="$(sed -n 's/^threads=//p' <<<"$logs")"
-    if [[ "$workers" =~ ^[0-9]+$ && "$workers" -ge 1 && "$workers" -lt 200 && "$threads" =~ ^[0-9]+$ && "$threads" -le $SUP_PIDS ]]; then
-      pass "under gVisor RLIMIT_NPROC bounds the app's threads ($workers of 200 workers started, $threads threads)"
+    if [[ "$workers" =~ ^[0-9]+$ && "$wfail" =~ ^[0-9]+$ && "$threads" =~ ^[0-9]+$ ]] &&
+      ((workers + wfail == 200 && workers >= 1 && wfail >= 1 && threads <= SUP_PIDS)); then
+      pass "under gVisor RLIMIT_NPROC bounds the app's threads ($workers of 200 workers started, $wfail refused, $threads threads)"
     else
-      bad "the thread check: '${workers:-none}' workers and '${threads:-none}' threads under RLIMIT_NPROC $SUP_PIDS"
+      bad "the thread check: '${workers:-none}' workers, '${wfail:-none}' refused and '${threads:-none}' threads under RLIMIT_NPROC $SUP_PIDS"
     fi
   fi
 fi

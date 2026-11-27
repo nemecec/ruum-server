@@ -2330,6 +2330,100 @@ async fn one_tenant_cannot_spend_every_tenants_reviews() {
     );
 }
 
+/// Kimi, run 17, re-check finding 1 (backlog I620-17): whole supervisor requests are bounded
+/// per tenant, not only the `TokenReview`s. One tenant's sandboxes that send many token requests
+/// (cached reviews, each still a pod and record read and a ledger read) spend only their
+/// tenant's share, so another tenant's request is still answered; a sandbox that forges tokens
+/// from an address whose tenant the pre-check knows pays from that share before any pod read.
+/// The control: with a share as large as the bound of all, the flood leaves the other tenant
+/// `503`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_tenant_cannot_spend_every_tenants_requests() {
+    let w = world(false).await;
+    let d = w.driver_with(
+        w.cfg.clone(),
+        Arc::new(ruum_runtime::kube::ledger::MemoryLedger::new()),
+    );
+    let mut pods = Vec::new();
+    for _ in 0..2 {
+        let s = d.start(w.service(identity(), None)).await.unwrap();
+        let pod_n = ruum_runtime::kube::pod_name(s.id, 1);
+        assert_eq!(wait_launched(&w, &pod_n).await, 200);
+        let (tok, ip) = w.pod_token(&pod_n);
+        let forged = kube_fake::unsigned_token(&claims_of(&w, &pod_n));
+        pods.push((tok, ip, forged));
+    }
+    let (flood, flood_ip, forged) = pods[0].clone();
+    let (other, other_ip, _) = pods[1].clone();
+    let pod_reads = || {
+        w.fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, verb, r)| verb == "get" && r == "pods")
+            .count()
+    };
+    for (share, other_answered) in [(3, true), (6, false)] {
+        let mut cfg = w.cfg.clone();
+        cfg.request_burst = 6;
+        cfg.request_rate_per_sec = 1;
+        cfg.tenant_request_burst = share;
+        cfg.tenant_request_rate_per_sec = 1;
+        let g = w.driver_with(
+            cfg,
+            Arc::new(ruum_runtime::kube::ledger::MemoryLedger::new()),
+        );
+        // The flood: the first tenant's valid token, until the bound answers 503.
+        let mut answers = Vec::new();
+        for _ in 0..10 {
+            let a = g.supervisor_token(&flood, flood_ip).await;
+            let stop = a == Err(LaunchRefusal::NotReady);
+            answers.push(a.map(|_| ()));
+            if stop {
+                break;
+            }
+        }
+        assert_eq!(
+            answers.last(),
+            Some(&Err(LaunchRefusal::NotReady)),
+            "share {share}: no bound: {answers:?}"
+        );
+        assert!(
+            answers[0].is_ok(),
+            "share {share}: the first request was refused: {answers:?}"
+        );
+        if share == 3 {
+            // A forged token from the flooding pod's address: refused before any pod read.
+            let before = pod_reads();
+            assert_eq!(
+                g.supervisor_token(&forged, flood_ip).await.unwrap_err(),
+                LaunchRefusal::NotReady,
+                "a forged token past the tenant's share"
+            );
+            assert_eq!(
+                pod_reads(),
+                before,
+                "a forged token past the share read the pod"
+            );
+        }
+        let a = g.supervisor_token(&other, other_ip).await;
+        if other_answered {
+            assert!(
+                a.is_ok(),
+                "share {share}: the other tenant's request was refused: {:?}",
+                a.err()
+            );
+        } else {
+            assert_eq!(
+                a.err(),
+                Some(LaunchRefusal::NotReady),
+                "share {share}: the control"
+            );
+        }
+    }
+}
+
 /// Review of I620-G, required change 2: a launch whose record write the API server refused
 /// with a status that writes nothing (`503`) releases its ledger claim, so the supervisor's next
 /// ask gets the launch; one whose write may have gone through (`500`) keeps the claim, and the
