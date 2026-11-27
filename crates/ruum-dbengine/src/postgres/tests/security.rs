@@ -490,6 +490,51 @@ async fn a_migration_cannot_lift_its_limits() {
     }
 }
 
+/// T-97: a `DO` block of a migration cannot change how the server lexes the next statement.
+/// The engine's splitter and the statement rules lex with standard strings and UTF-8; the
+/// engine pins `standard_conforming_strings` and `client_encoding` before each statement, so
+/// the server reads the same text. Without the pin, `'a\' -- '` is a string followed by code
+/// (`a' -- leak`), and `'é'` arrives as two Latin-1 characters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_migration_cannot_change_how_the_next_statement_is_lexed() {
+    let Some(engine) = engine().await else { return };
+    let f = Fixture::new(&engine).await;
+    let sync = ClassSync {
+        personal: vec![],
+        secret: vec![],
+    };
+    let up = "CREATE TABLE sink (id integer, v text);\n\
+              DO $$ BEGIN PERFORM set_config('standard_conforming_strings', 'off', true); END $$;\n\
+              INSERT INTO sink SELECT 1, 'a\\' -- ' || (SELECT 'leak')\n;\n\
+              DO $$ BEGIN PERFORM set_config('client_encoding', 'LATIN1', true); END $$;\n\
+              INSERT INTO sink VALUES (2, 'é');";
+    let request = MigrationRequest {
+        up: up.to_string(),
+        timeout: Duration::from_secs(10),
+        dry_run: false,
+    };
+    engine
+        .apply_migration(f.db(), &f.key, &request, &sync)
+        .await
+        .unwrap();
+    let out = f
+        .run(
+            RoleKind::Owner,
+            StatementMode::Read,
+            "SELECT v FROM sink ORDER BY id",
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        out.rows,
+        [
+            vec![Value::Text("a\\".into())],
+            vec![Value::Text("é".into())]
+        ]
+    );
+}
+
 /// After a request, a pooled connection holds no session option: `SHOW` of statement_timeout,
 /// role, search_path (and TimeZone) equal a fresh session.
 ///

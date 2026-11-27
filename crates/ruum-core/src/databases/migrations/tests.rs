@@ -1981,5 +1981,27 @@ async fn a_draft_migration_reads_no_catalog_text_without_manage() {
         )
         .await
         .unwrap());
+    // T-97 (review of D-2 landing, run 17, finding A): a DO body turns
+    // `standard_conforming_strings` off, so Postgres would read `'a\' -- '` as a string followed
+    // by a subquery that the rule took as a comment. The engine pins the option before each
+    // statement: the text after `--` stays a comment, and the row holds `a\` only.
+    for (id, who) in [(2, &ac), (3, &bob)] {
+        let up = format!(
+            "do $$ begin perform set_config('standard_conforming_strings', 'off', true); end $$;\n\
+             insert into sink(id, v) select {id}, 'a\\' -- ' || (select pg_get_expr(adbin, adrelid) from pg_attrdef limit 1)\n;"
+        );
+        ran(db
+            .apply_migration(who, branch, req(&format!("000{}_scs", id + 1), &up), "")
+            .await
+            .unwrap());
+        let v = pg_run(
+            &w,
+            branch,
+            RoleKind::Owner,
+            &format!("select v from sink where id = {id}"),
+        )
+        .await;
+        assert_eq!(v, vec![vec![Cell::Text("a\\".into())]], "{up}");
+    }
     pg_drop(&w, &[node, branch]).await;
 }
