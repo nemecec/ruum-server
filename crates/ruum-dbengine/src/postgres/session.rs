@@ -39,8 +39,18 @@ pub struct UntrustedStatement {
     pub sql: String,
 }
 
-/// Opens the request's transaction: read-only or not, with the timeout. Returns the marker of
-/// the transaction (its start time in microseconds) and the session's users.
+/// Pins the session options that change how the server lexes a statement's text (T-97). The
+/// statement rules and [`split`] lex with standard strings (sqlparser) and UTF-8; a
+/// `set_config('standard_conforming_strings', 'off', true)` in a `DO` block, or a role default
+/// left by `ALTER ROLE ... SET`, would make the server read a later string differently, so text
+/// that the rules took as a comment would run. [`begin`] sets these for every request and
+/// [`limit`] again before each statement of `up`.
+const LEXING: &str =
+    "set local standard_conforming_strings = on; set local client_encoding = 'UTF8'";
+
+/// Opens the request's transaction: read-only or not, with the timeout and the [`LEXING`]
+/// options. Returns the marker of the transaction (its start time in microseconds) and the
+/// session's users.
 async fn begin(
     conn: &mut PgConnection,
     read_only: bool,
@@ -49,7 +59,7 @@ async fn begin(
     let ms = timeout.as_millis().clamp(1, i32::MAX as u128);
     let mode = if read_only { " read only" } else { "" };
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "begin isolation level read committed{mode}; set local statement_timeout = {ms}"
+        "begin isolation level read committed{mode}; set local statement_timeout = {ms}; {LEXING}"
     )))
     .execute(&mut *conn)
     .await
@@ -522,11 +532,12 @@ const CANCEL_GRACE: Duration = Duration::from_secs(2);
 /// Sets the request's `statement_timeout` and `lock_timeout` again (decision 0004-35), before
 /// each statement of `up`: a `SET LOCAL` or a `set_config` in a `DO` block of one statement
 /// does not lift the limits of the next. The server arms a statement's timer when the statement
-/// starts, so a statement cannot lift its own.
+/// starts, so a statement cannot lift its own. It pins the [`LEXING`] options again too: the
+/// server lexes each statement after this runs.
 async fn limit(conn: &mut PgConnection, timeout: Duration) -> Result<(), EngineError> {
     let ms = timeout.as_millis().clamp(1, i32::MAX as u128);
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "set local statement_timeout = {ms}; set local lock_timeout = {ms}"
+        "set local statement_timeout = {ms}; set local lock_timeout = {ms}; {LEXING}"
     )))
     .execute(&mut *conn)
     .await
