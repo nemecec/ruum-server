@@ -50,6 +50,8 @@ pub trait SealLedger: Send + Sync {
     async fn release(&self, record: &RecordRef, pod_uid: &str) -> Result<(), RuntimeError>;
 
     /// Forgets the marks and launches of a record that is deleted (its uid never comes back).
+    /// The driver calls it only after a read shows the record gone: a finalizer can keep a
+    /// deleted record, writable under its uid (Kimi, run 17, finding 1).
     async fn forget(&self, record: &RecordRef) -> Result<(), RuntimeError>;
 }
 

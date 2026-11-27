@@ -155,7 +155,7 @@ admin tunnel open while it runs (`--no-tunnel` skips it). The command gets no va
 | `deploy/staging/deploy.sh <sha>` | Deploys a green commit of main by digest: checks it on the Mac (`gh`), then writes a release request that the deploy controller checks again by itself (`cosign`, GitHub) and runs ("The deploy controller"); `--rollback` to go back to the previous release on purpose, `--rollback-older` stops with the admin path to go back further ("Going back past the previous release"); one deploy at a time (Lease `ruum/ruum-deploy`); `--acme zerossl` to switch the CA. |
 | `deploy/staging/status.sh [--checks]` | What exists, its price, orphans, nodes, pods, backups, deployed commit; with `--checks` also the smoke checks and Zitadel drift. |
 | `deploy/staging/status.sh --netpol` | The network policy probe (`ops/netpol-probe.sh`): an unknown pod reaches no platform port; ruum-server reaches only Postgres, SpiceDB HTTP, NATS and Mailpit; the edge reaches only ruum-server, Zitadel and the app gateway; the gateway reaches only the internal listener and Postgres among the platform ports; a sandbox (runtime class gvisor, `ruum-apps`) reaches only the egress proxy. Not read-only (a temporary namespace, ephemeral containers, a sandbox pod). |
-| `tool.sh bash deploy/staging/ops/gvisor-check.sh [--class-only]` | The gVisor extension on every node; without `--class-only` also a pod of the runtime class gvisor and a control pod on each node (card I-6). Not read-only (short pods in `ruum-apps`). |
+| `tool.sh bash deploy/staging/ops/gvisor-check.sh [--class-only \| --supervisor-image <image@digest> \| --from-release]` | The gVisor extension on every node; without `--class-only` also a pod of the runtime class gvisor and a control pod on each node (card I-6), the admission rules, the pod read-back, the kubelet PID limit and the sandbox supervisor under gVisor (I620-3: with `--supervisor-image`; with `--from-release`, the platform step's form, the live release's supervisor image, or `SKIP` while the release has the driver off; with neither it fails). Not read-only (short pods in `ruum-apps`). |
 | `deploy/staging/ops/smoke-apps.sh` | The smoke checks of the app runtime (card I-6), on the Mac; also in `status.sh --checks`. |
 | `deploy/staging/destroy.sh --plan` | Three lists (removed, kept on purpose, never touched) and the state compared with the labelled resources. Read-only. |
 | `deploy/staging/destroy.sh` | The same, then asks you to type `destroy ruum-staging`. |
@@ -726,8 +726,22 @@ The orchestrator (the platform first, then the checks, then the switch):
      the Secret (never print its data).
 8. **The switch**: in a change of the chart values (`charts/ruum/values.yaml`, a card, after the
    person's line of step 1), `runtime.kubernetes: true` (`runtime.supervisorNetwork` stays `tls`;
-   `runtime.supervisorImage` comes from `ops/deploy-chart.sh`); merge it, then
-   `deploy/staging/deploy.sh <sha of main>`.
+   `runtime.supervisorImage` comes from `ops/deploy-chart.sh`). Merge it to main, then in this
+   order (Kimi, run 17, finding 5):
+   1. Wait for the `images.yml` run of the switch commit on main: it publishes
+      `ghcr.io/nemecec/ruum-supervisor:<switch sha>` with provenance. Note its Digest line (as in
+      step 4). This is the image the switch deploys, not the one of step 4.
+   2. The platform step from a checkout of the switch commit (`git checkout <switch sha>`, then
+      `RUUM_STAGING_APPLY=yes deploy/staging/secrets-push.sh platform`). The deploy controller
+      runs its own chart ("The chart is the controller's"): without this step the switch does
+      not reach staging and the driver stays off. Its gVisor check (`ops/gvisor-check.sh
+      --from-release`) prints `SKIP` for the supervisor, since the live release still has the
+      driver off.
+   3. Step 7's live checks again, the supervisor's with the digest of step 8.1:
+      `deploy/staging/tool.sh bash deploy/staging/ops/gvisor-check.sh --supervisor-image
+      ghcr.io/nemecec/ruum-supervisor@sha256:<digest of step 8.1>`, every line `PASS`.
+   4. `deploy/staging/deploy.sh <switch sha>`. `ops/deploy-chart.sh` resolves the supervisor of
+      that commit: the digest of step 8.1, which step 8.3 checked.
 9. **Checks after the deploy**:
    - `deploy/staging/tool.sh kubectl -n ruum logs deploy/ruum-server | grep -E 'runtime driver|supervisor listener|the sweep|seal ledger'`:
      per pod one line `runtime driver: Kubernetes (backlog I6-1)` and one `supervisor listener
@@ -736,7 +750,9 @@ The orchestrator (the platform first, then the checks, then the switch):
      ledger failed`.
    - `deploy/staging/tool.sh kubectl -n ruum get service ruum-supervisor` shows port 8091.
    - `deploy/staging/tool.sh kubectl -n ruum get deploy ruum-server -o yaml | grep -A1 -E
-     'RUUM_KUBE_SUPERVISOR_(NETWORK|IMAGE)'` shows `tls` and the supervisor's digest of step 4.
+     'RUUM_KUBE_SUPERVISOR_(NETWORK|IMAGE)'` shows `tls` and the supervisor's digest of step 8.1
+     (the one step 8.3 checked). From now on every platform step runs the supervisor check with
+     the live release's image (`--from-release`).
    - `deploy/staging/status.sh --checks`: as before; the node22 line stays `BLOCKED` (no builder,
      no registry).
 10. **The first sandbox** (once a registry and node22 deploys exist; only test values until the

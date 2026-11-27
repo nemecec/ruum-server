@@ -1253,8 +1253,18 @@ impl World {
     /// Replaces the record's data as a holder of the runtime identity's token can (`PUT` with
     /// the current resourceVersion).
     async fn put_record_data(&self, id: ruum_core::runtime::InstanceId, data: serde_json::Value) {
+        self.put_record(id, |cm| cm["data"] = data).await;
+    }
+
+    /// Changes the record ConfigMap (metadata too) with `f` and writes it back, as a writer of
+    /// ConfigMaps can.
+    async fn put_record(
+        &self,
+        id: ruum_core::runtime::InstanceId,
+        f: impl FnOnce(&mut serde_json::Value),
+    ) {
         let mut cm = self.record(id);
-        cm["data"] = data;
+        f(&mut cm);
         let url = format!(
             "{}/api/v1/namespaces/{NS}/configmaps/{}",
             self.cfg.api_url,
@@ -1947,6 +1957,104 @@ async fn a_put_back_seal_gets_no_second_launch_on_another_replica() {
         own.supervisor_launch(&tok, ip).await.is_ok(),
         "the control: without the shared ledger the put-back seal opens a second launch"
     );
+}
+
+/// Kimi, run 17, finding 1: a writer of ConfigMaps adds a finalizer to a launched pod's record
+/// and makes it look ended past its retention, so the sweep's `DELETE` is accepted but the record
+/// stays, under the same uid, with `metadata.deletionTimestamp`. The sweep must keep the record's
+/// ledger rows (it forgets them only once a read shows the record gone), and no replica launches
+/// a pod from a record that is being deleted: neither one sharing the ledger nor one with a
+/// ledger of its own (the control of `a_put_back_seal_gets_no_second_launch_on_another_replica`
+/// launches there).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_held_by_a_finalizer_keeps_its_launches_and_launches_nothing() {
+    let mut w = world(false).await;
+    w.cfg.ended_retention = Duration::from_millis(100);
+    let shared: Arc<dyn ruum_runtime::kube::ledger::SealLedger> =
+        Arc::new(ruum_runtime::kube::ledger::MemoryLedger::new());
+    let a = w.driver_with(w.cfg.clone(), shared.clone());
+    w.fake.skip_launch_once.store(true, Ordering::SeqCst);
+    let id = identity();
+    let s = a.start(w.service(id, None)).await.unwrap();
+    let pod_n = ruum_runtime::kube::pod_name(s.id, 1);
+    wait_pod_ip(&w, &pod_n).await;
+    let (tok, ip) = w.pod_token(&pod_n);
+    let pod_uid = w.fake.pod(NS, &pod_n).unwrap()["metadata"]["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let before = loop {
+        let r = w.record(s.id);
+        if r["data"]["record"]
+            .as_str()
+            .is_some_and(|t| t.contains("\"sealed\":\"v1."))
+        {
+            break r;
+        }
+        assert!(Instant::now() < deadline, "the run was not sealed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let record_uid = before["metadata"]["uid"].as_str().unwrap().to_owned();
+    assert!(launch_when_ready(&a, &tok, ip).await.is_ok(), "the launch");
+    // The finalizer, and the record ended long ago and unregistered.
+    w.put_record(s.id, |cm| {
+        cm["metadata"]["finalizers"] = serde_json::json!(["example.com/hold"]);
+        let mut rec: serde_json::Value =
+            serde_json::from_str(cm["data"]["record"].as_str().unwrap()).unwrap();
+        rec["state"] = serde_json::json!({ "state": "stopped" });
+        rec["ended_ms"] = serde_json::json!(1);
+        rec["registered"] = serde_json::Value::Null;
+        cm["data"]["record"] = serde_json::json!(rec.to_string());
+    })
+    .await;
+    // The sweep may not take the pod meanwhile (an unregistration that fails keeps it).
+    w.egress.refuse.store(true, Ordering::SeqCst);
+    a.sweep().await;
+    let held = w.record(s.id);
+    assert_eq!(held["metadata"]["uid"].as_str(), Some(record_uid.as_str()));
+    assert!(
+        held.pointer("/metadata/deletionTimestamp").is_some(),
+        "the sweep did not delete the record: {held}"
+    );
+    assert!(w.fake.pod(NS, &pod_n).is_some(), "the sweep took the pod");
+    let r = ruum_runtime::kube::ledger::RecordRef {
+        tenant: id.tenant,
+        instance: s.id,
+        record_uid: record_uid.clone(),
+    };
+    assert!(
+        !shared.claim_launch(&r, &pod_uid).await.unwrap(),
+        "the sweep forgot the launch of a record that is still there"
+    );
+    // The seal from before the launch, put back into the held record.
+    w.put_record_data(s.id, before["data"].clone()).await;
+    assert!(
+        w.record(s.id)
+            .pointer("/metadata/deletionTimestamp")
+            .is_some()
+    );
+    let b = w.driver_with(w.cfg.clone(), shared.clone());
+    assert_eq!(
+        b.supervisor_launch(&tok, ip).await.unwrap_err(),
+        LaunchRefusal::Forbidden,
+        "another replica launched the pod again from a record being deleted"
+    );
+    let own = w.driver_with(
+        w.cfg.clone(),
+        Arc::new(ruum_runtime::kube::ledger::MemoryLedger::new()),
+    );
+    assert_eq!(
+        own.supervisor_launch(&tok, ip).await.unwrap_err(),
+        LaunchRefusal::Forbidden,
+        "a record being deleted launched a pod"
+    );
+    // Once the finalizer goes, the API server removes the record.
+    w.put_record(s.id, |cm| {
+        cm["metadata"]["finalizers"] = serde_json::json!([]);
+    })
+    .await;
+    assert!(w.fake.config_maps().is_empty(), "the record stayed");
 }
 
 /// The claims of a projected token for `pod`, unsigned unless the fake issued it.

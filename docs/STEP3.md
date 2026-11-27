@@ -356,7 +356,12 @@ secret.
        supervisor's next ask gets the launch. A claim whose write may have gone through (a
        timeout, a cut answer, `500`, `502`, `504`) or whose answer was lost is kept and not
        answered again: the run ends as exited (exit 125), as for any failed launch. A second
-       launch would cost more than one run.
+       launch would cost more than one run. A record's ledger rows go only when the record is
+       gone: the sweep (and a failed start) deletes the record, then reads it again, and forgets
+       the rows only when no record of that `uid` is left. A finalizer, which a writer of
+       ConfigMaps can add, keeps a deleted record readable and writable under its `uid`; such a
+       record (`metadata.deletionTimestamp` set) launches nothing, on any replica (Kimi, run 17,
+       finding 1). Each request reads the generation mark; only a higher generation writes it.
    - **The pod's identity.** Sandbox pods run as the ServiceAccount `ruum-sandbox` of
      `ruum-apps`, which has no RoleBinding. The pod mounts one projected service account token
      with the audience `ruum-supervisor`, `expirationSeconds: 600` (refreshed by the kubelet), at
