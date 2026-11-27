@@ -381,6 +381,12 @@ secret.
      supervisor asks every 30 s, adds a new token to its redactors, then writes the token file
      (`TOKEN_FILE`, a memory `emptyDir`, readable by the app).
    - **The checks of the server**, for each request, all of them, before any value is read.
+     Every request (a token renewal with a cached review too) is within the request bounds:
+     per tenant 40 a second with a burst of 120, and all tenants together 400 a second with a
+     burst of 800, else `503` (Kimi, run 17, re-check finding 1, backlog I620-17). The tenant is
+     the one of the token's cached review, or of the pod the pre-check last found at the peer's
+     address (kept 10 minutes), so a sandbox that forges tokens pays from its own tenant's share
+     before the pod read.
      First the cheap ones, which cost the API server no `TokenReview` (backlog I620-12): the
      bearer reads (unverified) as a projected token of `system:serviceaccount:ruum-apps:ruum-sandbox`
      for the audience `ruum-supervisor`, unexpired, naming one pod (`kubernetes.io.pod`) by a

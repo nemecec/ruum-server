@@ -90,6 +90,8 @@ const PEER_REQUESTS: u32 = 30;
 const PEER_WINDOW: Duration = Duration::from_secs(10);
 /// The window of [`KubeConfig::peer_reviews_per_minute`].
 const PEER_REVIEW_WINDOW: Duration = Duration::from_secs(60);
+/// How long the tenant of the pod found at a peer address is kept (pod addresses are reused).
+const PEER_TENANT_TTL: Duration = Duration::from_secs(600);
 /// How long after the app container's start its supervisor may take the launch data (it tries
 /// for 60 s while the seal of its run is written).
 const LAUNCH_WINDOW_SECS: i64 = 120;
@@ -216,6 +218,16 @@ pub struct KubeConfig {
     /// of I620-G, required change 3). At most the bound of all peers.
     pub tenant_review_rate_per_sec: u32,
     pub tenant_review_burst: u32,
+    /// The bound of whole supervisor requests (each reads the pod and the record from the API
+    /// server and the generation mark from the platform database), per tenant and for every
+    /// tenant together, per second with a burst; past either the peer gets `503` and asks again
+    /// (Kimi, run 17, re-check finding 1, backlog I620-17). The tenant is the one of the token's
+    /// cached review, or of the pod at the peer's address (learnt by the pre-check). A tenant's
+    /// share is at most the bound of all.
+    pub tenant_request_rate_per_sec: u32,
+    pub tenant_request_burst: u32,
+    pub request_rate_per_sec: u32,
+    pub request_burst: u32,
 }
 
 impl KubeConfig {
@@ -271,6 +283,10 @@ impl KubeConfig {
             review_burst: 40,
             tenant_review_rate_per_sec: 4,
             tenant_review_burst: 8,
+            tenant_request_rate_per_sec: 40,
+            tenant_request_burst: 120,
+            request_rate_per_sec: 400,
+            request_burst: 800,
         }
     }
 
@@ -353,6 +369,18 @@ impl KubeConfig {
             || self.tenant_review_burst > self.review_burst
         {
             return bad("a tenant's share of the token reviews is at most the bound of all peers");
+        }
+        if self.tenant_request_rate_per_sec == 0
+            || self.tenant_request_burst == 0
+            || self.request_rate_per_sec == 0
+            || self.request_burst == 0
+        {
+            return bad("the supervisor request bounds must be above zero");
+        }
+        if self.tenant_request_rate_per_sec > self.request_rate_per_sec
+            || self.tenant_request_burst > self.request_burst
+        {
+            return bad("a tenant's share of the supervisor requests is at most the bound of all");
         }
         if self.pids_limit.is_some_and(|p| p < 64) {
             return bad("the PID limit is at least 64");
@@ -443,7 +471,7 @@ struct Inner {
     /// The byte budget of the running instances' log rings (S-91).
     live: Arc<LogBudget>,
     /// Positive `TokenReview`s: the token's SHA-256, the pod name and uid, and until when.
-    reviews: Mutex<HashMap<[u8; 32], (String, String, Instant)>>,
+    reviews: Mutex<HashMap<[u8; 32], CachedReview>>,
     /// The highest seal generation this process saw per record (instance and record uid): the
     /// cheap first check; the shared authority is `ledger` (backlog I620-9).
     gens: Mutex<HashMap<(InstanceId, String), u64>>,
@@ -457,7 +485,17 @@ struct Inner {
     review_bucket: Mutex<(Instant, f64)>,
     /// The token bucket of each tenant's share (last refill, tokens).
     tenant_reviews: Mutex<HashMap<TenantId, (Instant, f64)>>,
+    /// The bound of whole supervisor requests: each tenant's bucket and the bucket of all
+    /// (Kimi, run 17, re-check finding 1).
+    tenant_requests: Mutex<HashMap<TenantId, (Instant, f64)>>,
+    request_bucket: Mutex<(Instant, f64)>,
+    /// The tenant of the pod the pre-check found at a peer address, and when.
+    peer_tenants: Mutex<HashMap<IpAddr, (TenantId, Instant)>>,
 }
+
+/// A positive `TokenReview` kept: the pod name and uid, its tenant (the pod's label, read by the
+/// pre-check), and until when.
+type CachedReview = (String, String, TenantId, Instant);
 
 /// The Kubernetes driver (see the module docs).
 pub struct KubeDriver {
@@ -525,6 +563,7 @@ impl KubeDriver {
             })?;
         let live = LogBudget::new(cfg.max_live_log_bytes, cfg.max_tenant_live_log_bytes);
         let review_burst = cfg.review_burst;
+        let request_burst = cfg.request_burst;
         let inner = Arc::new(Inner {
             cfg,
             api,
@@ -543,6 +582,9 @@ impl KubeDriver {
             peer_reviews: Mutex::new(HashMap::new()),
             review_bucket: Mutex::new((Instant::now(), f64::from(review_burst))),
             tenant_reviews: Mutex::new(HashMap::new()),
+            tenant_requests: Mutex::new(HashMap::new()),
+            request_bucket: Mutex::new((Instant::now(), f64::from(request_burst))),
+            peer_tenants: Mutex::new(HashMap::new()),
         });
         let sweeper = tokio::runtime::Handle::try_current()
             .ok()
@@ -1773,11 +1815,6 @@ impl Inner {
             tracing::warn!(target: "ruum::runtime", %peer, "too many token reviews for one address");
             return Err(LaunchRefusal::TooMany);
         }
-        let refill = |b: &mut (Instant, f64), rate: u32, burst: u32| {
-            let add = b.0.elapsed().as_secs_f64() * f64::from(rate);
-            b.1 = (b.1 + add).min(f64::from(burst));
-            b.0 = Instant::now();
-        };
         let mut t = self.tenant_reviews.lock().expect("tenant reviews lock");
         if t.len() > 65_536 {
             let (rate, burst) = (
@@ -1813,6 +1850,70 @@ impl Inner {
         Ok(())
     }
 
+    /// One more whole supervisor request, within its bounds (Kimi, run 17, re-check finding 1):
+    /// of `tenant`'s share when known, and of all tenants together when `all`; past either
+    /// `NotReady` (the supervisor asks again). A refused request spends nothing.
+    fn request_budget(&self, all: bool, tenant: Option<TenantId>) -> Result<(), LaunchRefusal> {
+        // One order of the locks: the tenants, all.
+        let (rate, burst) = (
+            self.cfg.tenant_request_rate_per_sec,
+            self.cfg.tenant_request_burst,
+        );
+        let mut t = self.tenant_requests.lock().expect("tenant requests lock");
+        if t.len() > 65_536 {
+            t.retain(|_, b| {
+                refill(b, rate, burst);
+                b.1 < f64::from(burst)
+            });
+        }
+        let tb = tenant.map(|id| {
+            let b = t.entry(id).or_insert((Instant::now(), f64::from(burst)));
+            refill(b, rate, burst);
+            b
+        });
+        if let (Some(b), Some(id)) = (tb.as_deref(), tenant)
+            && b.1 < 1.0
+        {
+            tracing::warn!(target: "ruum::runtime", tenant = %id.0, "the supervisor requests of one tenant's sandboxes are at their share");
+            return Err(LaunchRefusal::NotReady);
+        }
+        if all {
+            let mut g = self.request_bucket.lock().expect("request bucket lock");
+            refill(
+                &mut g,
+                self.cfg.request_rate_per_sec,
+                self.cfg.request_burst,
+            );
+            if g.1 < 1.0 {
+                tracing::warn!(target: "ruum::runtime", "the supervisor requests of all sandboxes are at their bound");
+                return Err(LaunchRefusal::NotReady);
+            }
+            g.1 -= 1.0;
+        }
+        if let Some(b) = tb {
+            b.1 -= 1.0;
+        }
+        Ok(())
+    }
+
+    /// The tenant of the pod the pre-check last found at `peer` (within [`PEER_TENANT_TTL`]).
+    fn peer_tenant(&self, peer: IpAddr) -> Option<TenantId> {
+        self.peer_tenants
+            .lock()
+            .expect("peer tenants lock")
+            .get(&peer)
+            .filter(|(_, at)| at.elapsed() < PEER_TENANT_TTL)
+            .map(|(t, _)| *t)
+    }
+
+    fn note_peer_tenant(&self, peer: IpAddr, tenant: TenantId) {
+        let mut m = self.peer_tenants.lock().expect("peer tenants lock");
+        if m.len() > 65_536 {
+            m.retain(|_, (_, at)| at.elapsed() < PEER_TENANT_TTL);
+        }
+        m.insert(peer, (tenant, Instant::now()));
+    }
+
     /// The pod (name, uid) of a projected token, by a `TokenReview` (kept a short time), with
     /// every field of the answer checked (`docs/STEP3.md` "The sandbox supervisor" 4). Before
     /// the review (backlog I620-12), at no cost to the API server: the token must read as a
@@ -1821,7 +1922,11 @@ impl Inner {
     /// the review must be within its bounds ([`Inner::review_budget`]). Only then does the API server
     /// verify the token, and the pod it names must be the same. Only the review itself counts to
     /// the bounds (a supervisor that waits for its pod's address costs none).
-    async fn review(&self, bearer: &str, peer: IpAddr) -> Result<(String, String), LaunchRefusal> {
+    async fn review(
+        &self,
+        bearer: &str,
+        peer: IpAddr,
+    ) -> Result<(String, String, TenantId), LaunchRefusal> {
         use sha2::{Digest, Sha256};
         let refuse = |why: &str| {
             tracing::warn!(target: "ruum::runtime", reason = why, "a supervisor token was refused");
@@ -1831,10 +1936,17 @@ impl Inner {
             return Err(refuse("no token or an oversized one"));
         }
         let hash: [u8; 32] = Sha256::digest(bearer.as_bytes()).into();
-        if let Some((name, uid, until)) = self.reviews.lock().expect("reviews lock").get(&hash)
-            && Instant::now() < *until
-        {
-            return Ok((name.clone(), uid.clone()));
+        let cached = self
+            .reviews
+            .lock()
+            .expect("reviews lock")
+            .get(&hash)
+            .filter(|(_, _, _, until)| Instant::now() < *until)
+            .map(|(name, uid, tenant, _)| (name.clone(), uid.clone(), *tenant));
+        if let Some((name, uid, tenant)) = cached {
+            // A whole request of that tenant (re-check finding 1).
+            self.request_budget(true, Some(tenant))?;
+            return Ok((name, uid, tenant));
         }
         let user = format!(
             "system:serviceaccount:{}:{}",
@@ -1849,6 +1961,10 @@ impl Inner {
         ) else {
             return Err(refuse("not a projected token of a sandbox pod"));
         };
+        // The pod read below is a request too: of the tenant of the pod last found at this
+        // address (a sandbox that forges tokens pays from its own tenant's share), and of all.
+        let known = self.peer_tenant(peer);
+        self.request_budget(true, known)?;
         // The pod the token claims, at the peer's address, before the API server verifies it.
         let pod = self
             .api
@@ -1876,6 +1992,10 @@ impl Inner {
             .and_then(|t| uuid::Uuid::parse_str(t).ok())
             .map(TenantId)
             .ok_or_else(|| refuse("the token's pod names no tenant"))?;
+        self.note_peer_tenant(peer, tenant);
+        if known != Some(tenant) {
+            self.request_budget(false, Some(tenant))?;
+        }
         self.review_budget(peer, tenant)?;
         let status = self
             .api
@@ -1935,13 +2055,16 @@ impl Inner {
         let mut cache = self.reviews.lock().expect("reviews lock");
         if cache.len() >= REVIEW_CACHE_MAX {
             let now = Instant::now();
-            cache.retain(|_, (_, _, until)| *until > now);
+            cache.retain(|_, (_, _, _, until)| *until > now);
             if cache.len() >= REVIEW_CACHE_MAX {
                 cache.clear();
             }
         }
-        cache.insert(hash, (name.clone(), uid.clone(), Instant::now() + keep));
-        Ok((name, uid))
+        cache.insert(
+            hash,
+            (name.clone(), uid.clone(), tenant, Instant::now() + keep),
+        );
+        Ok((name, uid, tenant))
     }
 
     /// The checks of one supervisor request after the token review: the pod exists now with
@@ -2104,7 +2227,7 @@ impl Inner {
             tracing::warn!(target: "ruum::runtime", %peer, "too many supervisor requests from one address");
             return Err(LaunchRefusal::TooMany);
         }
-        let (pod_n, pod_uid) = self.review(bearer, peer).await?;
+        let (pod_n, pod_uid, _) = self.review(bearer, peer).await?;
         // The ledger claim of this request, and whether a seal that lists the launch may have
         // been written. A claim whose launch surely did not happen (nothing written, no answer)
         // is released, so the supervisor's next ask can take it (review of I620-G, required
@@ -3055,6 +3178,13 @@ fn canonical(ip: IpAddr) -> IpAddr {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
         v4 => v4,
     }
+}
+
+/// Refills a token bucket (last refill, tokens) at `rate` per second up to `burst`.
+fn refill(b: &mut (Instant, f64), rate: u32, burst: u32) {
+    let add = b.0.elapsed().as_secs_f64() * f64::from(rate);
+    b.1 = (b.1 + add).min(f64::from(burst));
+    b.0 = Instant::now();
 }
 
 /// The record, its `resourceVersion` and its `metadata.uid` of an instance record ConfigMap.

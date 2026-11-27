@@ -9,7 +9,7 @@
 //!   `/proc/1/environ` (the supervisor is non-dumpable), while it can open its own
 //!   `/proc/self/mem` (the positive control);
 //! - `RLIMIT_NPROC` of the launch bounds its processes (a fork loop) and its threads (Node.js
-//!   workers: at least one starts, not all 200);
+//!   workers: every attempt settles, at least one starts and at least one is refused);
 //! - last, `kill -STOP 1` and `kill -9 1`: on Linux (runc) PID 1 of a namespace ignores both from
 //!   its own namespace, and the run ends normally. gVisor (runsc release-20261109.0) delivers
 //!   both: SIGSTOP freezes the supervisor (its output stops, nothing raw passes) and SIGKILL ends
@@ -44,19 +44,26 @@ echo "raw-$S" > /proc/1/fd/1 2>/dev/null && echo fd1-open || echo fd1-refused
 cat /proc/1/environ >/dev/null 2>&1 && echo environ-read || echo environ-refused
 node -e '
 const { Worker } = require("worker_threads");
-let online = 0;
+let online = 0, failed = 0;
 for (let i = 0; i < 200; i++) {
+  let settled = false;
+  const settle = (ok) => { if (!settled) { settled = true; if (ok) online++; else failed++; } };
   try {
-    const w = new Worker("setTimeout(() => {}, 3000)", { eval: true });
-    w.on("online", () => { online++; });
-    w.on("error", () => {});
-  } catch (e) {}
+    const w = new Worker("setTimeout(() => {}, 60000)", { eval: true });
+    w.on("online", () => settle(true));
+    w.on("error", () => settle(false));
+    w.on("exit", () => settle(false));
+  } catch (e) { settle(false); }
 }
-setTimeout(() => {
+const start = Date.now();
+const wait = setInterval(() => {
+  if (online + failed < 200 && Date.now() - start < 30000) return;
+  clearInterval(wait);
   console.log("workers=" + online);
+  console.log("worker-failures=" + failed);
   console.log("threads=" + require("fs").readdirSync("/proc/self/task").length);
   process.exit(0);
-}, 1500);
+}, 100);
 ' 2>/dev/null || echo threads-failed
 ( n=0; while [ $n -lt 200 ]; do sleep 2 & n=$((n+1)); echo "started=$n"; done ) 2>/dev/null | tail -n 1
 echo done
@@ -243,16 +250,25 @@ fn the_supervisor_holds_as_pid1_of_a_sandbox() {
         "{started} processes started under RLIMIT_NPROC {PIDS}: {ctx}"
     );
     eprintln!(
-        "{runtime}: {started} processes started of 200 tried, workers {:?}, threads {:?}, under RLIMIT_NPROC {PIDS}",
+        "{runtime}: {started} processes started of 200 tried, workers {:?} (refused {:?}), threads {:?}, under RLIMIT_NPROC {PIDS}",
         num("workers="),
+        num("worker-failures="),
         num("threads=")
     );
-    // Node.js ran, at least one worker thread started, and the limit refused the rest of the
-    // 200 (Kimi, run 17, finding 6: a Node.js that does not start proves nothing).
+    // Node.js ran, every one of the 200 worker attempts settled (online or failed), at least
+    // one worker started and at least one was refused (Kimi, run 17, finding 6 and its
+    // re-check: a Node.js that does not start, or a count taken before the attempts settled,
+    // proves nothing).
     let workers = num("workers=").expect("no worker count: Node.js did not run");
+    let failures = num("worker-failures=").expect("no worker failure count");
+    assert_eq!(
+        workers + failures,
+        200,
+        "the worker attempts did not settle: {ctx}"
+    );
     assert!(
-        (1..200).contains(&workers),
-        "{workers} of 200 workers started under RLIMIT_NPROC {PIDS}: {ctx}"
+        workers >= 1 && failures >= 1,
+        "{workers} workers started and {failures} refused under RLIMIT_NPROC {PIDS}: {ctx}"
     );
     let threads = num("threads=").expect("no thread count");
     assert!(

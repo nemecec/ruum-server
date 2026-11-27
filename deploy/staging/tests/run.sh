@@ -2531,9 +2531,10 @@ sb="$STG/../../crates/ruum-runtime/tests/supervisor_sandbox.rs"
 rs_script="$(sed -n '/^const SCRIPT: &str = r#"$/,/^"#;$/p' "$sb" | sed '1d;$d')"
 sh_script="$(sed -n "/^read -r -d '' SUP_SCRIPT <<'SH' || true$/,/^SH$/p" "$gc" | sed '1d;$d')"
 [[ -n "$rs_script" && "$rs_script" == "$sh_script" ]] && grep -qxF '( : < /proc/1/mem ) 2>/dev/null && echo mem-open || echo mem-refused' <<<"$sh_script" &&
-  grep -qF 'mem-control-open' <<<"$sh_script" && grep -qF 'console.log("workers=" + online);' <<<"$sh_script" &&
+  grep -qF 'mem-control-open' <<<"$sh_script" && grep -qF 'console.log("worker-failures=" + failed);' <<<"$sh_script" && grep -qF 'if (online + failed < 200' <<<"$sh_script" &&
+  grep -qF 'workers + wfail == 200 && workers >= 1 && wfail >= 1' "$gc" &&
   grep -qF 'grep -qx mem-control-open' "$gc" && ! grep -qF 'grep -qx threads-failed' "$gc" &&
-  ok "the supervisor checks run one app script (Docker test and staging), /proc/1/mem open-only with a control, workers counted" ||
+  ok "the supervisor checks run one app script (Docker test and staging), /proc/1/mem open-only with a control, every worker attempt settled" ||
   bad "the supervisor checks differ, read /proc/1/mem at address 0, or pass the thread check without Node.js"
 bash -n "$STG/ops/gvisor-check.sh" && grep -qF 'the check proves nothing on this node' "$STG/ops/gvisor-check.sh" &&
   ok "gvisor-check.sh needs a control pod that sees the node's kernel (no pass on silence)" || bad "gvisor-check.sh"
