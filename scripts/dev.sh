@@ -363,6 +363,7 @@ cmd_env() {
 export DATABASE_URL=postgres://ruum:$RUUM_DB_PASSWORD@127.0.0.1:5434/ruum
 export TEST_DATABASE_URL=postgres://ruum:$RUUM_DB_PASSWORD@127.0.0.1:5434/ruum_test
 export RUUM_DBHOST_URL=postgres://ruum_dbhost:${RUUM_DBHOST_PASSWORD:-}@127.0.0.1:${POSTGRES_DATA_PORT:-5435}/postgres
+export RUUM_DATA_APP_TENANT_SHARE=${RUUM_DATA_APP_TENANT_SHARE:-50}
 export S3_ENDPOINT=http://127.0.0.1:3900
 export S3_REGION=garage
 export S3_BUCKET=$S3_BUCKET
