@@ -1887,3 +1887,98 @@ async fn a_migration_and_a_branch_never_overlap_on_postgres() {
     }
     pg_drop(&w, &made).await;
 }
+
+/// Kimi review of D-2 in run 17: a masked branch keeps the source's non-secret defaults and
+/// function bodies, and a migration runs as the schema owner. A migration of an agent, or of a
+/// person with edit only, cannot copy that catalog text into a confirmed `normal` column (top
+/// level, DO body, dynamic SQL): 422 `statement_not_allowed` with the hint
+/// `catalog_text_needs_manage`, nothing ran. A person with manage still can (positive control).
+#[tokio::test]
+async fn a_draft_migration_reads_no_catalog_text_without_manage() {
+    let Some((w, _engine)) = pg_world().await else {
+        return;
+    };
+    let node = pg_database(&w, "pg catalog text").await;
+    let a = ctx(w.team.id, w.alice);
+    let db = &w.s.databases;
+    let secret = format!("secret-{}@example.test", Uuid::now_v7().simple());
+    ran(db
+        .apply_migration(
+            &a,
+            node,
+            with_classes(
+                req(
+                    "0001_people",
+                    &format!(
+                        "create table people (id integer primary key, email text default '{secret}');\n\
+                         create table sink (id integer primary key, v text)"
+                    ),
+                ),
+                &[
+                    ("public.people.id", DataClass::Normal),
+                    ("public.sink.id", DataClass::Normal),
+                    ("public.sink.v", DataClass::Normal),
+                ],
+            ),
+            "",
+        )
+        .await
+        .unwrap());
+    let branch = db
+        .create_branch(
+            &a,
+            node,
+            CreateBranch {
+                name: "draft".into(),
+                data: DataCopy::Masked,
+                on_conflict: OnConflict::Fail,
+            },
+        )
+        .await
+        .unwrap()
+        .value
+        .node
+        .id;
+    settled(&w.s, &a, branch).await;
+    let agent = agent_of(&w, w.alice, Role::Edit).await;
+    let ac = agent_ctx(&agent);
+    let bob = ctx(w.team.id, w.bob);
+    let before = rows(&w, branch).await.len();
+    for up in [
+        "insert into sink(id, v) select 1, pg_get_expr(adbin, adrelid) from pg_catalog.pg_attrdef",
+        "do $$ begin insert into sink(id, v) select 1, pg_get_expr(adbin, adrelid) from pg_attrdef; end $$",
+        "do $$ begin execute 'insert into sink(id, v) select 1, pg_get_expr(adbin, adrelid) from pg_' || 'attrdef'; end $$",
+    ] {
+        for who in [&ac, &bob] {
+            let (status, c, text) = code(
+                db.apply_migration(who, branch, req("0002_leak", up), "")
+                    .await,
+            );
+            assert_eq!((status, c.as_str()), (422, "statement_not_allowed"), "{up}");
+            assert!(text.ends_with(rules::HINT_CATALOG_TEXT), "{up}: {text}");
+        }
+    }
+    assert_eq!(rows(&w, branch).await.len(), before);
+    let sink = pg_run(
+        &w,
+        branch,
+        RoleKind::Owner,
+        "select count(*)::text from sink",
+    )
+    .await;
+    assert_eq!(sink, vec![vec![Cell::Text("0".into())]]);
+    // A person with manage on the branch runs the same migration.
+    ran(db
+        .apply_migration(
+            &a,
+            branch,
+            req(
+                "0002_leak",
+                "insert into sink(id, v) select 1, pg_get_expr(adbin, adrelid) from pg_catalog.pg_attrdef",
+            ),
+            "",
+        )
+        .await
+        .unwrap());
+    pg_drop(&w, &[node, branch]).await;
+}

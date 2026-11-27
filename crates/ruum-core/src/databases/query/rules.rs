@@ -1002,6 +1002,103 @@ pub fn check_migration(engine: EngineKind, up: &str) -> Result<usize, (usize, Re
     Ok(n)
 }
 
+/// Functions that run a query given as text. The engine revokes them from every role kind but
+/// `owner` (`setup::grants_sql`), and a migration runs as the owner, so in `up` they would read
+/// what a name check cannot see.
+const TEXT_QUERY_FUNCTIONS: &[&str] = &[
+    "cursor_to_xml",
+    "cursor_to_xmlschema",
+    "query_to_xml",
+    "query_to_xml_and_xmlschema",
+    "query_to_xmlschema",
+    "ts_rewrite",
+    "ts_stat",
+];
+
+/// The catalog-text rule of a migration (Kimi review of D-2 in run 17): [`catalog_text_refusal`]
+/// for `up`, for a caller who is not a person with `manage` (every agent, and a person with
+/// `edit` on a `masked` or `schema_only` branch). `up` runs as the schema owner, who reads the
+/// catalog, and a draft branch keeps the source's function bodies, view definitions, comments and
+/// non-secret defaults, which can hold real values; without this rule a migration could copy that
+/// text into a column that its author reads plain (a confirmed `normal` column).
+///
+/// Stricter than the query rule, because `up` runs bodies that the tokenizer does not split
+/// (`DO $$ ... $$`, function bodies, string literals): the words of every token are checked,
+/// also the words inside a quoted or dollar-quoted string, so `'pg_proc'::regclass` and a DO
+/// body that names `pg_attrdef` are refused. Refused: the names of [`CATALOG_TEXT_NAMES`],
+/// `information_schema` followed by a view of [`INFORMATION_SCHEMA_TEXT`], the
+/// `table_to_xml*`/`schema_to_xml*`/`database_to_xml*` functions, the functions of
+/// [`TEXT_QUERY_FUNCTIONS`], and dynamic SQL in a body (`EXECUTE` inside a string or body that
+/// is not `EXECUTE FUNCTION` / `EXECUTE PROCEDURE` of a trigger), whose text a check of names
+/// cannot see. Like the other rules this is a check of names: a function that the source
+/// already had and that runs text as SQL is not seen (backlog). `None` for SQLite. The `usize`
+/// is the 1-based number of the statement, as in [`check_migration`].
+pub fn migration_catalog_text_refusal(engine: EngineKind, up: &str) -> Option<(usize, Refusal)> {
+    if engine != EngineKind::Postgres {
+        return None;
+    }
+    let dialect = dialect(engine);
+    let Ok(tokens) = Tokenizer::new(&*dialect, up)
+        .with_unescape(false)
+        .tokenize()
+    else {
+        return Some((0, unparsed()));
+    };
+    let refusal = |what: String| {
+        Refusal::not_allowed(
+            format!(
+                "{what} in up reads free-form text of the database's schema (definitions, \
+                 defaults, comments) or runs SQL that the platform cannot check; such text can \
+                 hold real values: only a person with manage on the database runs it in a \
+                 migration"
+            ),
+            Some(HINT_CATALOG_TEXT),
+        )
+    };
+    let mut n = 0;
+    for group in tokens.split(|t| matches!(t, Token::SemiColon)) {
+        let sig = significant(group);
+        if sig.is_empty() {
+            continue;
+        }
+        n += 1;
+        // The words of the statement, in order; a word of a string or body is marked.
+        let mut words: Vec<(String, bool)> = Vec::new();
+        for t in &sig {
+            let in_body = !matches!(t, Token::Word(_));
+            let text = t.to_string();
+            for w in text
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|w| !w.is_empty())
+            {
+                words.push((w.to_ascii_lowercase(), in_body));
+            }
+        }
+        for (i, (w, in_body)) in words.iter().enumerate() {
+            let next = words.get(i + 1).map(|(n, _)| n.as_str());
+            let dump = ["table_to_xml", "schema_to_xml", "database_to_xml"]
+                .iter()
+                .any(|p| w.starts_with(p));
+            if CATALOG_TEXT_NAMES.contains(&w.as_str())
+                || TEXT_QUERY_FUNCTIONS.contains(&w.as_str())
+                || dump
+            {
+                return Some((n, refusal(w.clone())));
+            }
+            if w == "information_schema"
+                && let Some(view) = next
+                && INFORMATION_SCHEMA_TEXT.contains(&view)
+            {
+                return Some((n, refusal(format!("information_schema.{view}"))));
+            }
+            if *in_body && w == "execute" && !matches!(next, Some("function" | "procedure")) {
+                return Some((n, refusal("dynamic SQL (EXECUTE in a body)".into())));
+            }
+        }
+    }
+    None
+}
+
 /// The word rules of one statement of `up` ([`check_migration`]).
 fn check_migration_statement(
     engine: EngineKind,
@@ -1066,6 +1163,58 @@ fn check_migration_statement(
 #[cfg(test)]
 mod migration_tests {
     use super::*;
+
+    /// Kimi review of D-2 in run 17: a migration of a caller without manage cannot read the
+    /// catalog's free-form text, also not from a DO body, a string or dynamic SQL.
+    #[test]
+    fn migrations_of_callers_without_manage_read_no_catalog_text() {
+        let pg = EngineKind::Postgres;
+        let refused = |up: &str| {
+            let (n, r) = migration_catalog_text_refusal(pg, up)
+                .unwrap_or_else(|| panic!("{up:?} was allowed"));
+            assert_eq!(r.hint.as_deref(), Some(HINT_CATALOG_TEXT), "{up}");
+            n
+        };
+        assert_eq!(
+            refused(
+                "create table sink (v text); insert into sink(v) select pg_get_expr(adbin, adrelid) \
+                 from pg_catalog.pg_attrdef"
+            ),
+            2
+        );
+        refused("insert into sink select prosrc from PG_PROC");
+        refused("insert into sink select prosrc from \"pg_proc\"");
+        refused("do $$ begin insert into sink select prosrc from pg_proc; end $$");
+        refused("do $b$ begin insert into sink select d from pg_description; end $b$");
+        refused("insert into sink select relname from pg_class where oid = 'pg_rewrite'::regclass");
+        refused("do $$ begin execute 'insert into sink select prosrc from pg_' || 'proc'; end $$");
+        refused("do $$ begin EXECUTE format('select %s', 1); end $$");
+        refused(
+            "create function f() returns setof text language plpgsql as $$ begin return query \
+             execute 'select 1'; end $$",
+        );
+        refused("insert into sink select query_to_xml('select 1', true, true, '')::text");
+        refused("insert into sink select table_to_xml('people', true, true, '')::text");
+        refused("insert into sink select column_default from information_schema.columns");
+        refused("do $$ begin perform 1 from information_schema.routines; end $$");
+        // Allowed: plain DDL and DML, DO blocks without catalog text or dynamic SQL, triggers,
+        // and catalog reads that show no free-form text.
+        for up in [
+            "create table beds (id int primary key, name text default 'x')",
+            "do $$ begin update people set email = 'moved-' || email where id = 302; end $$",
+            "create trigger t before insert on beds for each row execute function f()",
+            "create trigger t before insert on beds for each row execute procedure f()",
+            "create function f() returns trigger language plpgsql as $$ begin return new; end $$",
+            "insert into beds select 1, relname from pg_class limit 1",
+            "insert into beds select 1, table_name from information_schema.tables limit 1",
+            "-- pg_proc in a comment\ncreate table c (id int)",
+        ] {
+            assert!(migration_catalog_text_refusal(pg, up).is_none(), "{up}");
+        }
+        assert!(
+            migration_catalog_text_refusal(EngineKind::Sqlite, "select * from pg_proc").is_none()
+        );
+    }
 
     fn refused_at(engine: EngineKind, up: &str) -> (usize, Refusal) {
         match check_migration(engine, up) {
