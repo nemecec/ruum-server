@@ -197,9 +197,10 @@ pod and container user `10001`, `runAsNonRoot`, `fsGroup` 10001, `RuntimeDefault
   `/ruum-supervisor install /ruum/bin/ruum-supervisor` into the memory volume `ruum-bin`.
 - The container `app`: the image by digest from the repository of the spec's tenant and app
   (checked at the registry first, and its config read for the command), `command`
-  `/ruum/bin/ruum-supervisor run --launch-url http://<listener ip>:<port> --identity-file
-  /ruum/id/token --token-file /var/run/ruum/token` (no `args`: the app's command is in the sealed
-  launch data), `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, `privileged: false`,
+  `/ruum/bin/ruum-supervisor run --launch-url https://<listener ip>:<port> --identity-file
+  /ruum/id/token --token-file /var/run/ruum/token --server-pin sha256:<certificate>` (with
+  `supervisor_tls`, backlog I620-2; `http://` and no pin with `network_encrypted`; no `args`: the
+  app's command is in the sealed launch data), `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, `privileged: false`,
   `capabilities.drop: [ALL]`, CPU and memory limits with requests equal to them, the plain
   environment only, the termination message path `/dev/termination-log` with the policy `File`.
 - Volumes: `tmp` (`emptyDir`, `medium: Memory`, `sizeLimit` = the disk limit; a full disk is
@@ -314,7 +315,7 @@ its digest), and the egress proxy's control listener (`EgressRegistry`, as the D
 | `RUUM_KUBE_SUPERVISOR_IMAGE` | The supervisor's image, by digest. Required. |
 | `RUUM_KUBE_SUPERVISOR_SERVICE` | The supervisor listener as the sandboxes reach it (`host:port`; the driver resolves the host). Required. |
 | `RUUM_KUBE_SUPERVISOR_LISTEN` | The listener of this process (`addr:port`; `crates/ruum-server` `supervisor.rs`). Required. |
-| `RUUM_KUBE_SUPERVISOR_NETWORK` | Must be `encrypted`: node-to-node traffic is encrypted and authenticated (the launch channel is plain HTTP; decision 0006 I point 4). |
+| `RUUM_KUBE_SUPERVISOR_NETWORK` | `tls`: the launch channel is TLS 1.3 with the key every replica derives from the record key, pinned by each supervisor (backlog I620-2; staging). `encrypted`: plain HTTP, because node-to-node traffic is encrypted and authenticated (decision 0006 I point 4). Required. With `kubernetes` the server also needs the platform database (`DATABASE_URL`): the launch ledger (backlog I620-9). |
 | `RUUM_KUBE_NODE_ARCH` | The nodes' architecture for a multi-arch image (`amd64` by default). |
 
 ### Tests
@@ -330,8 +331,18 @@ network policies or the kubelet's behaviour: on staging `ops/gvisor-check.sh`,
 
 ### Known limits of the Kubernetes driver
 
-- No pids limit per pod (Kubernetes sets it per node, `podPidsLimit` of the kubelet; staging has
-  none yet: backlog I6-19).
+- The pids limit per pod is the kubelet's `podPidsLimit` (4096 on staging, backlog I6-19): under
+  gVisor it bounds the host side of a sandbox; the app's own processes and threads are bounded by
+  the supervisor's `RLIMIT_NPROC` (512), proven under runsc (`tests/supervisor_sandbox.rs`).
+- Under gVisor the app can stop or kill its supervisor (PID 1 takes `SIGSTOP` and `SIGKILL` from
+  its namespace there; backlog I620-15): its own run freezes or ends, nothing leaks.
+- The anti-rollback state (each record's seal generation and the launched pods) is the shared
+  ledger (`kube::ledger::SealLedger`; the server's Postgres ledger, backlog I620-9);
+  `KubeDriver::new` keeps it in the process (`MemoryLedger`), for tests and one process alone.
+- `TokenReview`s of the supervisor listener come only after the cheap checks (the token reads
+  as the sandbox account's projected token of a pod at the caller's address) and within
+  `peer_reviews_per_minute` (6) per address and `review_rate_per_sec` (20, burst
+  `review_burst` 40) for all (backlog I620-12).
 - Each process keeps the logs of at most `max_instances` instances (4096), of at most
   `max_tenant_instances` (512) running or scaled-to-zero instances of one tenant (a start past it
   is `runtime_unavailable`, so one tenant never takes every slot; Kimi run 15 I6-1 finding 5,

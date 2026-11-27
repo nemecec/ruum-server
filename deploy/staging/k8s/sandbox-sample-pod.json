@@ -21,11 +21,13 @@
           "/ruum/bin/ruum-supervisor",
           "run",
           "--launch-url",
-          "http://192.0.2.1:8091",
+          "https://192.0.2.1:8091",
           "--identity-file",
           "/ruum/id/token",
           "--token-file",
-          "/var/run/ruum/token"
+          "/var/run/ruum/token",
+          "--server-pin",
+          "sha256:e83e00c742bd37c6efcf65b8f9faab97d9564922fae806c4919d12b44c21b1ec"
         ],
         "env": [
           {

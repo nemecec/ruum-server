@@ -238,9 +238,11 @@ node's files clean and stop cross-tenant harm; they do not make a hostile app's 
 secret.
 
 1. **The binary.** Rust, built for `*-unknown-linux-musl` (static: no C library needed in the
-   image), with std, `nix` (safe wrappers of the process calls), `serde`/`serde_json` and `time`
-   only (all pure Rust): no async
-   runtime, no TLS, no C code, no `unsafe`. Source: `crates/ruum-runtime/supervisor` (package
+   image), with std, `nix` (safe wrappers of the process calls), `serde`/`serde_json`, `time`,
+   and `rustls` with the aws-lc-rs provider and `sha2` for the TLS launch channel (backlog
+   I620-2; aws-lc's primitives are the binary's only C and assembly code): no async runtime, no
+   `unsafe`. The image builds in its Dockerfile's Alpine stage (aws-lc needs a musl C compiler),
+   and the Docker tests take the binary from that build. Source: `crates/ruum-runtime/supervisor` (package
    `ruum-supervisor`, about 1 MiB). The redactor is the one of `ruum-core`
    (`runtime::redact::LineRedactor`, compiled into the supervisor from the same file, not a
    copy), so the sandbox and the driver redact with the same code.
@@ -258,9 +260,12 @@ secret.
    1. `prctl(PR_SET_DUMPABLE, 0)`: its `/proc/<pid>` files belong to root, so the app (same
       user, no `CAP_SYS_PTRACE`) cannot open `/proc/1/fd/1` (the raw output stream),
       `/proc/1/mem` or `/proc/1/environ`, and cannot trace it. As PID 1 of its PID namespace it
-      also ignores `SIGKILL` and `SIGSTOP` from the app. The supervisor's tests prove both on
-      Linux; `ops/gvisor-check.sh` must prove them under gVisor before the driver is turned on
-      (see "Turning the Kubernetes driver on").
+      also ignores `SIGKILL` and `SIGSTOP` from the app on Linux. **gVisor does not** (runsc
+      release-20261109.0, proven by `crates/ruum-runtime` `tests/supervisor_sandbox.rs` under
+      runsc, backlog I620-15): the app's `SIGSTOP` freezes the supervisor (its output stops;
+      nothing raw passes, the token stops renewing) and its `SIGKILL` ends the whole sandbox,
+      the app with it. Both harm only the app's own run; the non-dumpable `/proc` holds under
+      gVisor (the same test, and `ops/gvisor-check.sh` on staging).
    2. Empties `/dev/termination-log`, then reads the launch data **once** (below) and checks it:
       at most 256 values, 16 KiB per value, 256 KiB in all (the limits of `ruum-core`'s
       redactor), plus at most 16 workload tokens (the current one and the earlier ones that are
@@ -271,7 +276,11 @@ secret.
       gVisor counts in its own kernel, one per sandbox. The Docker driver keeps the engine's
       `pids-limit` and sends none (under runc the count spans every container of uid 10001). The
       kubelet's `podPidsLimit` (I6-19) stays the hard bound on staging; the supervisor's limit is
-      a second bound, proven live (a fork and a thread check) before it counts.
+      a second bound, proven under runsc (a fork and a thread check: `tests/supervisor_sandbox.rs`
+      on the build server, `ops/gvisor-check.sh` on staging). The kubelet's `podPidsLimit` is
+      4096 on staging (`talos/patches/cluster.yaml`, I6-19): under gVisor it bounds the host side
+      of a sandbox (the Sentry's and the gofer's threads); the app's processes live in gVisor's
+      kernel and only `RLIMIT_NPROC` bounds them.
    4. Starts the app with the merged environment (the container's plain environment, then the
       secret values), standard input from `/dev/null`, standard output and standard error as two
       pipes. No other file descriptor is inherited. The supervisor blocks the forwarded signals
@@ -329,17 +338,20 @@ secret.
      - **Rollback.** An attacker who writes ConfigMaps can put an older `sealed` value of the same
        record back. It names an earlier run's pod (gone; `uid`s are never reused) or, within one
        run, an older token: a launch it allows goes only to that run's own pod, and the server
-       refuses a generation below the highest it has seen for the instance (kept in memory per
-       process; also when it seals again). The values of an instance never change (a new
-       deployment is a new instance). A seal put back before the launch list can make another
-       replica (or a restarted one) launch the same pod a second time; so a launch is also
-       refused more than 120 s after the app container started (the kubelet's `startedAt`, which
-       the pod's creator cannot write). The kubelet writes the status on its own schedule: while
+       refuses a generation below the highest any server process has seen for the record (the
+       **launch ledger**, backlog I620-9: `runtime_seal_marks` in the platform database, shared by
+       every replica, keyed by the instance and the record's `metadata.uid`; also when it seals
+       again). The values of an instance never change (a new deployment is a new instance). The
+       launches are claimed in the ledger too (`runtime_launches`, one row per pod uid, inserted
+       before the answer leaves), so a seal put back that hides a launch opens no second launch
+       on any replica or after a restart. A launch is also refused more than 120 s after the app
+       container started (the kubelet's `startedAt`, which the pod's creator cannot write). The kubelet writes the status on its own schedule: while
        the app container has no `startedAt` (and has not ended), or the pod no address, the
-       answer is `503` and the supervisor asks again; an ended app container is refused. The residual: within those 120 s, a holder of the runtime
-       token together with the pod's own app can fetch that pod's launch data again (its previous
-       values). A shared, server-side record of generations and launches closes it (backlog
-       I620-9).
+       answer is `503` and the supervisor asks again; an ended app container is refused. The
+       ConfigMap's seal is the encrypted cache of the values; the ledger is the authority of the
+       generation and the launches. A launch whose claim is written but whose answer is lost (the
+       connection broke, the record write kept failing) is not answered again: the run ends as
+       exited (exit 125), as for any failed launch.
    - **The pod's identity.** Sandbox pods run as the ServiceAccount `ruum-sandbox` of
      `ruum-apps`, which has no RoleBinding. The pod mounts one projected service account token
      with the audience `ruum-supervisor`, `expirationSeconds: 600` (refreshed by the kubelet), at
@@ -358,8 +370,14 @@ secret.
      only after the supervisor's launch). `/v1/token` answers only the current workload token; the
      supervisor asks every 30 s, adds a new token to its redactors, then writes the token file
      (`TOKEN_FILE`, a memory `emptyDir`, readable by the app).
-   - **The checks of the server**, for each request, all of them, before any value is read: a
-     `TokenReview` with `spec.audiences: ["ruum-supervisor"]`, and its answer has
+   - **The checks of the server**, for each request, all of them, before any value is read.
+     First the cheap ones, which cost the API server no `TokenReview` (backlog I620-12): the
+     bearer reads (unverified) as a projected token of `system:serviceaccount:ruum-apps:ruum-sandbox`
+     for the audience `ruum-supervisor`, unexpired, naming one pod (`kubernetes.io.pod`), and
+     that pod exists with that uid at the connection's peer address. Then within the review
+     bounds (per peer address 6 a minute, else `429`; all peers together 20 a second with a burst
+     of 40, else `503`): a `TokenReview` with `spec.audiences: ["ruum-supervisor"]`, and its
+     answer names the same pod and has
      `authenticated: true`, no error, `ruum-supervisor` in `status.audiences`, the user exactly
      `system:serviceaccount:ruum-apps:ruum-sandbox`, and exactly one value in each of the extra
      fields `authentication.kubernetes.io/pod-name` and `authentication.kubernetes.io/pod-uid`;
@@ -385,14 +403,22 @@ secret.
      and the supervisor tries again for 60 s. A positive `TokenReview` is kept for at most 60 s
      and never past the token's `exp`, 4096 entries at most; the pod, record and run checks run
      on every request. Requests are limited per peer address.
-   - **Transport.** Plain HTTP between a sandbox and a server pod. A pod's traffic to another
-     node crosses the network between the nodes, so the driver refuses to start unless the
-     setting `RUUM_KUBE_SUPERVISOR_NETWORK=encrypted` says that node-to-node traffic is
-     encrypted and authenticated (Talos KubeSpan or the CNI's WireGuard: every hop off a node).
-     An enable step checks it (`talosctl get kubespanpeerstatuses`). TLS with a certificate the
-     supervisor pins is the alternative (a follow-up card). Within a node, pod traffic does not
-     leave the node; a sandbox cannot send as another address (restricted Pod Security: no
-     `NET_RAW`; gVisor's network stack).
+   - **Transport** (backlog I620-2). A pod's traffic to another node crosses the network
+     between the nodes, so the launch channel is **TLS 1.3 with a pinned certificate**
+     (`RUUM_KUBE_SUPERVISOR_NETWORK=tls`, staging's setting): every server replica derives the
+     same Ed25519 key from the record key (`RecordKey::derive("ruum-supervisor-tls-v1")`) and
+     makes the same self-signed certificate (a fixed template; Ed25519 signs deterministically);
+     the driver puts the certificate's SHA-256 into the pod's command (`--server-pin`, held by
+     the read-back), and the supervisor accepts that certificate only and checks the
+     handshake's signature with its key (no CA, no name, no expiry). Chosen over a cluster-wide
+     mesh (Talos KubeSpan or the CNI's WireGuard) because it protects exactly this channel with
+     no change to the nodes' networking (KubeSpan changes the MTU and routes of every node and
+     sends node data to a discovery service), needs no new secret, and is tested end to end in
+     CI (`crates/ruum-server` `supervisor.rs`). Plain HTTP stays possible only with
+     `RUUM_KUBE_SUPERVISOR_NETWORK=encrypted`, the statement that node-to-node traffic is
+     encrypted and authenticated. Within a node, pod traffic does not leave the node; a sandbox
+     cannot send as another address (restricted Pod Security: no `NET_RAW`; gVisor's network
+     stack).
    - **Network policies.** One ingress rule on the server pods (from `ruum-apps`, only the
      supervisor port) and one egress rule for the sandboxes (to the server pods, only that port).
      kube-proxy does not translate the source address of pod-to-Service traffic, so the peer
@@ -443,17 +469,19 @@ secret limits but not part of this budget (backlog row). The Docker driver uses 
 | Attacker | Can | Cannot (and why) |
 |---|---|---|
 | **Holder of the runtime ServiceAccount's token** (stolen from the server pod, or a bug that leaks it) | Create, read, list and delete pods and records in `ruum-apps`; read pod logs and pod status; create `TokenReview`s. End or restart runs and put back older seals (denial of service), read plain environment values and image names in records (as before). | Read a secret value or token: no Secret exists, records hold sealed data, the record key is not in `ruum-apps`. Get values into a pod it made: the launch needs the kubelet's token of the pod whose `uid` a server process sealed for the run, from that pod's address; a pod it makes (also one deleted and made again under the same name) has another `uid`. Change what a run gets: the fixed fields are bound by the sealed digest, the seal by its associated data (record name, record `uid`, generation). Get a second launch of a pod: the launched `uid`s are sealed, and no launch comes later than 120 s after the app's start (alone it gains nothing from a second launch; with the pod's own app, within 120 s and on another replica, see Rollback and backlog I620-9). Read values from logs: the supervisor redacted them before the kubelet wrote them. |
-| **Compromised app** (code in the sandbox) | Read its own values and token (rule 7 "honestly"); send them out through the egress proxy; read its projected identity token and fetch the current token; write encoded values to its output; write its own value to `/dev/termination-log` (see Known limits); fill its PID limit. | Fetch the launch data again (previous values): the launch is once per pod. Write raw output to the container runtime: its output is a pipe to the supervisor, which is non-dumpable (no `/proc/1/fd/1`, no ptrace). Kill or stop the supervisor: PID 1 ignores `SIGKILL` and `SIGSTOP` from its own namespace, and the forwarded signals go to the app. Change the supervisor: read-only mount. Get another pod's values: its token names its own pod. |
+| **Compromised app** (code in the sandbox) | Read its own values and token (rule 7 "honestly"); send them out through the egress proxy; read its projected identity token and fetch the current token; write encoded values to its output; write its own value to `/dev/termination-log` (see Known limits); fill its PID limit; under gVisor stop or kill the supervisor (I620-15), which freezes or ends its own run. | Fetch the launch data again (previous values): the launch is once per pod (the ledger). Write raw output to the container runtime: its output is a pipe to the supervisor, which is non-dumpable (no `/proc/1/fd/1`, no ptrace); a killed supervisor ends every process of the sandbox, a stopped one passes nothing. Make the server send unbounded `TokenReview`s: the cheap checks and the review bounds (I620-12). Change the supervisor: read-only mount. Get another pod's values: its token names its own pod. |
 | **Node admin** (root on a node; Talos API) | Everything on that node: process memory, environment, projected tokens, kubelet files. | Read a value from `/var/log/pods`: only the supervisor's redacted output is there (exact matches). Out of scope otherwise: admins are the person (decision 0006 E-3); a short kubelet log rotation is still good hygiene. |
 | **Compromised server process** | Everything (record key, secret store, token issuer), as before. | Out of scope of this design. |
-| **Observer or attacker on the network between nodes** | Nothing while node-to-node traffic is encrypted and authenticated (the driver refuses to start without the setting that says so). | Read or change launch answers, or replay a projected token: WireGuard (KubeSpan or the CNI's) authenticates and encrypts every hop off a node; a replayed token from another address fails the peer check. |
+| **Observer or attacker on the network between nodes** | See that a sandbox talks to the supervisor listener (TLS hides the content). | Read or change launch answers, or impersonate the listener: TLS 1.3 with the pinned certificate (only a holder of the record key has its key). Replay a projected token: TLS hides it, and a token from another address fails the peer check. |
 
 **Turning the Kubernetes driver on again** (decision 0008-5 keeps it off) needs, in order: the
-supervisor image built and pinned, the record key Secret, node-to-node encryption, the chart and
-platform changes applied, I6-19's kubelet PID limit, the live checks of `ops/gvisor-check.sh`
-(gVisor, non-dumpable `/proc`, PID 1 signals, the PID limit, a CRI log canary) and
-`ops/rbac-check.sh live` (no Secret verb, a forged pod refused by the server), and the person's
-decision. The exact steps are in `deploy/staging/README.md` "Turning the Kubernetes runtime
+person's decision, the supervisor image published (`images.yml`, I620-1) and pinned by
+`ops/deploy-chart.sh`, a release with the launch ledger (migration 0018, I620-9), I6-19's kubelet
+PID limit applied, the record key Secret (it also derives the listener's TLS key, I620-2), the
+platform changes applied, the live checks of `ops/gvisor-check.sh --supervisor-image` (gVisor,
+the kubelet PID limit, the supervisor in the driver's shape: a CRI log canary, non-dumpable
+`/proc`, the process and thread limit, the PID 1 signals, I620-3) and `ops/rbac-check.sh live`
+(no Secret verb, a forged pod refused by the server), then the switch. The exact steps are in `deploy/staging/README.md` "Turning the Kubernetes runtime
 driver on".
 
 ### Host names and slugs (review R10, RC-5)

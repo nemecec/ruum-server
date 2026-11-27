@@ -24,33 +24,43 @@ pub const REGISTRY_IMAGE: &str =
     "registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373";
 
 /// The static sandbox supervisor (backlog I6-20) for the driver: `RUUM_SUPERVISOR_BIN`, or built
-/// here for `<arch>-unknown-linux-musl` (once per test binary, into `CARGO_TARGET_TMPDIR`). The
-/// musl target must be installed (`rustup target add`); without it the build fails, and the test
-/// fails when `CI` is set (the CI job installs the target), else it runs without a supervisor.
+/// here from its own Dockerfile (`crates/ruum-runtime/supervisor/Dockerfile`, the image that
+/// staging runs; once per test binary, the binary copied out into `CARGO_TARGET_TMPDIR`). Since
+/// backlog I620-2 the supervisor links aws-lc (TLS to the launch listener), whose C needs a musl
+/// C compiler: the Dockerfile's Alpine stage has one, a glibc host does not. Without an engine or
+/// on a failed build the test fails when `CI` is set, else it runs without a supervisor.
 pub fn supervisor_bin() -> Option<PathBuf> {
     static BIN: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     BIN.get_or_init(|| {
         if let Ok(p) = std::env::var("RUUM_SUPERVISOR_BIN") {
             return Some(PathBuf::from(p));
         }
-        let target = format!("{}-unknown-linux-musl", std::env::consts::ARCH);
         let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("supervisor");
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-        let built = Command::new(cargo)
-            .args(["build", "--release", "-p", "ruum-supervisor", "--target", &target])
-            .env("CARGO_TARGET_DIR", &dir)
-            .current_dir(&root)
-            .status();
-        let bin = dir.join(&target).join("release/ruum-supervisor");
+        let file = root.join("crates/ruum-runtime/supervisor/Dockerfile");
+        let tag = format!("ruum-supervisor:test-{}", std::process::id());
+        let bin = dir.join("ruum-supervisor");
+        let built = (|| -> Result<(), String> {
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let root_s = root.display().to_string();
+            let file_s = file.display().to_string();
+            docker(&["build", "-q", "-f", &file_s, "-t", &tag, &root_s])?;
+            let id = docker(&["create", &tag])?;
+            let from = format!("{id}:/ruum-supervisor");
+            let to = bin.display().to_string();
+            let copied = docker(&["cp", &from, &to]);
+            let _ = docker(&["rm", &id]);
+            let _ = docker(&["rmi", &tag]);
+            copied.map(|_| ())
+        })();
         match built {
-            Ok(s) if s.success() && bin.is_file() => Some(bin),
+            Ok(()) if bin.is_file() => Some(bin),
             other => {
                 assert!(
                     std::env::var_os("CI").is_none(),
-                    "the sandbox supervisor did not build for {target} ({other:?}); install the target"
+                    "the sandbox supervisor did not build from its Dockerfile ({other:?})"
                 );
-                eprintln!("the sandbox supervisor did not build for {target}: the Docker tests run without it");
+                eprintln!("the sandbox supervisor did not build from its Dockerfile: the Docker tests run without it ({other:?})");
                 None
             }
         }

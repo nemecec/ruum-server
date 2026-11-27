@@ -117,6 +117,32 @@ pub struct Issued {
     pub exp: i64,
 }
 
+/// A token with the claims of `i` that the fake did not issue (its review answers "not
+/// authenticated"): what a sandbox can write by itself, since it knows its own pod.
+pub fn unsigned_token(i: &Issued) -> String {
+    use base64::Engine;
+    let b64 = |v: &Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap())
+    };
+    format!(
+        "{}.{}.{}",
+        b64(&json!({ "alg": "RS256" })),
+        b64(&json!({
+            "aud": [i.audience],
+            "exp": i.exp,
+            "iss": "https://kubernetes.default.svc.cluster.local",
+            "sub": format!("system:serviceaccount:{}:{}", i.namespace, i.service_account),
+            "jti": uuid::Uuid::now_v7().to_string(),
+            "kubernetes.io": {
+                "namespace": i.namespace,
+                "pod": { "name": i.pod, "uid": i.pod_uid },
+                "serviceaccount": { "name": i.service_account, "uid": "sa-uid" },
+            },
+        })),
+        "fake-signature"
+    )
+}
+
 pub struct Fake {
     objs: Mutex<Objects>,
     rules: Vec<(String, Vec<String>)>,
@@ -382,22 +408,22 @@ impl Fake {
     }
 
     /// Issues a projected token for a pod (what the kubelet does for a `serviceAccountToken`
-    /// volume source). The token is a JWT in shape, with `exp`.
+    /// volume source). The token is a JWT in shape, with the claims of a real projected token
+    /// (`aud`, `exp`, `sub` and `kubernetes.io` with the namespace, the pod and the account).
     pub fn issue(&self, i: Issued) -> String {
-        use base64::Engine;
-        let b64 = |v: &Value| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap())
-        };
-        let token = format!(
-            "{}.{}.{}",
-            b64(&json!({ "alg": "RS256" })),
-            b64(
-                &json!({ "aud": [i.audience], "exp": i.exp, "sub": format!("system:serviceaccount:{}:{}", i.namespace, i.service_account), "jti": uuid::Uuid::now_v7().to_string() })
-            ),
-            "fake-signature"
-        );
+        let token = unsigned_token(&i);
         self.issued.lock().unwrap().insert(token.clone(), i);
         token
+    }
+
+    /// How many `TokenReview`s the driver made.
+    pub fn token_reviews(&self) -> usize {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, _, r)| r == "tokenreviews")
+            .count()
     }
 
     /// `Err` (401 or 403) unless the token and the Role allow the call.

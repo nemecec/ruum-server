@@ -17,6 +17,10 @@
 #     review of I-6, 2). A commit without both images (before I-6) deploys without the app
 #     runtime only when the live release has none, or on a stated rollback (--rollback,
 #     --rollback-older); otherwise helm would delete the running gateway and egress proxy;
+#   - the sandbox supervisor (backlog I620-1): ghcr.io/nemecec/ruum-supervisor of the tag
+#     <commit>, with the same provenance and revision checks, goes into runtime.supervisorImage
+#     (always set, empty without the image, so no earlier release's supervisor runs with this
+#     server; the chart refuses runtime.kubernetes without it). A lookup error stops the deploy;
 #   - the values go to helm in a values file (JSON), never through --set, so no value can add
 #     another key (helm splits --set on commas).
 # Then (design 12.7, backlog O-25), holding the deploy lock (Lease ruum/ruum-deploy,
@@ -125,6 +129,27 @@ else
   echo "==> no ruum-gateway or ruum-egress image of $commit (a commit from before card I-6, or the packages are not public): allowed only when the live release has no app runtime, or on a rollback (checked under the deploy lock)" >&2
 fi
 
+# The sandbox supervisor of the same commit (backlog I620-1), by digest, for
+# runtime.supervisorImage. Missing (a commit from before I620-1, or the package is private):
+# empty, and the chart then refuses runtime.kubernetes (the driver stays off).
+supervisor=""
+rc=0
+digest="$(ghcr_tag_lookup "nemecec/ruum-supervisor" "$commit")" || rc=$?
+if [[ $rc == 0 ]]; then
+  [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]] || die "ghcr.io/nemecec/ruum-supervisor:$commit resolves to an odd digest"
+  ref="ghcr.io/nemecec/ruum-supervisor@$digest"
+  [[ "$ref" =~ $RUUM_SUPERVISOR_IMAGE_RE ]] || die "unexpected supervisor image $ref"
+  cosign_verify_provenance "$ref" || die "no valid provenance attestation for $ref"
+  rev="$(ghcr_revision "$ref")" || die "cannot read the revision label of $ref"
+  [[ "$rev" == "$commit" ]] || die "$ref was built from ${rev:-an unknown commit}, not from $commit"
+  supervisor="$ref"
+  echo "==> sandbox supervisor: $supervisor (provenance and revision checked)" >&2
+elif [[ $rc == 3 ]]; then
+  echo "==> no ruum-supervisor image of $commit: runtime.supervisorImage stays empty (the Kubernetes driver cannot be on)" >&2
+else
+  die "cannot read the tag ghcr.io/nemecec/ruum-supervisor:$commit (a registry or network error); not deploying. Run deploy.sh again later"
+fi
+
 tmp="$(mktemp -d "$WORK/deploy.XXXXXX")"
 holder="deploy-${commit:0:12}-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
 locked=0
@@ -220,8 +245,8 @@ ruum_lock_renew "$holder" || die "lost the deploy lock after the migration step;
 
 # 3. The values as JSON (valid YAML), built by jq from validated strings.
 values="$tmp/values.json"
-jq -n --arg server "$server" --arg edge "$edge" --arg gateway "$gateway" --arg egress "$egress" --arg commit "$commit" --arg previous "$previous_value" --arg acme "$acme" --arg email "$acme_email" '
-  { images: { server: $server, edge: $edge, gateway: $gateway, egress: $egress }, commit: $commit, previousCommit: $previous }
+jq -n --arg server "$server" --arg edge "$edge" --arg gateway "$gateway" --arg egress "$egress" --arg supervisor "$supervisor" --arg commit "$commit" --arg previous "$previous_value" --arg acme "$acme" --arg email "$acme_email" '
+  { images: { server: $server, edge: $edge, gateway: $gateway, egress: $egress }, runtime: { supervisorImage: $supervisor }, commit: $commit, previousCommit: $previous }
   + (if $acme != "" then { acme: ({ issuer: $acme } + (if $email != "" then { email: $email } else {} end)) } else {} end)
 ' >"$values"
 

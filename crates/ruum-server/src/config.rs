@@ -215,9 +215,10 @@ impl GallerySettings {
 ///   key that seals the values in the instance records), `RUUM_KUBE_SUPERVISOR_IMAGE` (the
 ///   supervisor's image, by digest), `RUUM_KUBE_SUPERVISOR_SERVICE` (`host:port`: the listener as
 ///   the sandboxes reach it, a Service), `RUUM_KUBE_SUPERVISOR_LISTEN` (`addr:port`: the
-///   listener of this process) and `RUUM_KUBE_SUPERVISOR_NETWORK=encrypted` (node-to-node
-///   traffic is encrypted and authenticated: the launch channel is plain HTTP; decision 0006 I
-///   point 4). `RUUM_KUBE_NODE_ARCH` (default `amd64`): the platform of a multi-arch image.
+///   listener of this process) and `RUUM_KUBE_SUPERVISOR_NETWORK`: `tls` (the launch channel is
+///   TLS 1.3 with the listener's key derived from the record key, pinned by the supervisor;
+///   backlog I620-2) or `encrypted` (plain HTTP, because node-to-node traffic is encrypted and
+///   authenticated; decision 0006 I point 4). `RUUM_KUBE_NODE_ARCH` (default `amd64`): the platform of a multi-arch image.
 /// - `RUUM_KUBE_RUNTIME_CLASS_OVERHEAD` (`cpu=50m,memory=64Mi`; default none): the runtime
 ///   class's `overhead.podFixed`, exactly as its manifest has it. The RuntimeClass admission
 ///   plugin writes it into every pod and the driver's read-back must know it (review of I6-20).
@@ -243,6 +244,8 @@ pub struct KubeSettings {
     pub supervisor_image: String,
     pub supervisor_service: (String, u16),
     pub supervisor_listen: std::net::SocketAddr,
+    /// `RUUM_KUBE_SUPERVISOR_NETWORK=tls` (else `encrypted`).
+    pub supervisor_tls: bool,
     pub node_arch: String,
     pub runtime_class_overhead: std::collections::BTreeMap<String, String>,
 }
@@ -356,10 +359,13 @@ impl RuntimeSettings {
         let supervisor_listen: std::net::SocketAddr = need("RUUM_KUBE_SUPERVISOR_LISTEN")?
             .parse()
             .context("RUUM_KUBE_SUPERVISOR_LISTEN must be addr:port")?;
-        anyhow::ensure!(
-            get("RUUM_KUBE_SUPERVISOR_NETWORK").as_deref() == Some("encrypted"),
-            "RUUM_KUBE_SUPERVISOR_NETWORK must be encrypted: the launch channel is plain HTTP, so node-to-node traffic must be encrypted and authenticated first (KubeSpan or the CNI's WireGuard; decision 0006 I point 4)"
-        );
+        let supervisor_tls = match get("RUUM_KUBE_SUPERVISOR_NETWORK").as_deref() {
+            Some("tls") => true,
+            Some("encrypted") => false,
+            _ => anyhow::bail!(
+                "RUUM_KUBE_SUPERVISOR_NETWORK must be tls (the launch channel with a pinned certificate, backlog I620-2) or encrypted (plain HTTP over node-to-node traffic that is encrypted and authenticated; decision 0006 I point 4)"
+            ),
+        };
         // The service account token goes to the API server over TLS only.
         let api_url =
             get("RUUM_KUBE_API_URL").unwrap_or_else(|| "https://kubernetes.default.svc".into());
@@ -382,6 +388,7 @@ impl RuntimeSettings {
             supervisor_image,
             supervisor_service,
             supervisor_listen,
+            supervisor_tls,
             node_arch: get("RUUM_KUBE_NODE_ARCH").unwrap_or_else(|| "amd64".into()),
             runtime_class_overhead: overhead(
                 &get("RUUM_KUBE_RUNTIME_CLASS_OVERHEAD").unwrap_or_default(),
@@ -477,6 +484,7 @@ mod tests {
         );
         assert!(!k.split_log_streams);
         assert_eq!(k.supervisor_listen.port(), 8091);
+        assert!(!k.supervisor_tls);
         assert_eq!(k.node_arch, "amd64");
         assert!(k.runtime_class_overhead.is_empty());
         let mut with = ok.clone();
@@ -491,6 +499,17 @@ mod tests {
                 ("memory".to_owned(), "64Mi".to_owned()),
             ])
         );
+        // TLS on the launch channel (backlog I620-2).
+        let mut tls: Vec<_> = ok
+            .iter()
+            .filter(|x| x.0 != "RUUM_KUBE_SUPERVISOR_NETWORK")
+            .cloned()
+            .collect();
+        tls.push(("RUUM_KUBE_SUPERVISOR_NETWORK", "tls"));
+        let RuntimeSettings::Kubernetes(k) = runtime(&tls).unwrap() else {
+            panic!("not kubernetes");
+        };
+        assert!(k.supervisor_tls);
         // The supervisor settings are required, the image by digest, the network encrypted.
         for missing in base.iter().skip(1) {
             let all: Vec<_> = base.iter().filter(|x| x != &missing).cloned().collect();

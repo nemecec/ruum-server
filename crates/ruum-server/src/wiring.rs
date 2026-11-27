@@ -262,6 +262,7 @@ pub fn install_apps(
     pool: Option<sqlx::PgPool>,
     handles: &MemoryHandles,
 ) -> anyhow::Result<()> {
+    let ledger_pool = pool.clone();
     let mut parts = match pool {
         Some(pool) => ruum_core::apps::AppParts::postgres(pool),
         None => {
@@ -279,7 +280,7 @@ pub fn install_apps(
     }
     // The runtime driver: the in-memory one, or pods in gVisor (backlog I6-1). The Docker driver
     // of the laptop is card I-4's.
-    let kube = kube_driver(&crate::config::RuntimeSettings::from_env()?)?;
+    let kube = kube_driver(&crate::config::RuntimeSettings::from_env()?, ledger_pool)?;
     if let Some(k) = &kube {
         parts.runtime = k.clone();
     }
@@ -305,6 +306,7 @@ impl ruum_core::runtime::RuntimeUsageSink for UnmeteredUsage {
 /// driver. It makes no API call here; its sweep starts on the current runtime.
 pub fn kube_driver(
     settings: &crate::config::RuntimeSettings,
+    pool: Option<sqlx::PgPool>,
 ) -> anyhow::Result<Option<Arc<ruum_runtime::KubeDriver>>> {
     use ruum_core::runtime::{Route, SecretValue};
     use ruum_runtime::{EgressRegistry, HttpEgressRegistry, KubeConfig, NoEgress, SharedService};
@@ -327,7 +329,17 @@ pub fn kube_driver(
     cfg.supervisor_image = k.supervisor_image.clone();
     cfg.supervisor_address = k.supervisor_service.0.clone();
     cfg.supervisor_port = k.supervisor_service.1;
-    cfg.network_encrypted = true;
+    // TLS with a pinned certificate (backlog I620-2), or plain HTTP over an encrypted node
+    // network (the setting says which; one of them is required).
+    cfg.supervisor_tls = k.supervisor_tls;
+    cfg.network_encrypted = !k.supervisor_tls;
+    let tls = match (k.supervisor_tls, &cfg.record_key) {
+        (true, Some(key)) => Some(crate::supervisor::tls_acceptor(
+            &ruum_runtime::kube::tls::SupervisorTls::derive(key)
+                .map_err(|e| anyhow::anyhow!("the supervisor listener's TLS: {e}"))?,
+        )?),
+        _ => None,
+    };
     cfg.node_arch = k.node_arch.clone();
     cfg.runtime_class_overhead = k.runtime_class_overhead.clone();
     if let Some((host, port)) = &k.egress_proxy {
@@ -361,10 +373,16 @@ pub fn kube_driver(
             "the runtime driver has no registry (RUUM_REGISTRY): every app image is image_not_found"
         );
     }
-    let driver = Arc::new(ruum_runtime::KubeDriver::new(
+    // The anti-rollback ledger that every server replica shares (backlog I620-9): the platform
+    // database. A process without one would keep the marks to itself, so it does not start.
+    let pool = pool.context(
+        "RUUM_RUNTIME_DRIVER=kubernetes needs the platform database (DATABASE_URL): the seal ledger of the sandbox launches is shared by every server replica (backlog I620-9)",
+    )?;
+    let driver = Arc::new(ruum_runtime::KubeDriver::with_ledger(
         cfg,
         egress,
         Arc::new(UnmeteredUsage),
+        Arc::new(crate::seal_ledger::PgSealLedger::new(pool)),
     )?);
     tracing::info!(
         namespace = %k.namespace,
@@ -372,14 +390,24 @@ pub fn kube_driver(
         "runtime driver: Kubernetes (backlog I6-1)"
     );
     // The supervisor listener of this process serves this driver (main.rs starts it).
-    let _ = SUPERVISOR.set((driver.clone(), k.supervisor_listen));
+    let _ = SUPERVISOR.set(Supervisor {
+        driver: driver.clone(),
+        listen: k.supervisor_listen,
+        tls,
+    });
     Ok(Some(driver))
 }
 
-/// The Kubernetes driver and the address of its supervisor listener (backlog S-89), set once by
-/// [`kube_driver`]; `main` serves [`crate::supervisor::router`] on it.
-pub static SUPERVISOR: std::sync::OnceLock<(Arc<ruum_runtime::KubeDriver>, std::net::SocketAddr)> =
-    std::sync::OnceLock::new();
+/// The Kubernetes driver, the address of its supervisor listener (backlog S-89) and its TLS
+/// acceptor (backlog I620-2; `None`: plain HTTP over an encrypted node network).
+pub struct Supervisor {
+    pub driver: Arc<ruum_runtime::KubeDriver>,
+    pub listen: std::net::SocketAddr,
+    pub tls: Option<tokio_rustls::TlsAcceptor>,
+}
+
+/// Set once by [`kube_driver`]; `main` serves [`crate::supervisor::router`] on it.
+pub static SUPERVISOR: std::sync::OnceLock<Supervisor> = std::sync::OnceLock::new();
 
 /// The sandbox directory over the Kubernetes driver: the gateway reaches a running pod at its
 /// address and the service port (the driver's last status of it). No spec maker yet: nothing

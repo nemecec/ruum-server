@@ -4,6 +4,7 @@
 //! ruum-supervisor install <dest>
 //! ruum-supervisor run --launch-stdin --token-file <path>
 //! ruum-supervisor run --launch-url http://<ip>:<port> --identity-file <path> --token-file <path>
+//! ruum-supervisor run --launch-url https://<ip>:<port> --server-pin sha256:<hex> --identity-file <path> --token-file <path>
 //! ruum-supervisor exec -- <app argv...>
 //! ```
 //!
@@ -60,6 +61,7 @@ fn main() {
             let mut launch_url = None;
             let mut identity = None;
             let mut token_file = None;
+            let mut server_pin = None;
             let mut it = args[1..].iter();
             while let Some(a) = it.next() {
                 if a == "--launch-stdin" {
@@ -70,6 +72,7 @@ fn main() {
                     "--launch-url" => &mut launch_url,
                     "--identity-file" => &mut identity,
                     "--token-file" => &mut token_file,
+                    "--server-pin" => &mut server_pin,
                     _ => break,
                 };
                 *slot = it.next().cloned();
@@ -79,13 +82,26 @@ fn main() {
             };
             let source = match (launch_stdin, launch_url, identity) {
                 (true, None, None) => Source::Stdin,
-                (false, Some(u), Some(i)) => match ruum_supervisor::http::parse_base(&u) {
-                    Some(base) => Source::Http {
+                (false, Some(u), Some(i)) => {
+                    let Some((base, tls)) = ruum_supervisor::http::parse_base(&u) else {
+                        fail("--launch-url must be http://<ip>:<port> or https://<ip>:<port>");
+                    };
+                    // TLS needs the pin, and a pin is never ignored (backlog I620-2).
+                    let pin = match (tls, server_pin.as_deref()) {
+                        (true, Some(p)) => match ruum_supervisor::http::parse_pin(p) {
+                            Some(pin) => Some(pin),
+                            None => fail("--server-pin must be sha256:<64 hex>"),
+                        },
+                        (false, None) => None,
+                        (true, None) => fail("an https launch URL needs --server-pin"),
+                        (false, Some(_)) => fail("--server-pin needs an https launch URL"),
+                    };
+                    Source::Http {
                         base,
                         identity: PathBuf::from(i),
-                    },
-                    None => fail("--launch-url must be http://<ip>:<port>"),
-                },
+                        pin,
+                    }
+                }
                 _ => fail("run needs --launch-stdin, or --launch-url with --identity-file"),
             };
             let mut opts = Options::new(source, PathBuf::from(token_file));

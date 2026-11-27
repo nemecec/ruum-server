@@ -112,9 +112,13 @@ runtime:
   # The sandbox supervisor's image by digest (crates/ruum-runtime/supervisor/Dockerfile; required
   # with kubernetes on). Its init container copies the binary into each sandbox.
   supervisorImage: ""
+  # The supervisor's launch channel (RUUM_KUBE_SUPERVISOR_NETWORK): tls (TLS 1.3 with the
+  # listener's key derived from the record key; each supervisor pins its certificate, backlog
+  # I620-2; staging's choice) or encrypted (plain HTTP; only with nodeNetworkEncrypted).
+  supervisorNetwork: tls
   # Node-to-node traffic is encrypted and authenticated (Talos KubeSpan or the CNI's WireGuard):
-  # required with kubernetes on, since the supervisor's launch channel is plain HTTP (decision
-  # 0006 I point 4). Set it only after the README's check passed.
+  # required only with supervisorNetwork encrypted (decision 0006 I point 4). Set it only after
+  # the README's check passed. Staging does not use it (tls).
   nodeNetworkEncrypted: false
   # The registry the nodes pull app images from (host:port, RUUM_REGISTRY). Empty: none yet, so
   # every app image is image_not_found (fails closed). Staging has no registry and no builder yet.

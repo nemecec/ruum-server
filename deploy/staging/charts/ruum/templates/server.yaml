@@ -27,13 +27,18 @@
 {{- fail "runtime.registry must be host or host:port" }}
 {{- end }}
 {{- /* The sandbox supervisor (backlog I6-20, S-89; decision 0006 I): the driver does not start
-       without its pinned image and without node-to-node encryption. */}}
+       without its pinned image, and its launch channel is TLS with a pinned certificate
+       (supervisorNetwork tls, backlog I620-2) or plain HTTP over encrypted node traffic
+       (supervisorNetwork encrypted, only with nodeNetworkEncrypted). */}}
 {{- if $kube }}
 {{- if not (regexMatch "^[a-z0-9./:-]+@sha256:[0-9a-f]{64}$" (.Values.runtime.supervisorImage | default "")) }}
 {{- fail "runtime.supervisorImage must be the sandbox supervisor's image by digest (name@sha256:...) when runtime.kubernetes is on" }}
 {{- end }}
-{{- if not .Values.runtime.nodeNetworkEncrypted }}
-{{- fail "runtime.nodeNetworkEncrypted must be true when runtime.kubernetes is on: the launch channel is plain HTTP (decision 0006 I point 4; deploy/staging/README.md)" }}
+{{- if not (has .Values.runtime.supervisorNetwork (list "tls" "encrypted")) }}
+{{- fail "runtime.supervisorNetwork must be tls or encrypted (backlog I620-2)" }}
+{{- end }}
+{{- if and (eq .Values.runtime.supervisorNetwork "encrypted") (not .Values.runtime.nodeNetworkEncrypted) }}
+{{- fail "runtime.supervisorNetwork encrypted needs runtime.nodeNetworkEncrypted true: that launch channel is plain HTTP (decision 0006 I point 4; deploy/staging/README.md)" }}
 {{- end }}
 {{- end }}
 apiVersion: apps/v1
@@ -170,7 +175,9 @@ spec:
             - { name: RUUM_KUBE_SUPERVISOR_IMAGE, value: {{ .Values.runtime.supervisorImage | quote }} }
             - { name: RUUM_KUBE_SUPERVISOR_SERVICE, value: "ruum-supervisor.ruum.svc.cluster.local:8091" }
             - { name: RUUM_KUBE_SUPERVISOR_LISTEN, value: "0.0.0.0:8091" }
-            - { name: RUUM_KUBE_SUPERVISOR_NETWORK, value: encrypted }
+            # TLS with the certificate derived from the record key, pinned by each supervisor
+            # (backlog I620-2), or plain HTTP over encrypted node traffic.
+            - { name: RUUM_KUBE_SUPERVISOR_NETWORK, value: {{ .Values.runtime.supervisorNetwork | quote }} }
             {{- end }}
           ports:
             - { name: platform, containerPort: 8491 }
