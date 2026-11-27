@@ -305,6 +305,16 @@ fn token_dir() -> &'static str {
 
 /// Where the supervisor binary is in its own image (the init container copies it from there).
 pub const SUPERVISOR_IN_IMAGE: &str = "/ruum-supervisor";
+
+/// The pin of the supervisor listener's certificate when the launch channel is TLS
+/// (`KubeConfig::supervisor_tls`, backlog I620-2), derived from the record key.
+pub(crate) fn supervisor_pin(cfg: &KubeConfig) -> Option<String> {
+    if !cfg.supervisor_tls {
+        return None;
+    }
+    let key = cfg.record_key.as_ref()?;
+    super::tls::SupervisorTls::derive(key).ok().map(|t| t.pin)
+}
 /// The name of the init container that installs the supervisor.
 pub(crate) const INIT_CONTAINER: &str = "ruum-supervisor";
 /// The projected service account token's lifetime (the kubelet renews it at 80 %).
@@ -367,16 +377,26 @@ pub(crate) fn pod_body(
     }
     let mut labels = labels(cfg, &rec.identity, id);
     labels[LABEL_RUN] = json!(rec.run.to_string());
+    let mut command = vec![
+        json!(SUPERVISOR_PATH),
+        json!("run"),
+        json!("--launch-url"),
+        json!(launch_url),
+        json!("--identity-file"),
+        json!(IDENTITY_FILE),
+        json!("--token-file"),
+        json!(TOKEN_FILE),
+    ];
+    // TLS on the launch channel (backlog I620-2): the supervisor accepts only the listener's
+    // certificate of this pin, which the read-back holds like every other argument.
+    if let Some(pin) = supervisor_pin(cfg) {
+        command.extend([json!("--server-pin"), json!(pin)]);
+    }
     let mut container = json!({
         "name": CONTAINER,
         "image": rec.image,
         "imagePullPolicy": "IfNotPresent",
-        "command": [
-            SUPERVISOR_PATH, "run",
-            "--launch-url", launch_url,
-            "--identity-file", IDENTITY_FILE,
-            "--token-file", TOKEN_FILE,
-        ],
+        "command": command,
         "env": env,
         "resources": {
             "limits": { "cpu": format!("{}m", rec.limits.cpu_millis), "memory": rec.limits.memory_bytes.to_string() },
@@ -529,7 +549,8 @@ pub fn sample_pod(cfg: &KubeConfig) -> Value {
             alias: s.alias.clone(),
         })
         .collect();
-    let launch = format!("http://192.0.2.1:{}", cfg.supervisor_port);
+    let scheme = if cfg.supervisor_tls { "https" } else { "http" };
+    let launch = format!("{scheme}://192.0.2.1:{}", cfg.supervisor_port);
     pod_body(cfg, &rec, &hosts, &launch)
 }
 

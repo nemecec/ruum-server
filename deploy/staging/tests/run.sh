@@ -301,6 +301,20 @@ expect 1 "refuses an email with a comma" bash "$dc" "$C" "$SV" "$ED" --acme zero
 expect 1 "refuses zerossl without an email" bash "$dc" "$C" "$SV" "$ED" --acme zerossl --validate-only
 grep -vE '^[[:space:]]*#' "$dc" | grep -qE -- '--set[ =]' && bad "deploy-chart.sh passes values with --set" || ok "deploy-chart.sh gives helm a values file, never --set"
 grep -q 'cosign_verify_provenance' "$dc" && ok "deploy-chart.sh verifies the provenance again (in the deploy controller)" || bad "deploy-chart.sh skips the provenance check"
+# The sandbox supervisor's image (backlog I620-1): resolved from the commit's tag, its provenance
+# and revision checked, and always written into runtime.supervisorImage (never an older one).
+grep -qF 'ghcr_tag_lookup "nemecec/ruum-supervisor" "$commit"' "$dc" && grep -qF '[[ "$ref" =~ $RUUM_SUPERVISOR_IMAGE_RE ]]' "$dc" &&
+  grep -qF 'runtime: { supervisorImage: $supervisor }' "$dc" &&
+  ok "deploy-chart.sh pins the supervisor image of the commit into runtime.supervisorImage (I620-1)" || bad "deploy-chart.sh does not pin the supervisor image (I620-1)"
+( . "$STG/ops/image-check.sh"
+  [[ "ghcr.io/nemecec/ruum-supervisor@sha256:$(printf '%064d' 7)" =~ $RUUM_SUPERVISOR_IMAGE_RE ]] &&
+    ! [[ "ghcr.io/nemecec/ruum-supervisor@sha256:$(printf '%064d' 7)" =~ $RUUM_APP_IMAGE_RE ]] &&
+    ! [[ "ghcr.io/nemecec/ruum-gateway@sha256:$(printf '%064d' 7)" =~ $RUUM_SUPERVISOR_IMAGE_RE ]] &&
+    ! [[ "ghcr.io/nemecec/ruum-supervisor:main" =~ $RUUM_SUPERVISOR_IMAGE_RE ]] ) &&
+  ok "the supervisor image pattern takes only ghcr.io/nemecec/ruum-supervisor by digest" || bad "the supervisor image pattern is too wide or too narrow"
+grep -qF '{ image: ruum-supervisor, file: crates/ruum-runtime/supervisor/Dockerfile }' "$STG/../../.github/workflows/images.yml" &&
+  [[ "$(grep -cF '{ image: ruum-supervisor, file: crates/ruum-runtime/supervisor/Dockerfile }' "$STG/../../.github/workflows/images.yml")" == 2 ]] &&
+  ok "images.yml builds and publishes the supervisor image (I620-1)" || bad "images.yml does not build and publish ruum-supervisor (I620-1)"
 expect 1 "deploy-chart.sh runs only in the deploy controller (backlog O-34)" env -u RUUM_DEPLOY_IN_CLUSTER -u KUBERNETES_SERVICE_HOST bash "$dc" "$C" "$SV" "$ED" --expect-deployed none
 grep -qF 'runs in the deploy controller' "$TMP/out" && ok "deploy-chart.sh says where it runs" || bad "deploy-chart.sh outside the controller: $(cat "$TMP/out")"
 
@@ -1143,20 +1157,25 @@ YAML
   sa_is_default "$TMP/srv-default.yaml" && sa_is_default "$TMP/srv-noapps.yaml" &&
     ok "with the driver off the server runs as the ServiceAccount default, with or without the app runtime (S-93)" || bad "with the driver off the server does not name the ServiceAccount default (S-93)"
   # The Kubernetes runtime driver (I6-1) when turned on: with the app runtime only, its account and
-  # token, and the sandbox supervisor (I6-20, S-89): its pinned image and encrypted node traffic.
-  KD=(--set runtime.kubernetes=true --set "runtime.supervisorImage=ghcr.io/nemecec/ruum-supervisor@sha256:$(printf '%064d' 5)" --set runtime.nodeNetworkEncrypted=true)
-  expect 1 "charts/ruum refuses the driver without the supervisor's image (S-89)" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.kubernetes=true --set runtime.nodeNetworkEncrypted=true
+  # token, and the sandbox supervisor (I6-20, S-89): its pinned image and its launch channel (TLS
+  # with a pinned certificate by default, backlog I620-2; plain HTTP only over encrypted node
+  # traffic).
+  KD=(--set runtime.kubernetes=true --set "runtime.supervisorImage=ghcr.io/nemecec/ruum-supervisor@sha256:$(printf '%064d' 5)")
+  expect 1 "charts/ruum refuses the driver without the supervisor's image (S-89)" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.kubernetes=true
   expect 1 "charts/ruum refuses a supervisor image by tag" helm template ruum "$STG/charts/ruum" "${A[@]}" "${KD[@]}" --set runtime.supervisorImage=ghcr.io/nemecec/ruum-supervisor:latest
-  expect 1 "charts/ruum refuses the driver without encrypted node traffic (decision 0006 I point 4)" helm template ruum "$STG/charts/ruum" "${A[@]}" "${KD[@]}" --set runtime.nodeNetworkEncrypted=false
+  expect 1 "charts/ruum refuses plain HTTP on the launch channel without encrypted node traffic (decision 0006 I point 4)" helm template ruum "$STG/charts/ruum" "${A[@]}" "${KD[@]}" --set runtime.supervisorNetwork=encrypted
+  expect 1 "charts/ruum refuses an unknown launch channel setting (I620-2)" helm template ruum "$STG/charts/ruum" "${A[@]}" "${KD[@]}" --set runtime.supervisorNetwork=plain
+  expect 0 "render charts/ruum with plain HTTP over encrypted node traffic" helm template ruum "$STG/charts/ruum" "${A[@]}" "${KD[@]}" --set runtime.supervisorNetwork=encrypted --set runtime.nodeNetworkEncrypted=true
+  grep -qF '{ name: RUUM_KUBE_SUPERVISOR_NETWORK, value: "encrypted" }' "$TMP/out" && ok "supervisorNetwork encrypted reaches the server" || bad "supervisorNetwork encrypted is not RUUM_KUBE_SUPERVISOR_NETWORK"
   expect 0 "render charts/ruum with the app runtime and the driver on" helm template ruum "$STG/charts/ruum" "${A[@]}" "${KD[@]}"
   doc_of "$TMP/out" Service ruum-supervisor | grep -qF 'port: 8091' && ok "the supervisor listener has its Service (8091)" || bad "no Service ruum-supervisor"
   doc_of "$TMP/out" Deployment ruum-server >"$TMP/srv-apps.yaml"
   grep -qF 'serviceAccountName: ruum-server' "$TMP/srv-apps.yaml" && grep -qF '{ name: RUUM_RUNTIME_DRIVER, value: kubernetes }' "$TMP/srv-apps.yaml" &&
     grep -qF 'serviceAccountToken: { path: token, expirationSeconds: 3600 }' "$TMP/srv-apps.yaml" && grep -qF 'automountServiceAccountToken: false' "$TMP/srv-apps.yaml" &&
     ok "with the app runtime the server runs the Kubernetes driver with a projected token only" || bad "the server has no Kubernetes driver, or its token is not the projected one"
-  grep -qF '{ name: RUUM_KUBE_SUPERVISOR_NETWORK, value: encrypted }' "$TMP/srv-apps.yaml" && grep -qF '{ name: RUUM_KUBE_SUPERVISOR_LISTEN, value: "0.0.0.0:8091" }' "$TMP/srv-apps.yaml" &&
+  grep -qF '{ name: RUUM_KUBE_SUPERVISOR_NETWORK, value: "tls" }' "$TMP/srv-apps.yaml" && grep -qF '{ name: RUUM_KUBE_SUPERVISOR_LISTEN, value: "0.0.0.0:8091" }' "$TMP/srv-apps.yaml" &&
     grep -qF 'secretName: ruum-runtime-record-key' "$TMP/srv-apps.yaml" && grep -qF '{ name: RUUM_KUBE_RECORD_KEY_FILE, value: /var/run/secrets/ruum-runtime/record-key }' "$TMP/srv-apps.yaml" &&
-    ok "the driver gets the record key, the supervisor listener and the encrypted-network setting (S-89)" || bad "the driver lacks the supervisor settings"
+    ok "the driver gets the record key, the supervisor listener and TLS on the launch channel by default (S-89, I620-2)" || bad "the driver lacks the supervisor settings"
   # The runtime class's overhead the driver checks pods against is the manifest's (review of
   # I6-20, required change 1): a drift would fail every sandbox start.
   rc_cpu="$(awk '/podFixed:/ { f = 1; next } f && /cpu:/ { print $2; exit }' "$STG/k8s/manifests/runtimeclass.yaml")"
@@ -2483,6 +2502,16 @@ grl="$(grep -nF 'sql/ruum-gateway-grants.sql" >/dev/null' "$ap" | cut -d: -f1)" 
 [[ -n "$grl" && -n "$gsl" && "$grl" -lt "$gsl" ]] && ok "apply.sh grants ruum_gateway its one right before the gateway gets its DSN" || bad "apply.sh writes the gateway's DSN before its grants"
 grep -B2 -E '\| secret ruum ruum-gateway$' "$ap" | grep -qF 'postgres://ruum_gateway:%s@' && ok "ruum/ruum-gateway holds ruum_gateway's DSN (never ruum_app's or the owner's)" || bad "ruum/ruum-gateway does not hold ruum_gateway's DSN"
 grep -qF 'for role in ruum ruum_app ruum_gateway zitadel spicedb; do' "$ap" && ok "apply.sh makes the password Secret of ruum_gateway" || bad "no password Secret for ruum_gateway"
+# Backlog I6-19 and I620-3: the kubelet's PID limit on every node, and the supervisor's
+# protections under gVisor in a pod of the driver's shape (admitted by a dry run first); without
+# the supervisor image the step fails (no pass on silence).
+gc="$STG/ops/gvisor-check.sh"
+grep -qF "jq -r '.kubeletconfig.podPidsLimit // empty'" "$gc" && grep -qF 'sup_pod | kubectl create --dry-run=server' "$gc" &&
+  grep -qF 'the supervisor protections under gVisor were not checked' "$gc" && grep -qF 'canary-out-<hidden secret>' "$gc" &&
+  grep -qF 'echo "raw-$S" > /proc/1/fd/1' "$gc" && grep -qF "kill -STOP 1" "$gc" && grep -qF "signals-ignored" "$gc" &&
+  grep -qF 'echo "raw-$S" > /proc/1/fd/1' "$STG/../../crates/ruum-runtime/tests/supervisor_sandbox.rs" &&
+  ok "gvisor-check.sh checks the kubelet's PID limit and the supervisor's protections under gVisor, as the build server's runsc test does (I6-19, I620-3)" ||
+  bad "gvisor-check.sh lacks the kubelet PID limit or the supervisor checks (I6-19, I620-3)"
 bash -n "$STG/ops/gvisor-check.sh" && grep -qF 'the check proves nothing on this node' "$STG/ops/gvisor-check.sh" &&
   ok "gvisor-check.sh needs a control pod that sees the node's kernel (no pass on silence)" || bad "gvisor-check.sh"
 sa="$STG/ops/smoke-apps.sh"

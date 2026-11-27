@@ -15,6 +15,7 @@
 mod app;
 mod config;
 mod migrate;
+mod seal_ledger;
 mod seed;
 mod shutdown;
 mod supervisor;
@@ -219,17 +220,19 @@ async fn main() -> anyhow::Result<()> {
     };
     // The supervisor listener of the Kubernetes driver (backlog S-89), with the driver.
     let supervisor = match wiring::SUPERVISOR.get() {
-        Some((driver, bind)) => {
+        Some(sup) => {
+            let bind = sup.listen;
             let listener = tokio::net::TcpListener::bind(bind)
                 .await
                 .with_context(|| format!("bind {bind} (RUUM_KUBE_SUPERVISOR_LISTEN)"))?;
-            tracing::info!(addr = %bind, "supervisor listener (sandboxes only) listening");
+            tracing::info!(addr = %bind, tls = sup.tls.is_some(), "supervisor listener (sandboxes only) listening");
             // Its own connection caps: the callers run untrusted code (Kimi re-check of I6-20
-            // in run 16, defect 4).
+            // in run 16, defect 4). TLS with the pinned key (backlog I620-2) when set.
             Some(supervisor::serve(
                 listener,
-                supervisor::router(driver.clone()),
+                supervisor::router(sup.driver.clone()),
                 supervisor::Caps::default(),
+                sup.tls.clone(),
                 stop.clone().stopped(),
             ))
         }

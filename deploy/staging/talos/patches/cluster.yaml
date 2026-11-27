@@ -1,7 +1,8 @@
 # Machine config patch for every staging node (all control plane and worker).
 # Talos v1.14 config: each setting lives in its own document. The v1alpha1 document keeps only
 # the fields that have no document of their own (etcd here). A setting in both places is an
-# error ("... is already set in v1alpha1 config"), so never add machine.kubelet,
+# error ("... is already set in v1alpha1 config"), so never add machine.kubelet (the kubelet's
+# settings are the KubeletConfig document below),
 # machine.install, machine.network, machine.features.kubePrism, cluster.apiServer,
 # cluster.network or cluster.discovery here. tests/run.sh renders the config and runs
 # `talosctl validate --mode cloud` on it.
@@ -10,6 +11,19 @@ cluster:
     advertisedSubnets:
       # etcd, kubelet and Flannel use the private network (plan 3.3).
       - 10.20.1.0/24
+---
+# The kubelet's PID limit of every pod (backlog I6-19): a pod's cgroup holds at most this many
+# host processes and threads. Under gVisor the app's own processes live in the sandbox's kernel
+# (the supervisor's RLIMIT_NPROC bounds them, 512 by default); this bounds the host side of a
+# sandbox (the Sentry's and the gofer's threads), so a hostile app cannot use up the node's PIDs.
+# 4096 leaves room for the largest system pods (the Postgres pods of the data cluster: one
+# process per connection) and for gVisor's threads. The orchestrator applies it through the
+# admin tunnel (up.sh: talos_machine_configuration_apply in place on each node); it is checked by
+# tests/talos-validate.sh and live by ops/gvisor-check.sh (each kubelet's configz).
+apiVersion: v1alpha1
+kind: KubeletConfig
+config:
+  podPidsLimit: 4096
 ---
 apiVersion: v1alpha1
 kind: KubeNodeConfig

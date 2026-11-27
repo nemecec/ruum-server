@@ -5,9 +5,11 @@
 #
 # Build from the repository root:
 #   docker build -f crates/ruum-runtime/supervisor/Dockerfile -t ruum-supervisor .
-# On Alpine the Rust target is musl and links statically. The binary needs std, nix and serde only.
-# Publishing it (a pinned digest for runtime.supervisorImage) is a card of its own for
-# .github/workflows/images.yml (decision 0008-3).
+# On Alpine the Rust target is musl and links statically. The binary needs std, nix, serde and
+# rustls with aws-lc-rs (TLS to the launch listener, backlog I620-2; aws-lc's C builds with the
+# image's compiler). .github/workflows/images.yml publishes it as ghcr.io/nemecec/ruum-supervisor
+# (linux/amd64, provenance, backlog I620-1); ops/deploy-chart.sh pins the digest of the deployed
+# commit into runtime.supervisorImage.
 FROM rust:1.99-alpine@sha256:44819b27be4c97b0e4d7203bd2e02c4820f97700211b6a37fb4c246a2de59383 AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./

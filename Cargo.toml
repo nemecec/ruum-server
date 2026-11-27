@@ -102,6 +102,14 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 wasmtime = "50"
 
 # Auth and crypto
+# TLS of the supervisor listener (backlog I620-2), both ends with the aws-lc-rs provider that the
+# tree's rustls already has (through reqwest and sqlx): no second provider, so no crate that asks
+# rustls for its default provider finds two. Already in the tree.
+rustls = { version = "0.23.46", default-features = false, features = ["std"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs"] }
+# The supervisor listener's Ed25519 key and self-signed certificate (backlog I620-2). Already in
+# the tree through rustls, jsonwebtoken and object_store.
+aws-lc-rs = "1.19.0"
 jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
 sha2 = "0.11.1"
 argon2 = "0.6.0"

@@ -53,6 +53,17 @@ impl RecordKey {
     pub fn id(&self) -> String {
         hex::encode(&Sha256::digest(self.0)[..8])
     }
+
+    /// A key of its own for another use, derived from this one: SHA-256 of `label`, a zero byte
+    /// and the key (the supervisor listener's TLS key, backlog I620-2). The label separates the
+    /// uses; the record key itself never leaves the seal code.
+    pub(crate) fn derive(&self, label: &str) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(label.as_bytes());
+        h.update([0u8]);
+        h.update(self.0);
+        h.finalize().into()
+    }
 }
 
 /// The sealed values of an instance. No `Debug` that shows a value.

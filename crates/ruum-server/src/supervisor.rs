@@ -6,6 +6,11 @@
 //! makes every check (`ruum_runtime::KubeDriver::supervisor_launch`); this module only maps its
 //! answer: `200` with the JSON, or `403`, `503`, `429` without a detail.
 //!
+//! With `RUUM_KUBE_SUPERVISOR_NETWORK=tls` (backlog I620-2) the listener speaks TLS 1.3 with the
+//! key every replica derives from the record key ([`tls_acceptor`],
+//! `ruum_runtime::kube::tls`); the supervisor pins its certificate. The TLS handshake counts to
+//! the header time.
+//!
 //! The sandboxes that reach this port run untrusted code, so the connections have their own
 //! caps ([`serve`]; Kimi re-check of I6-20 in run 16, defect 4): at most [`MAX_CONNECTIONS`] at
 //! once and [`MAX_PEER_CONNECTIONS`] per peer address, the request headers within
@@ -119,6 +124,7 @@ pub async fn serve(
     listener: tokio::net::TcpListener,
     app: Router,
     caps: Caps,
+    tls: Option<tokio_rustls::TlsAcceptor>,
     stop: impl Future<Output = ()>,
 ) -> std::io::Result<()> {
     use tower::ServiceExt as _;
@@ -148,6 +154,7 @@ pub async fn serve(
             continue;
         };
         let app = app.clone();
+        let tls = tls.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let _slot = slot;
@@ -163,8 +170,24 @@ pub async fn serve(
             b.timer(TokioTimer::new())
                 .header_read_timeout(caps.header_timeout)
                 .keep_alive(false);
-            let conn = b.serve_connection(TokioIo::new(stream), service);
-            let _ = tokio::time::timeout(caps.lifetime, conn).await;
+            let started = tokio::time::Instant::now();
+            match tls {
+                None => {
+                    let conn = b.serve_connection(TokioIo::new(stream), service);
+                    let _ = tokio::time::timeout(caps.lifetime, conn).await;
+                }
+                Some(acceptor) => {
+                    // The handshake within the header time; the lifetime counts from the accept.
+                    let Ok(Ok(stream)) =
+                        tokio::time::timeout(caps.header_timeout, acceptor.accept(stream)).await
+                    else {
+                        return;
+                    };
+                    let conn = b.serve_connection(TokioIo::new(stream), service);
+                    let left = caps.lifetime.saturating_sub(started.elapsed());
+                    let _ = tokio::time::timeout(left, conn).await;
+                }
+            }
         });
     }
     drop(listener);
@@ -172,6 +195,24 @@ pub async fn serve(
     let n = u32::try_from(caps.connections).unwrap_or(u32::MAX);
     let _ = all.acquire_many(n).await;
     Ok(())
+}
+
+/// The TLS 1.3 acceptor of the listener's identity (backlog I620-2): the certificate and key
+/// derived from the record key, the aws-lc-rs provider, no client certificate.
+pub fn tls_acceptor(
+    t: &ruum_runtime::kube::tls::SupervisorTls,
+) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
+    use tokio_rustls::rustls;
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let cert = rustls::pki_types::CertificateDer::from(t.cert_der.clone());
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(t.key_pkcs8.clone().into());
+    let cfg = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| anyhow::anyhow!("the supervisor listener's TLS versions: {e}"))?
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .map_err(|e| anyhow::anyhow!("the supervisor listener's TLS key: {e}"))?;
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(cfg)))
 }
 
 pub fn router(driver: Arc<KubeDriver>) -> Router {
@@ -241,7 +282,7 @@ mod tests {
         );
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
-        tokio::spawn(serve(l, app, caps, std::future::pending()));
+        tokio::spawn(serve(l, app, caps, None, std::future::pending()));
         addr
     }
 
@@ -374,7 +415,7 @@ mod tests {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-        let server = tokio::spawn(serve(l, app, Caps::default(), async move {
+        let server = tokio::spawn(serve(l, app, Caps::default(), None, async move {
             let _ = stop_rx.await;
         }));
         let client = tokio::spawn(post_token(addr));
@@ -419,6 +460,66 @@ mod tests {
         assert!(
             closed_within(&mut s, Duration::from_secs(5)).await,
             "a connection stays open past its lifetime"
+        );
+    }
+
+    /// Backlog I620-2: the listener speaks TLS with the certificate derived from the record
+    /// key; the supervisor's client takes the answer with that pin, refuses another pin, and a
+    /// plain HTTP request gets no answer.
+    #[tokio::test]
+    async fn the_supervisor_reaches_the_tls_listener_with_its_pin_only() {
+        let key = ruum_runtime::kube::RecordKey::new([9u8; 32]);
+        let t = ruum_runtime::kube::tls::SupervisorTls::derive(&key).unwrap();
+        let app = Router::new().route(
+            "/v1/token",
+            post(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.ip().to_string() }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let caps = Caps {
+            header_timeout: Duration::from_secs(2),
+            ..Caps::default()
+        };
+        tokio::spawn(serve(
+            l,
+            app,
+            caps,
+            Some(tls_acceptor(&t).unwrap()),
+            std::future::pending(),
+        ));
+        let pin = ruum_supervisor::http::parse_pin(&t.pin).unwrap();
+        let ask = move |pin: Option<[u8; 32]>| {
+            tokio::task::spawn_blocking(move || {
+                ruum_supervisor::http::post(
+                    addr,
+                    pin,
+                    "/v1/token",
+                    "tok",
+                    1024,
+                    Duration::from_secs(5),
+                )
+            })
+        };
+        let body = ask(Some(pin)).await.unwrap().expect("the pinned answer");
+        assert_eq!(body, b"127.0.0.1");
+        let other = ruum_runtime::kube::tls::SupervisorTls::derive(
+            &ruum_runtime::kube::RecordKey::new([10u8; 32]),
+        )
+        .unwrap();
+        let other_pin = ruum_supervisor::http::parse_pin(&other.pin).unwrap();
+        assert!(
+            ask(Some(other_pin)).await.unwrap().is_err(),
+            "another pin was accepted"
+        );
+        assert!(
+            ask(None).await.unwrap().is_err(),
+            "a plain HTTP request was answered"
+        );
+        // A connection that starts no handshake is closed after the header time.
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        assert!(
+            closed_within(&mut s, Duration::from_secs(5)).await,
+            "a connection without a handshake stays open"
         );
     }
 }

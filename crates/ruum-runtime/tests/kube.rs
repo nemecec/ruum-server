@@ -226,6 +226,27 @@ impl World {
         d
     }
 
+    /// A driver of `cfg` with `ledger` (another server process; with one ledger for all, the
+    /// platform database's), whose own sweep never runs.
+    fn driver_with(
+        &self,
+        mut cfg: KubeConfig,
+        ledger: Arc<dyn ruum_runtime::kube::ledger::SealLedger>,
+    ) -> Arc<KubeDriver> {
+        cfg.sweep_every = Duration::from_secs(3600);
+        let d = Arc::new(
+            KubeDriver::with_ledger(
+                cfg,
+                self.egress.clone(),
+                Arc::new(MemoryUsage::new()),
+                ledger,
+            )
+            .unwrap(),
+        );
+        *self.listener.lock().unwrap() = Some(d.clone());
+        d
+    }
+
     /// A driver whose own sweep never runs (the test calls `sweep`).
     fn quiet_driver(&self) -> Arc<KubeDriver> {
         let mut cfg = self.cfg.clone();
@@ -1875,15 +1896,245 @@ async fn the_launch_is_refused_long_after_the_start() {
     );
 }
 
+/// Backlog I620-9: a writer of ConfigMaps saves the seal of a pod's run before its launch and
+/// puts it back after the launch. Another server process (or a restarted one) that shares the
+/// platform database's ledger refuses the pod a second launch, within the launch window too: the
+/// ledger keeps the generation mark and the launch. A process with a ledger of its own (the
+/// residual before I620-9) would launch it again, which the control case shows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_put_back_seal_gets_no_second_launch_on_another_replica() {
+    let w = world(false).await;
+    let shared: Arc<dyn ruum_runtime::kube::ledger::SealLedger> =
+        Arc::new(ruum_runtime::kube::ledger::MemoryLedger::new());
+    let a = w.driver_with(w.cfg.clone(), shared.clone());
+    w.fake.skip_launch_once.store(true, Ordering::SeqCst);
+    let s = a.start(w.service(identity(), None)).await.unwrap();
+    let pod_n = ruum_runtime::kube::pod_name(s.id, 1);
+    wait_pod_ip(&w, &pod_n).await;
+    let (tok, ip) = w.pod_token(&pod_n);
+    // The seal of the run with its pod, before the launch (generation N, no launched pod).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let before = loop {
+        let r = w.record(s.id);
+        let sealed = r["data"]["record"]
+            .as_str()
+            .is_some_and(|t| t.contains("\"sealed\":\"v1."));
+        if sealed {
+            break r;
+        }
+        assert!(Instant::now() < deadline, "the run was not sealed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(launch_when_ready(&a, &tok, ip).await.is_ok(), "the launch");
+    w.put_record_data(s.id, before["data"].clone()).await;
+    let b = w.driver_with(w.cfg.clone(), shared.clone());
+    assert_eq!(
+        b.supervisor_launch(&tok, ip).await.unwrap_err(),
+        LaunchRefusal::Forbidden,
+        "another replica launched the pod again from a seal put back"
+    );
+    assert_eq!(
+        a.supervisor_launch(&tok, ip).await.unwrap_err(),
+        LaunchRefusal::Forbidden,
+        "the same replica launched the pod again"
+    );
+    // The control: a process whose ledger is its own sees nothing of the first launch.
+    let own = w.driver_with(
+        w.cfg.clone(),
+        Arc::new(ruum_runtime::kube::ledger::MemoryLedger::new()),
+    );
+    assert!(
+        own.supervisor_launch(&tok, ip).await.is_ok(),
+        "the control: without the shared ledger the put-back seal opens a second launch"
+    );
+}
+
+/// The claims of a projected token for `pod`, unsigned unless the fake issued it.
+fn claims_of(w: &World, pod: &str) -> kube_fake::Issued {
+    let p = w.fake.pod(NS, pod).expect("the pod");
+    kube_fake::Issued {
+        audience: "ruum-supervisor".into(),
+        namespace: NS.into(),
+        service_account: "ruum-sandbox".into(),
+        pod: pod.into(),
+        pod_uid: p["metadata"]["uid"].as_str().unwrap().into(),
+        exp: time::OffsetDateTime::now_utc().unix_timestamp() + 600,
+    }
+}
+
+/// Backlog I620-12: a bearer that does not read as a projected token of a sandbox pod at the
+/// peer's address costs the API server no `TokenReview`; one that does (a sandbox can write its
+/// own pod's claims) is bounded per peer address (429) and for all peers together (503).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forged_tokens_cost_no_review_and_reviews_are_bounded() {
+    let w = world(false).await;
+    let mut cfg = w.cfg.clone();
+    cfg.peer_reviews_per_minute = 3;
+    let d = w.driver_with(
+        cfg,
+        Arc::new(ruum_runtime::kube::ledger::MemoryLedger::new()),
+    );
+    let s = d.start(w.service(identity(), None)).await.unwrap();
+    let pod_n = ruum_runtime::kube::pod_name(s.id, 1);
+    assert_eq!(wait_launched(&w, &pod_n).await, 200);
+    let ip: std::net::IpAddr = w.fake.pod(NS, &pod_n).unwrap()["status"]["podIP"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let base = w.fake.token_reviews();
+    let good = claims_of(&w, &pod_n);
+    let elsewhere: std::net::IpAddr = "10.9.9.9".parse().unwrap();
+    let mut other_ns = good.clone();
+    other_ns.namespace = "ruum".into();
+    let mut other_aud = good.clone();
+    other_aud.audience = "kubernetes".into();
+    let mut no_pod = good.clone();
+    no_pod.pod = format!("{pod_n}9");
+    let mut other_uid = good.clone();
+    other_uid.pod_uid = "another-uid".into();
+    let mut expired = good.clone();
+    expired.exp = 1;
+    for (what, bearer, peer) in [
+        ("not a JWT", "not-a-token".to_owned(), ip),
+        (
+            "another namespace",
+            kube_fake::unsigned_token(&other_ns),
+            ip,
+        ),
+        (
+            "another audience",
+            kube_fake::unsigned_token(&other_aud),
+            ip,
+        ),
+        ("an expired token", kube_fake::unsigned_token(&expired), ip),
+        (
+            "a pod that does not exist",
+            kube_fake::unsigned_token(&no_pod),
+            ip,
+        ),
+        ("another uid", kube_fake::unsigned_token(&other_uid), ip),
+        (
+            "another address",
+            kube_fake::unsigned_token(&good),
+            elsewhere,
+        ),
+    ] {
+        assert_eq!(
+            d.supervisor_token(&bearer, peer).await.unwrap_err(),
+            LaunchRefusal::Forbidden,
+            "{what}"
+        );
+        assert_eq!(w.fake.token_reviews(), base, "{what} cost a TokenReview");
+    }
+    // Claims that name the pod at its address: reviewed (and refused), at most the peer's
+    // bound in a minute, then 429 without a review.
+    let mut answers = Vec::new();
+    for _ in 0..6 {
+        answers.push(
+            d.supervisor_token(&kube_fake::unsigned_token(&good), ip)
+                .await
+                .unwrap_err(),
+        );
+    }
+    assert!(
+        answers.contains(&LaunchRefusal::TooMany),
+        "no bound per peer: {answers:?}"
+    );
+    assert!(
+        w.fake.token_reviews() - base <= 3,
+        "{} reviews for one peer in a minute",
+        w.fake.token_reviews() - base
+    );
+    // The bound of all peers together: a burst of two, one more per second.
+    let mut cfg = w.cfg.clone();
+    cfg.review_burst = 2;
+    cfg.review_rate_per_sec = 1;
+    let g = w.driver_with(
+        cfg,
+        Arc::new(ruum_runtime::kube::ledger::MemoryLedger::new()),
+    );
+    let before = w.fake.token_reviews();
+    let mut answers = Vec::new();
+    for _ in 0..5 {
+        answers.push(
+            g.supervisor_token(&kube_fake::unsigned_token(&good), ip)
+                .await
+                .unwrap_err(),
+        );
+    }
+    assert!(
+        answers.contains(&LaunchRefusal::NotReady),
+        "no bound for all peers: {answers:?}"
+    );
+    assert!(
+        w.fake.token_reviews() - before <= 3,
+        "{} reviews past the bound of all peers",
+        w.fake.token_reviews() - before
+    );
+}
+
+/// Backlog I620-2: with TLS on the launch channel the pod's command names the `https` listener
+/// and the pin of the certificate derived from the record key; without TLS and without an
+/// encrypted node network the driver does not start.
+#[test]
+fn the_launch_channel_is_tls_with_the_pin_or_refused() {
+    let cfg = staging_config();
+    let pod = ruum_runtime::kube::sample_pod(&cfg);
+    let cmd: Vec<String> =
+        serde_json::from_value(pod["spec"]["containers"][0]["command"].clone()).unwrap();
+    let at = |flag: &str| {
+        cmd.iter()
+            .position(|a| a == flag)
+            .and_then(|i| cmd.get(i + 1))
+            .cloned()
+            .unwrap_or_default()
+    };
+    assert!(at("--launch-url").starts_with("https://"), "{cmd:?}");
+    let pin = ruum_runtime::kube::tls::SupervisorTls::derive(cfg.record_key.as_ref().unwrap())
+        .unwrap()
+        .pin;
+    assert_eq!(at("--server-pin"), pin);
+    let mut plain = cfg.clone();
+    plain.supervisor_tls = false;
+    let cmd = ruum_runtime::kube::sample_pod(&plain).to_string();
+    assert!(
+        !cmd.contains("--server-pin") && !cmd.contains("https://"),
+        "{cmd}"
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let none: Arc<dyn ruum_runtime::EgressRegistry> = Arc::new(ruum_runtime::NoEgress);
+        let mut c = cfg.clone();
+        c.supervisor_image = format!("r/ruum-supervisor@sha256:{}", "1".repeat(64));
+        c.supervisor_address = "127.0.0.1".into();
+        assert!(KubeDriver::new(c.clone(), none.clone(), Arc::new(MemoryUsage::new())).is_ok());
+        c.supervisor_tls = false;
+        assert!(
+            KubeDriver::new(c.clone(), none.clone(), Arc::new(MemoryUsage::new())).is_err(),
+            "neither TLS nor an encrypted node network"
+        );
+        c.network_encrypted = true;
+        assert!(KubeDriver::new(c, none, Arc::new(MemoryUsage::new())).is_ok());
+    });
+}
+
 /// The driver's settings on staging (`charts/ruum` `templates/server.yaml` and
 /// `crates/ruum-server` `wiring.rs`): the namespace, the runtime class and its overhead, the
-/// egress proxy, the supervisor listener. The image digest is a placeholder (a dry run pulls
+/// egress proxy, the supervisor listener with TLS. The image digest is a placeholder (a dry run pulls
 /// nothing).
 fn staging_config() -> KubeConfig {
     let mut c = KubeConfig::new("https://kubernetes.default.svc", "ruum-apps", "gvisor");
     c.runtime_class_overhead = kube_fake::staging_runtime_class_overhead();
     c.supervisor_image = format!("ghcr.io/nemecec/ruum-supervisor@sha256:{}", "0".repeat(64));
     c.supervisor_address = "ruum-supervisor.ruum.svc.cluster.local".into();
+    // TLS on the launch channel (backlog I620-2), as staging runs it; the pin in the sample comes
+    // from this fixed sample key (staging's pin comes from its own record key).
+    c.supervisor_tls = true;
+    c.record_key = Some(RecordKey::new([0x5a; 32]));
     c.routes = BTreeMap::from([(
         Route::EgressProxy,
         SharedService {

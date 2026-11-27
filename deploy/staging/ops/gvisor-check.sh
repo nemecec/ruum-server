@@ -2,6 +2,7 @@
 # The gVisor check of staging (card I-6). In the tools container with the admin kubeconfig:
 #
 #   deploy/staging/tool.sh bash deploy/staging/ops/gvisor-check.sh [--class-only]
+#   deploy/staging/tool.sh bash deploy/staging/ops/gvisor-check.sh --supervisor-image ghcr.io/nemecec/ruum-supervisor@sha256:<digest>
 #
 # 1. The handler: every node runs the Talos extension gvisor (talosctl get extensions, through the
 #    admin tunnel), so containerd knows the handler runsc.
@@ -32,14 +33,39 @@
 #    read-back (the test the_api_servers_answer_to_the_sample_pod_passes_the_read_back). A new
 #    answer (another Kubernetes release, another admission plugin) fails until it is committed
 #    and CI passes with it. The driver is not turned on before this step passes.
-# Not read-only in step 2: it creates two short pods per node (ruum-apps and ops) and deletes
-# them. Steps 3, 4 and 5 create nothing (dry runs).
+# 6. The kubelet's PID limit of every pod (backlog I6-19): each node's kubelet configuration
+#    (configz, through the API server's node proxy) has podPidsLimit 4096
+#    (talos/patches/cluster.yaml).
+# 7. The sandbox supervisor under gVisor (backlog I620-3; docs/STEP3.md "The sandbox supervisor"
+#    2): a pod in the driver's shape (k8s/sandbox-sample-pod.json: the init container copies the
+#    supervisor of --supervisor-image, the app container runs it as PID 1) whose app is a shell
+#    script that tries each way around it. First a server-side dry run (the admission rules
+#    admit it), then the pod itself: the launch data (a test value, RLIMIT_NPROC 64) goes to the
+#    supervisor's standard input (kubectl attach), and the pod's log (the kubelet's CRI file)
+#    must show the value only as "<hidden secret>", the app could not open /proc/1/fd/1,
+#    /proc/1/mem or /proc/1/environ, and the app started fewer than 64 processes and threads.
+#    Last the app sends PID 1 SIGSTOP and SIGKILL: on Linux PID 1 ignores both; gVisor delivers
+#    them (backlog I620-15), and then the whole sandbox must end (137) with nothing written after
+#    the SIGSTOP in the log. The same script runs on the build server under
+#    runsc (crates/ruum-runtime tests/supervisor_sandbox.rs with RUUM_RUNTIME_DRIVER=runsc).
+#    Without --supervisor-image (or RUUM_SUPERVISOR_IMAGE) this step FAILS: never a pass on
+#    silence. The digest is the one images.yml published for the deployed commit.
+# Not read-only in steps 2 and 7: they create short pods (two per node in ruum-apps and ops, and
+# one in ruum-apps) and delete them. Steps 3, 4, 5 and 6 create nothing (dry runs and reads).
 # Exit 1 on any failure.
 set -uo pipefail
 WORK="${RUUM_STAGING_WORK:-$HOME/.config/ruum/staging}"
 export TALOSCONFIG="${TALOSCONFIG:-$WORK/talosconfig}"
 IMG=busybox:1.37.0
 NS=ruum-apps
+# The app image of step 7: sh and Node.js (the thread check), the fixture base of the Docker tests
+# (crates/ruum-runtime testdata/fixture), pinned by digest.
+NODE_IMG=node:22-alpine@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a
+SUPERVISOR_IMAGE="${RUUM_SUPERVISOR_IMAGE:-}"
+if [[ "${1:-}" == --supervisor-image ]]; then
+  SUPERVISOR_IMAGE="${2:-}"
+  set -- "${@:3}"
+fi
 # The control pod without gVisor: not in ruum-apps, whose admission rule refuses it (S-83).
 CONTROL_NS=ops
 fail=0
@@ -221,6 +247,114 @@ if answer="$(kubectl -n "$NS" create --dry-run=server -o json -f "$SAMPLE" 2>&1)
   fi
 else
   bad "the sample pod did not pass the dry run: ${answer:-no answer}"
+fi
+
+# 6. The kubelet's PID limit of every pod (backlog I6-19).
+while IFS='=' read -r name _ _; do
+  [[ -n "$name" ]] || continue
+  limit="$(kubectl get --raw "/api/v1/nodes/$name/proxy/configz" 2>/dev/null | jq -r '.kubeletconfig.podPidsLimit // empty' 2>/dev/null)"
+  if [[ "$limit" == 4096 ]]; then
+    pass "$name: the kubelet limits every pod to 4096 PIDs (I6-19)"
+  else
+    bad "$name: the kubelet's podPidsLimit is '${limit:-unset}', not 4096 (talos/patches/cluster.yaml, applied through the admin tunnel)"
+  fi
+done <<<"$nodes"
+
+# 7. The sandbox supervisor under gVisor (backlog I620-3).
+SUP_POD=gvisor-check-supervisor
+SUP_PIDS=64
+# The app's script (the same checks as crates/ruum-runtime tests/supervisor_sandbox.rs).
+read -r -d '' SUP_SCRIPT <<'SH' || true
+echo "canary-out-$S"
+echo "canary-err-$S" >&2
+echo "raw-$S" > /proc/1/fd/1 2>/dev/null && echo fd1-open || echo fd1-refused
+dd if=/proc/1/mem of=/dev/null bs=1 count=1 2>/dev/null && echo mem-read || echo mem-refused
+cat /proc/1/environ >/dev/null 2>&1 && echo environ-read || echo environ-refused
+node -e '
+const { Worker } = require("worker_threads");
+for (let i = 0; i < 200; i++) {
+  try { new Worker("setTimeout(() => {}, 2000)", { eval: true }).on("error", () => {}); } catch (e) {}
+}
+setTimeout(() => {
+  console.log("threads=" + require("fs").readdirSync("/proc/self/task").length);
+  process.exit(0);
+}, 1000);
+' 2>/dev/null || echo threads-failed
+( n=0; while [ $n -lt 200 ]; do sleep 2 & n=$((n+1)); echo "started=$n"; done ) 2>/dev/null | tail -n 1
+echo done
+sleep 1
+kill -STOP 1 2>/dev/null
+echo "after-stop-$S"
+kill -9 1 2>/dev/null
+echo "after-kill-$S"
+echo signals-ignored
+SH
+# sup_pod: the driver's sample pod with the checked supervisor and the script's app, no labels of
+# the driver (its sweep must not take the pod for one of its own).
+sup_pod() {
+  jq -c --arg sup "$SUPERVISOR_IMAGE" --arg img "$NODE_IMG" --arg name "$SUP_POD" '
+    .metadata = {name: $name, namespace: "ruum-apps", labels: {"app.kubernetes.io/name": "gvisor-check"}}
+    | .spec.initContainers[0].image = $sup
+    | .spec.containers[0] |= (
+        .image = $img
+        | .command = ["/ruum/bin/ruum-supervisor", "run", "--launch-stdin", "--token-file", "/var/run/ruum/token"]
+        | .stdin = true | .stdinOnce = true
+        | del(.readinessProbe, .ports))' "$SAMPLE"
+}
+if [[ ! "$SUPERVISOR_IMAGE" =~ ^ghcr\.io/nemecec/ruum-supervisor@sha256:[0-9a-f]{64}$ ]]; then
+  bad "the supervisor protections under gVisor were not checked: give --supervisor-image ghcr.io/nemecec/ruum-supervisor@sha256:<digest> (images.yml, the deployed commit)"
+elif ! out="$(sup_pod | kubectl create --dry-run=server -f - -o name 2>&1)"; then
+  bad "the supervisor check pod did not pass the admission rules: $out"
+else
+  pass "the supervisor check pod in the driver's shape passes the admission rules (dry run)"
+  secret="gvisor-check-secret-$RANDOM$RANDOM$RANDOM"
+  launch="$(jq -cn --arg script "$SUP_SCRIPT" --arg s "$secret" --argjson pids "$SUP_PIDS" \
+    '{v: 1, argv: ["/bin/sh", "-c", $script], env: [["S", $s]], redact: [], pids_limit: $pids}')"
+  kubectl -n "$NS" delete pod "$SUP_POD" --ignore-not-found --wait=true >/dev/null 2>&1
+  logs="" code=""
+  # The pod ends Succeeded (Linux semantics: PID 1 ignores the app's SIGKILL) or Failed with 137
+  # (gVisor's: the app's SIGKILL ends the sandbox, backlog I620-15).
+  if sup_pod | kubectl create -f - >/dev/null 2>&1 &&
+    kubectl -n "$NS" wait --for=condition=Ready "pod/$SUP_POD" --timeout=180s >/dev/null 2>&1 &&
+    kubectl -n "$NS" attach -i -c app "$SUP_POD" <<<"$launch" >/dev/null 2>&1; then
+    for _ in $(seq 1 120); do
+      phase="$(kubectl -n "$NS" get pod "$SUP_POD" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+      [[ "$phase" == Succeeded || "$phase" == Failed ]] && break
+      sleep 2
+    done
+    logs="$(kubectl -n "$NS" logs "$SUP_POD" -c app 2>/dev/null | tr -d '\r')"
+    code="$(kubectl -n "$NS" get pod "$SUP_POD" -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}' 2>/dev/null || true)"
+  fi
+  kubectl -n "$NS" delete pod "$SUP_POD" --wait=false >/dev/null 2>&1
+  if [[ -z "$logs" ]]; then
+    bad "the supervisor check pod did not run to its end under gVisor (kubectl -n $NS get events)"
+  else
+    [[ "$logs" != *"$secret"* && "$logs" == *"canary-out-<hidden secret>"* && "$logs" == *"canary-err-<hidden secret>"* ]] &&
+      pass "the supervisor redacts the app's output before the kubelet's log (the CRI canary)" ||
+      bad "the pod's log holds the test value or no redacted canary"
+    for line in fd1-refused mem-refused environ-refused; do
+      grep -qx "$line" <<<"$logs" && pass "under gVisor the app is refused /proc/1 (${line%-refused})" || bad "under gVisor the app was not refused /proc/1 (${line%-refused})"
+    done
+    grep -qx "done" <<<"$logs" && pass "the app's checks ran to their end" || bad "the app's checks did not run to their end"
+    # The app's SIGSTOP and SIGKILL to PID 1, last (backlog I620-15).
+    if grep -qx signals-ignored <<<"$logs"; then
+      [[ "$code" == 0 && "$logs" == *"after-kill-<hidden secret>"* ]] &&
+        pass "the supervisor (PID 1) ignored the app's SIGSTOP and SIGKILL and went on redacting" || bad "PID 1 ignored the signals but the run did not end cleanly (exit ${code:-none})"
+    elif [[ "$code" == 137 && "$logs" != *"after-stop-"* && "$logs" != *"after-kill-"* ]]; then
+      pass "the app's SIGKILL to PID 1 ended the whole sandbox, and nothing it wrote after its SIGSTOP reached the log (gVisor semantics, backlog I620-15)"
+    else
+      bad "after the app's SIGSTOP and SIGKILL to PID 1 the run neither went on nor ended with its supervisor (exit ${code:-none})"
+    fi
+    started="$(sed -n 's/^started=//p' <<<"$logs")"
+    [[ "$started" =~ ^[0-9]+$ && "$started" -lt $SUP_PIDS ]] &&
+      pass "under gVisor RLIMIT_NPROC bounds the app's processes ($started started of 200 tried, limit $SUP_PIDS)" || bad "the fork check: '${started:-none}' processes started under RLIMIT_NPROC $SUP_PIDS"
+    threads="$(sed -n 's/^threads=//p' <<<"$logs")"
+    if [[ "$threads" =~ ^[0-9]+$ && "$threads" -le $SUP_PIDS ]] || grep -qx threads-failed <<<"$logs"; then
+      pass "under gVisor RLIMIT_NPROC bounds the app's threads (${threads:-the workers failed})"
+    else
+      bad "the thread check: '${threads:-none}' threads under RLIMIT_NPROC $SUP_PIDS"
+    fi
+  fi
 fi
 
 [[ $fail == 0 ]] && echo "gvisor check: passed" || echo "gvisor check: FAILED"

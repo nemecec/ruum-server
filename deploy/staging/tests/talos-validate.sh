@@ -75,6 +75,11 @@ for n in $(jq -r 'keys[]' mc.json); do
       { d = d $0 "\n"; if ($0 == k) hk = 1; if ($0 == nm) hn = 1 }
       END { out() }' "$n.yaml"
   }
+  # The kubelet's PID limit of every pod (backlog I6-19), in the KubeletConfig document.
+  awk '/^---$/ { if (k) exit; d = ""; next } { d = d $0 "\n" } $0 == "kind: KubeletConfig" { k = 1 } END { if (k) printf "%s", d }' "$n.yaml" |
+    grep -qE '^ +podPidsLimit: 4096$' &&
+    echo "ok   $n: the kubelet limits every pod to 4096 PIDs (I6-19)" ||
+    { echo "FAIL $n: the kubelet limits every pod to 4096 PIDs (I6-19)"; failed=1; }
   doc UserVolumeConfig local-path | grep -qE '^ +match: system_disk$' &&
     echo "ok   $n: user volume local-path on the system disk" ||
     { echo "FAIL $n: user volume local-path on the system disk"; failed=1; }

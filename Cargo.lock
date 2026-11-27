@@ -3186,6 +3186,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
+ "aws-lc-rs",
  "axum",
  "base64 0.23.1",
  "bollard",
@@ -3237,6 +3238,7 @@ name = "ruum-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "bytes",
  "futures",
@@ -3250,10 +3252,12 @@ dependencies = [
  "ruum-core",
  "ruum-mcp",
  "ruum-runtime",
+ "ruum-supervisor",
  "ruum-webdav",
  "serde_json",
  "sqlx",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tonic",
  "tower",
@@ -3268,8 +3272,10 @@ name = "ruum-supervisor"
 version = "0.1.0"
 dependencies = [
  "nix",
+ "rustls",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "time",
 ]
 

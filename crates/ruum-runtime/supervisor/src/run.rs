@@ -26,8 +26,13 @@ pub enum Source {
     /// The Docker driver: the launch data on standard input, which the driver closes after it
     /// (`OpenStdin`, `StdinOnce`). The app gets `/dev/null`.
     Stdin,
-    /// The server's supervisor listener (Kubernetes), with the pod's projected token file.
-    Http { base: SocketAddr, identity: PathBuf },
+    /// The server's supervisor listener (Kubernetes), with the pod's projected token file;
+    /// TLS 1.3 with the listener's certificate of `pin` when it is set (backlog I620-2).
+    Http {
+        base: SocketAddr,
+        identity: PathBuf,
+        pin: Option<[u8; 32]>,
+    },
 }
 
 /// How one supervisor runs.
@@ -97,6 +102,7 @@ fn identity(path: &Path) -> Result<String, String> {
 /// 5xx until `deadline`. Any other status ends at once.
 fn fetch(
     base: SocketAddr,
+    pin: Option<[u8; 32]>,
     identity_file: &Path,
     path: &str,
     deadline: Instant,
@@ -104,7 +110,7 @@ fn fetch(
     let mut wait = Duration::from_millis(200);
     loop {
         let r = identity(identity_file).and_then(|tok| {
-            http::post(base, path, &tok, MAX_LAUNCH_BYTES, HTTP_TIMEOUT).map_err(|e| match e {
+            http::post(base, pin, path, &tok, MAX_LAUNCH_BYTES, HTTP_TIMEOUT).map_err(|e| match e {
                 HttpError::Status(s) if s != 429 && s < 500 => format!("refused: status {s}"),
                 other => format!("retry: {other}"),
             })
@@ -163,9 +169,14 @@ pub fn parse_launch(raw: &[u8], with_token: bool) -> Result<Launch, String> {
 pub fn load(opts: &Options) -> Result<Launch, String> {
     match &opts.source {
         Source::Stdin => parse_launch(&read_stdin(opts.launch_timeout)?, false),
-        Source::Http { base, identity } => parse_launch(
+        Source::Http {
+            base,
+            identity,
+            pin,
+        } => parse_launch(
             &fetch(
                 *base,
+                *pin,
                 identity,
                 "/v1/launch",
                 Instant::now() + opts.launch_timeout,
@@ -477,8 +488,16 @@ pub fn supervise(
         }
     }
     // Kubernetes: the current token every poll interval, redacted first, then written.
-    if let (Source::Http { base, identity }, Some(_)) = (&opts.source, &launch.token) {
-        let (base, identity) = (*base, identity.clone());
+    if let (
+        Source::Http {
+            base,
+            identity,
+            pin,
+        },
+        Some(_),
+    ) = (&opts.source, &launch.token)
+    {
+        let (base, identity, pin) = (*base, identity.clone(), *pin);
         let path = opts.token_file.clone();
         let shared = shared.clone();
         let every = launch
@@ -492,7 +511,7 @@ pub fn supervise(
                 let mut current = String::new();
                 loop {
                     std::thread::sleep(every);
-                    let got = fetch(base, &identity, "/v1/token", Instant::now() + every)
+                    let got = fetch(base, pin, &identity, "/v1/token", Instant::now() + every)
                         .and_then(|raw| {
                             serde_json::from_slice::<TokenAnswer>(&raw)
                                 .map_err(|_| "the token answer does not parse".to_owned())
@@ -849,6 +868,7 @@ mod tests {
             Source::Http {
                 base: addr,
                 identity: idf,
+                pin: None,
             },
             tf.clone(),
         );
