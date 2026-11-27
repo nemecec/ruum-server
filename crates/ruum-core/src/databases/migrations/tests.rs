@@ -1948,6 +1948,7 @@ async fn a_draft_migration_reads_no_catalog_text_without_manage() {
         "insert into sink(id, v) select 1, pg_get_expr(adbin, adrelid) from pg_catalog.pg_attrdef",
         "do $$ begin insert into sink(id, v) select 1, pg_get_expr(adbin, adrelid) from pg_attrdef; end $$",
         "do $$ begin execute 'insert into sink(id, v) select 1, pg_get_expr(adbin, adrelid) from pg_' || 'attrdef'; end $$",
+        r#"do $$ begin insert into sink(id, v) select 1, U&"\0070g_get_expr"(adbin, adrelid) from U&"\0070g_attrdef"; end $$"#,
     ] {
         for who in [&ac, &bob] {
             let (status, c, text) = code(
