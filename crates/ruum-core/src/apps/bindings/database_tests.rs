@@ -1030,6 +1030,58 @@ async fn a_repair_of_another_replica_leaves_no_role() {
     );
 }
 
+/// Kimi run 17 B-1d, second re-check: another replica's repair runs inside the first
+/// `revoke_binding` of an end (after the drop, before the delete of the row). Its
+/// `repair_node` makes the role again under a new name and writes the row again; the delete by
+/// binding deletes that new row. The second drop by binding takes the new role with it.
+#[tokio::test]
+async fn a_repair_inside_a_revoke_of_another_replica_leaves_no_role() {
+    let w = world().await;
+    let live = w.database(w.data, "Shop", "postgres").await;
+    let app = w.app(&w.a(), w.data, "Shop app").await;
+    let dep = w
+        .ready(&w.a(), app, &bound("shop", live, "edit"), None)
+        .await;
+    w.publish(&w.a(), app, dep).await;
+    let row = w.active_of(app.0).await.remove(0);
+    let old = w.engine_roles(live).await;
+    assert_eq!(old.len(), 1);
+    let none = w.ready(&w.a(), app, "runtime: static\n", None).await;
+    let roles2 = Arc::new(AppRoles::new(
+        w.store.clone(),
+        w.s.databases.deps().store.clone(),
+        w.s.database_engines.clone(),
+    ));
+    let db2 = DatabaseBindings::new(roles2, w.s.databases.clone());
+    let store = w.s.apps.store().clone();
+    let pause = Pause::arm(&w.db().roles().pause_after_drop);
+    let a = w.a();
+    let (published, made) = tokio::join!(w.publish(&a, app, none), async {
+        pause.reached.notified().await;
+        // The binding's row is still active and its role row is there: the repair of the
+        // other replica makes the engine role again.
+        db2.repair_target(&*store, w.team.id, live).await.unwrap();
+        let made = w.engine_roles(live).await;
+        pause.go.notify_one();
+        made
+    });
+    assert_eq!(made.len(), 1, "the other replica made the role again");
+    assert_ne!(made[0].role_name, old[0].role_name);
+    assert_ne!(published, dep, "the release without the binding is live");
+    assert!(w.active_of(app.0).await.is_empty());
+    assert!(
+        w.engine_roles(live).await.is_empty(),
+        "a role made inside the revoke outlived the end"
+    );
+    assert!(
+        w.store
+            .of_binding(w.team.id, row.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 /// Kimi run 17 B-1d, finding 3: a publish between the live check of a start and its read of
 /// the rows must not hand the old live deployment the rows of the new release.
 #[tokio::test]

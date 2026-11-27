@@ -53,7 +53,7 @@ use super::{DatabaseStore, Engines};
 use crate::error::{ApiError, Error, ErrorCode, Result};
 use crate::ids::{NodeId, TenantId};
 use async_trait::async_trait;
-use ruum_dbengine::{AppCredentials, EngineError, EngineKind, RoleKind, RoleRef};
+use ruum_dbengine::{AppCredentials, DatabaseEngine, EngineError, EngineKind, RoleKind, RoleRef};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -469,6 +469,18 @@ pub struct AppRoles {
     /// the rows.
     #[cfg(test)]
     pub(crate) pause_after_rows: Mutex<Option<Arc<crate::apps::bindings::database::Pause>>>,
+    /// A test seam: the next `revoke_binding` waits here after its first drop of a role,
+    /// before it deletes the row.
+    #[cfg(test)]
+    pub(crate) pause_after_drop: Mutex<Option<Arc<crate::apps::bindings::database::Pause>>>,
+}
+
+/// Drops the app role `role`; a role that is gone is no error.
+async fn drop_role(engine: &dyn DatabaseEngine, role: &RoleRef) -> Result<()> {
+    match engine.drop_app_role(role).await {
+        Ok(()) | Err(EngineError::NotFound) => Ok(()),
+        Err(e) => Err(engine_problem(e)),
+    }
 }
 
 /// An engine error as a platform error. No engine text reaches a status; none holds a password.
@@ -532,6 +544,8 @@ impl AppRoles {
             after_count: Mutex::new(None),
             #[cfg(test)]
             pause_after_rows: Mutex::new(None),
+            #[cfg(test)]
+            pause_after_drop: Mutex::new(None),
         }
     }
 
@@ -682,24 +696,34 @@ impl AppRoles {
 
     /// Drops the roles of a binding (their sessions end) and deletes the rows. A binding
     /// without roles, or whose database is gone, is no error.
+    ///
+    /// The role goes again after its row is deleted (Kimi run 17 B-1d, second re-check): the
+    /// `repair_node` of another replica that read the row before the first drop makes the
+    /// role again under a new name and writes the row again, and the delete (by binding, not
+    /// by name) then deletes that new row. The second drop (by binding too) takes the new
+    /// role with it; a role made after it has its row written after this delete, which the
+    /// repair's second read or the end's second [`Self::revoke_binding`] finds.
     pub async fn revoke_binding(&self, tenant: TenantId, binding: Uuid) -> Result<()> {
         let _held = self.lock.lock().await;
         for row in self.store.of_binding(tenant, binding).await? {
-            match self.database(tenant, row.node_id).await {
+            let found = match self.database(tenant, row.node_id).await {
                 Ok((db, engine)) => {
                     let role = RoleRef::app(db.database_ref(), row.kind, row.binding_id)
                         .map_err(engine_problem)?;
-                    match engine.drop_app_role(&role).await {
-                        Ok(()) | Err(EngineError::NotFound) => {}
-                        Err(e) => return Err(engine_problem(e)),
-                    }
+                    drop_role(&*engine, &role).await?;
+                    Some((engine, role))
                 }
-                Err(Error::Api(e)) if e.code == ErrorCode::NotFound => {}
+                Err(Error::Api(e)) if e.code == ErrorCode::NotFound => None,
                 Err(e) => return Err(e),
-            }
+            };
+            #[cfg(test)]
+            crate::apps::bindings::database::Pause::hold(&self.pause_after_drop).await;
             self.store
                 .delete(tenant, row.node_id, row.kind, row.binding_id)
                 .await?;
+            if let Some((engine, role)) = found {
+                drop_role(&*engine, &role).await?;
+            }
         }
         Ok(())
     }
