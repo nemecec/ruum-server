@@ -982,6 +982,54 @@ async fn a_repair_from_a_stale_read_leaves_no_role() {
     );
 }
 
+/// Kimi run 17 B-1d re-check, finding 1: the `repair_node` of another replica (its own
+/// `AppRoles`, its own lock) that read the role rows before an end makes the role again after
+/// the whole end; its repair reads the rows again and drops the role.
+#[tokio::test]
+async fn a_repair_of_another_replica_leaves_no_role() {
+    let w = world().await;
+    let live = w.database(w.data, "Shop", "postgres").await;
+    let app = w.app(&w.a(), w.data, "Shop app").await;
+    let dep = w
+        .ready(&w.a(), app, &bound("shop", live, "edit"), None)
+        .await;
+    w.publish(&w.a(), app, dep).await;
+    let row = w.active_of(app.0).await.remove(0);
+    let none = w.ready(&w.a(), app, "runtime: static\n", None).await;
+    let roles2 = Arc::new(AppRoles::new(
+        w.store.clone(),
+        w.s.databases.deps().store.clone(),
+        w.s.database_engines.clone(),
+    ));
+    let db2 = DatabaseBindings::new(roles2.clone(), w.s.databases.clone());
+    let store = w.s.apps.store().clone();
+    let pause = Pause::arm(&roles2.pause_after_rows);
+    let a = w.a();
+    let (fixed, published) = tokio::join!(
+        async { db2.repair_target(&*store, w.team.id, live).await.unwrap() },
+        async {
+            pause.reached.notified().await;
+            let id = w.publish(&a, app, none).await;
+            pause.go.notify_one();
+            id
+        }
+    );
+    assert_ne!(published, dep, "the release without the binding is live");
+    assert!(fixed >= 1, "{fixed}");
+    assert!(w.active_of(app.0).await.is_empty());
+    assert!(
+        w.engine_roles(live).await.is_empty(),
+        "a role made by another replica's repair outlived the end"
+    );
+    assert!(
+        w.store
+            .of_binding(w.team.id, row.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 /// Kimi run 17 B-1d, finding 3: a publish between the live check of a start and its read of
 /// the rows must not hand the old live deployment the rows of the new release.
 #[tokio::test]

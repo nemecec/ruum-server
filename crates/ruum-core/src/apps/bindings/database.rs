@@ -55,8 +55,9 @@
 //!   for the still active row;
 //! - a repair (or a grant) that read a row as active while an end runs: the end drops the
 //!   roles, revokes the rows and drops the roles again, and every role made reads its row
-//!   again after it is made ([`DatabaseBindings::ensure_role`]), so no role outlives a
-//!   completed end (Kimi run 17 B-1d, finding 2);
+//!   again after it is made ([`DatabaseBindings::ensure_role`]; the repair reads the role rows
+//!   and the binding rows again after [`AppRoles::repair_node`]), so no role outlives a
+//!   completed end (Kimi run 17 B-1d, finding 2 and its re-check);
 //! - a `database_roles` row whose binding has no active row (a role of an ended or purged
 //!   binding) is dropped by the repair of its database.
 //!
@@ -437,21 +438,12 @@ impl DatabaseBindings {
         }
     }
 
-    /// The roles of the database `target` follow its active rows (backlog D5-8; see the module
-    /// docs for the order of the reads). Returns how many fixes it made. A target that is no
-    /// database (or a SQLite one) is left alone.
-    pub(crate) async fn repair_target(
-        &self,
+    /// Every active row on the database `target`, page by page.
+    async fn active_on(
         store: &dyn AppStore,
         tenant: TenantId,
         target: NodeId,
-    ) -> Result<usize> {
-        match self.row(tenant, target).await? {
-            Some(r) if r.engine != EngineKind::Sqlite => {}
-            _ => return Ok(0),
-        }
-        // The role rows first, then the binding rows.
-        let have = self.roles.rows_of_node(tenant, target).await?;
+    ) -> Result<Vec<BindingRow>> {
         let mut active: Vec<BindingRow> = Vec::new();
         loop {
             let page = store
@@ -472,6 +464,25 @@ impl DatabaseBindings {
                 break;
             }
         }
+        Ok(active)
+    }
+
+    /// The roles of the database `target` follow its active rows (backlog D5-8; see the module
+    /// docs for the order of the reads). Returns how many fixes it made. A target that is no
+    /// database (or a SQLite one) is left alone.
+    pub(crate) async fn repair_target(
+        &self,
+        store: &dyn AppStore,
+        tenant: TenantId,
+        target: NodeId,
+    ) -> Result<usize> {
+        match self.row(tenant, target).await? {
+            Some(r) if r.engine != EngineKind::Sqlite => {}
+            _ => return Ok(0),
+        }
+        // The role rows first, then the binding rows.
+        let have = self.roles.rows_of_node(tenant, target).await?;
+        let active = Self::active_on(store, tenant, target).await?;
         #[cfg(test)]
         Pause::hold(&self.pause_after_rows).await;
         let want: BTreeMap<Uuid, &BindingRow> = active
@@ -499,6 +510,26 @@ impl DatabaseBindings {
         // The engine and the role rows agree (an engine role without a row goes, a row whose
         // engine role is gone gets one again).
         self.roles.repair_node(tenant, target).await?;
+        // `repair_node` makes a role again for each role row it read; on another replica an
+        // end may have dropped that role and revoked its row in between (Kimi run 17 B-1d
+        // re-check, finding 1). So the role rows and then the binding rows once more: a role
+        // row whose binding has no active row goes.
+        let have = self.roles.rows_of_node(tenant, target).await?;
+        let active: BTreeSet<Uuid> = Self::active_on(store, tenant, target)
+            .await?
+            .into_iter()
+            .filter(|b| b.kind != BindingKind::Api && b.role.is_some())
+            .map(|b| b.id)
+            .collect();
+        let late: BTreeSet<Uuid> = have
+            .iter()
+            .filter(|r| !active.contains(&r.binding_id))
+            .map(|r| r.binding_id)
+            .collect();
+        for binding in late {
+            self.roles.revoke_binding(tenant, binding).await?;
+            fixed += 1;
+        }
         if fixed > 0 {
             tracing::warn!(%tenant, %target, fixes = fixed, "the binding repair fixed app roles");
         }

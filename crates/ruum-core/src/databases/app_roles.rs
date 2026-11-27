@@ -465,6 +465,10 @@ pub struct AppRoles {
     /// barrier after it counted the tenant's rows.
     #[cfg(test)]
     pub(crate) after_count: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    /// A test seam: the next `repair_node` waits here after it read the engine's roles and
+    /// the rows.
+    #[cfg(test)]
+    pub(crate) pause_after_rows: Mutex<Option<Arc<crate::apps::bindings::database::Pause>>>,
 }
 
 /// An engine error as a platform error. No engine text reaches a status; none holds a password.
@@ -526,6 +530,8 @@ impl AppRoles {
             lock: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             after_count: Mutex::new(None),
+            #[cfg(test)]
+            pause_after_rows: Mutex::new(None),
         }
     }
 
@@ -707,6 +713,8 @@ impl AppRoles {
         let dbref = db.database_ref();
         let in_engine = engine.app_roles(&dbref).await.map_err(engine_problem)?;
         let rows = self.store.of_node(tenant, node).await?;
+        #[cfg(test)]
+        crate::apps::bindings::database::Pause::hold(&self.pause_after_rows).await;
         for role in &in_engine {
             if !rows
                 .iter()
