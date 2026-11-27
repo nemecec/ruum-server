@@ -3,6 +3,7 @@
 #
 #   deploy/staging/tool.sh bash deploy/staging/ops/gvisor-check.sh [--class-only]
 #   deploy/staging/tool.sh bash deploy/staging/ops/gvisor-check.sh --supervisor-image ghcr.io/nemecec/ruum-supervisor@sha256:<digest>
+#   deploy/staging/tool.sh bash deploy/staging/ops/gvisor-check.sh --from-release   (k8s/apply.sh)
 #
 # 1. The handler: every node runs the Talos extension gvisor (talosctl get extensions, through the
 #    admin tunnel), so containerd knows the handler runsc.
@@ -43,13 +44,20 @@
 #    admit it), then the pod itself: the launch data (a test value, RLIMIT_NPROC 64) goes to the
 #    supervisor's standard input (kubectl attach), and the pod's log (the kubelet's CRI file)
 #    must show the value only as "<hidden secret>", the app could not open /proc/1/fd/1,
-#    /proc/1/mem or /proc/1/environ, and the app started fewer than 64 processes and threads.
+#    /proc/1/mem or /proc/1/environ (but its own /proc/self/mem: the control), and the app
+#    started fewer than 64 processes and threads (at least one Node.js worker, not all 200).
 #    Last the app sends PID 1 SIGSTOP and SIGKILL: on Linux PID 1 ignores both; gVisor delivers
 #    them (backlog I620-15), and then the whole sandbox must end (137) with nothing written after
 #    the SIGSTOP in the log. The same script runs on the build server under
 #    runsc (crates/ruum-runtime tests/supervisor_sandbox.rs with RUUM_RUNTIME_DRIVER=runsc).
 #    Without --supervisor-image (or RUUM_SUPERVISOR_IMAGE) this step FAILS: never a pass on
 #    silence. The digest is the one images.yml published for the deployed commit.
+#    --from-release (the platform step, k8s/apply.sh; Kimi, run 17, finding 4): the image is the
+#    live release's (RUUM_KUBE_SUPERVISOR_IMAGE of deployment ruum/ruum-server, which
+#    ops/deploy-chart.sh resolved with its provenance) when that release runs the Kubernetes
+#    driver; when it does not (the driver is off, or no release yet), step 7 prints SKIP, not
+#    PASS: no sandbox runs, and README "Turning the Kubernetes runtime driver on" step 7 runs it
+#    with --supervisor-image before the switch. A release that cannot be read FAILS.
 # Not read-only in steps 2 and 7: they create short pods (two per node in ruum-apps and ops, and
 # one in ruum-apps) and delete them. Steps 3, 4, 5 and 6 create nothing (dry runs and reads).
 # Exit 1 on any failure.
@@ -62,9 +70,13 @@ NS=ruum-apps
 # (crates/ruum-runtime testdata/fixture), pinned by digest.
 NODE_IMG=node:22-alpine@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a
 SUPERVISOR_IMAGE="${RUUM_SUPERVISOR_IMAGE:-}"
+FROM_RELEASE=0
 if [[ "${1:-}" == --supervisor-image ]]; then
   SUPERVISOR_IMAGE="${2:-}"
   set -- "${@:3}"
+elif [[ "${1:-}" == --from-release ]]; then
+  FROM_RELEASE=1
+  set -- "${@:2}"
 fi
 # The control pod without gVisor: not in ruum-apps, whose admission rule refuses it (S-83).
 CONTROL_NS=ops
@@ -268,17 +280,24 @@ read -r -d '' SUP_SCRIPT <<'SH' || true
 echo "canary-out-$S"
 echo "canary-err-$S" >&2
 echo "raw-$S" > /proc/1/fd/1 2>/dev/null && echo fd1-open || echo fd1-refused
-dd if=/proc/1/mem of=/dev/null bs=1 count=1 2>/dev/null && echo mem-read || echo mem-refused
+( : < /proc/1/mem ) 2>/dev/null && echo mem-open || echo mem-refused
+( : < /proc/self/mem ) 2>/dev/null && echo mem-control-open || echo mem-control-refused
 cat /proc/1/environ >/dev/null 2>&1 && echo environ-read || echo environ-refused
 node -e '
 const { Worker } = require("worker_threads");
+let online = 0;
 for (let i = 0; i < 200; i++) {
-  try { new Worker("setTimeout(() => {}, 2000)", { eval: true }).on("error", () => {}); } catch (e) {}
+  try {
+    const w = new Worker("setTimeout(() => {}, 3000)", { eval: true });
+    w.on("online", () => { online++; });
+    w.on("error", () => {});
+  } catch (e) {}
 }
 setTimeout(() => {
+  console.log("workers=" + online);
   console.log("threads=" + require("fs").readdirSync("/proc/self/task").length);
   process.exit(0);
-}, 1000);
+}, 1500);
 ' 2>/dev/null || echo threads-failed
 ( n=0; while [ $n -lt 200 ]; do sleep 2 & n=$((n+1)); echo "started=$n"; done ) 2>/dev/null | tail -n 1
 echo done
@@ -301,7 +320,24 @@ sup_pod() {
         | .stdin = true | .stdinOnce = true
         | del(.readinessProbe, .ports))' "$SAMPLE"
 }
-if [[ ! "$SUPERVISOR_IMAGE" =~ ^ghcr\.io/nemecec/ruum-supervisor@sha256:[0-9a-f]{64}$ ]]; then
+# --from-release: the live release's supervisor, or SKIP when it has the driver off.
+sup_skip=""
+if [[ $FROM_RELEASE == 1 ]]; then
+  if ! release="$(kubectl -n ruum get deployment ruum-server --ignore-not-found -o json 2>&1)"; then
+    SUPERVISOR_IMAGE=""
+    bad "cannot read the live release (deployment ruum/ruum-server): $release"
+  else
+    live_env() { jq -r --arg n "$1" '[.spec.template.spec.containers[].env[]? | select(.name == $n) | .value] | first // empty' <<<"$release"; }
+    if [[ -n "$release" && "$(live_env RUUM_RUNTIME_DRIVER)" == kubernetes ]]; then
+      SUPERVISOR_IMAGE="$(live_env RUUM_KUBE_SUPERVISOR_IMAGE)"
+    else
+      sup_skip="the live release has the Kubernetes runtime driver off"
+    fi
+  fi
+fi
+if [[ -n "$sup_skip" ]]; then
+  printf 'SKIP %s\n' "the supervisor under gVisor (step 7): $sup_skip; README \"Turning the Kubernetes runtime driver on\" step 7 runs it with --supervisor-image before the switch"
+elif [[ ! "$SUPERVISOR_IMAGE" =~ ^ghcr\.io/nemecec/ruum-supervisor@sha256:[0-9a-f]{64}$ ]]; then
   bad "the supervisor protections under gVisor were not checked: give --supervisor-image ghcr.io/nemecec/ruum-supervisor@sha256:<digest> (images.yml, the deployed commit)"
 elif ! out="$(sup_pod | kubectl create --dry-run=server -f - -o name 2>&1)"; then
   bad "the supervisor check pod did not pass the admission rules: $out"
@@ -335,6 +371,9 @@ else
     for line in fd1-refused mem-refused environ-refused; do
       grep -qx "$line" <<<"$logs" && pass "under gVisor the app is refused /proc/1 (${line%-refused})" || bad "under gVisor the app was not refused /proc/1 (${line%-refused})"
     done
+    # /proc/1/mem is only opened; the app's own /proc/self/mem is the positive control (Kimi,
+    # run 17, finding 6).
+    grep -qx mem-control-open <<<"$logs" && pass "the app can open its own /proc/self/mem (the control of the /proc/1/mem check)" || bad "the app could not open its own /proc/self/mem: the /proc/1/mem check proves nothing"
     grep -qx "done" <<<"$logs" && pass "the app's checks ran to their end" || bad "the app's checks did not run to their end"
     # The app's SIGSTOP and SIGKILL to PID 1, last (backlog I620-15).
     if grep -qx signals-ignored <<<"$logs"; then
@@ -348,11 +387,14 @@ else
     started="$(sed -n 's/^started=//p' <<<"$logs")"
     [[ "$started" =~ ^[0-9]+$ && "$started" -lt $SUP_PIDS ]] &&
       pass "under gVisor RLIMIT_NPROC bounds the app's processes ($started started of 200 tried, limit $SUP_PIDS)" || bad "the fork check: '${started:-none}' processes started under RLIMIT_NPROC $SUP_PIDS"
+    # Node.js ran, at least one worker started, and the limit refused the rest of the 200 (Kimi,
+    # run 17, finding 6: no pass when Node.js did not run).
+    workers="$(sed -n 's/^workers=//p' <<<"$logs")"
     threads="$(sed -n 's/^threads=//p' <<<"$logs")"
-    if [[ "$threads" =~ ^[0-9]+$ && "$threads" -le $SUP_PIDS ]] || grep -qx threads-failed <<<"$logs"; then
-      pass "under gVisor RLIMIT_NPROC bounds the app's threads (${threads:-the workers failed})"
+    if [[ "$workers" =~ ^[0-9]+$ && "$workers" -ge 1 && "$workers" -lt 200 && "$threads" =~ ^[0-9]+$ && "$threads" -le $SUP_PIDS ]]; then
+      pass "under gVisor RLIMIT_NPROC bounds the app's threads ($workers of 200 workers started, $threads threads)"
     else
-      bad "the thread check: '${threads:-none}' threads under RLIMIT_NPROC $SUP_PIDS"
+      bad "the thread check: '${workers:-none}' workers and '${threads:-none}' threads under RLIMIT_NPROC $SUP_PIDS"
     fi
   fi
 fi

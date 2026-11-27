@@ -6,9 +6,10 @@
 //! - its output reaches the container runtime's log redacted (the CRI log canary: `docker logs`
 //!   reads the engine's log file, as the kubelet's `/var/log/pods` files hold the pod's);
 //! - it cannot open `/proc/1/fd/1` (the supervisor's raw output), `/proc/1/mem` or
-//!   `/proc/1/environ` (the supervisor is non-dumpable);
+//!   `/proc/1/environ` (the supervisor is non-dumpable), while it can open its own
+//!   `/proc/self/mem` (the positive control);
 //! - `RLIMIT_NPROC` of the launch bounds its processes (a fork loop) and its threads (Node.js
-//!   workers);
+//!   workers: at least one starts, not all 200);
 //! - last, `kill -STOP 1` and `kill -9 1`: on Linux (runc) PID 1 of a namespace ignores both from
 //!   its own namespace, and the run ends normally. gVisor (runsc release-20261109.0) delivers
 //!   both: SIGSTOP freezes the supervisor (its output stops, nothing raw passes) and SIGKILL ends
@@ -38,17 +39,24 @@ const SCRIPT: &str = r#"
 echo "canary-out-$S"
 echo "canary-err-$S" >&2
 echo "raw-$S" > /proc/1/fd/1 2>/dev/null && echo fd1-open || echo fd1-refused
-dd if=/proc/1/mem of=/dev/null bs=1 count=1 2>/dev/null && echo mem-read || echo mem-refused
+( : < /proc/1/mem ) 2>/dev/null && echo mem-open || echo mem-refused
+( : < /proc/self/mem ) 2>/dev/null && echo mem-control-open || echo mem-control-refused
 cat /proc/1/environ >/dev/null 2>&1 && echo environ-read || echo environ-refused
 node -e '
 const { Worker } = require("worker_threads");
+let online = 0;
 for (let i = 0; i < 200; i++) {
-  try { new Worker("setTimeout(() => {}, 2000)", { eval: true }).on("error", () => {}); } catch (e) {}
+  try {
+    const w = new Worker("setTimeout(() => {}, 3000)", { eval: true });
+    w.on("online", () => { online++; });
+    w.on("error", () => {});
+  } catch (e) {}
 }
 setTimeout(() => {
+  console.log("workers=" + online);
   console.log("threads=" + require("fs").readdirSync("/proc/self/task").length);
   process.exit(0);
-}, 1000);
+}, 1500);
 ' 2>/dev/null || echo threads-failed
 ( n=0; while [ $n -lt 200 ]; do sleep 2 & n=$((n+1)); echo "started=$n"; done ) 2>/dev/null | tail -n 1
 echo done
@@ -177,7 +185,16 @@ fn the_supervisor_holds_as_pid1_of_a_sandbox() {
         all.contains("canary-out-<hidden secret>") && all.contains("canary-err-<hidden secret>"),
         "{ctx}"
     );
-    for line in ["fd1-refused", "mem-refused", "environ-refused", "done"] {
+    // `/proc/1/mem` is only opened (the access check is at the open; a read at an unmapped
+    // address fails even after an open that passed), with the app's own `/proc/self/mem` as the
+    // positive control (Kimi, run 17, finding 6).
+    for line in [
+        "fd1-refused",
+        "mem-refused",
+        "mem-control-open",
+        "environ-refused",
+        "done",
+    ] {
         assert!(all.lines().any(|l| l == line), "no line {line}: {ctx}");
     }
     // The signals to PID 1, last (backlog I620-15).
@@ -226,14 +243,20 @@ fn the_supervisor_holds_as_pid1_of_a_sandbox() {
         "{started} processes started under RLIMIT_NPROC {PIDS}: {ctx}"
     );
     eprintln!(
-        "{runtime}: {started} processes started of 200 tried, threads {:?}, under RLIMIT_NPROC {PIDS}",
+        "{runtime}: {started} processes started of 200 tried, workers {:?}, threads {:?}, under RLIMIT_NPROC {PIDS}",
+        num("workers="),
         num("threads=")
     );
-    match num("threads=") {
-        Some(t) => assert!(t <= PIDS, "{t} threads past RLIMIT_NPROC {PIDS}: {ctx}"),
-        None => assert!(
-            all.lines().any(|l| l == "threads-failed"),
-            "no thread result: {ctx}"
-        ),
-    }
+    // Node.js ran, at least one worker thread started, and the limit refused the rest of the
+    // 200 (Kimi, run 17, finding 6: a Node.js that does not start proves nothing).
+    let workers = num("workers=").expect("no worker count: Node.js did not run");
+    assert!(
+        (1..200).contains(&workers),
+        "{workers} of 200 workers started under RLIMIT_NPROC {PIDS}: {ctx}"
+    );
+    let threads = num("threads=").expect("no thread count");
+    assert!(
+        threads <= PIDS,
+        "{threads} threads past RLIMIT_NPROC {PIDS}: {ctx}"
+    );
 }

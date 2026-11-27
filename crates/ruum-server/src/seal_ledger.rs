@@ -1,8 +1,8 @@
 //! The seal ledger of the Kubernetes runtime driver in the platform database (backlog I620-9;
 //! `ruum_runtime::kube::ledger`, migration `0018_runtime_seal_marks.sql`): the generation mark of
 //! each sealed record and the pods that took their launch data, shared by every server replica,
-//! out of reach of a writer of ConfigMaps. Each statement is one atomic upsert or insert in the
-//! record's tenant (row-level security).
+//! out of reach of a writer of ConfigMaps. Each change is one atomic upsert, insert or delete in
+//! the record's tenant (row-level security); a generation that is already the mark is only read.
 
 use async_trait::async_trait;
 use ruum_core::journal::postgres::begin_tenant;
@@ -38,6 +38,28 @@ impl SealLedger for PgSealLedger {
         let mut tx = begin_tenant(&self.pool, r.tenant)
             .await
             .map_err(|e| unavailable("open a transaction", e))?;
+        // Read first: every supervisor request (each token renewal too) observes its record's
+        // generation, which is nearly always the mark. That answer writes nothing (Kimi, run
+        // 17, finding 2: no row version and no WAL per request). Only a missing or a higher
+        // generation takes the upsert below, which stays atomic for two raises at once.
+        let mark: Option<i64> = sqlx::query_scalar(
+            "select generation from runtime_seal_marks \
+             where tenant_id = $1 and instance_id = $2 and record_uid = $3",
+        )
+        .bind(r.tenant.0)
+        .bind(r.instance.0)
+        .bind(&r.record_uid)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| unavailable("read a mark", e))?;
+        if let Some(m) = mark
+            && m >= generation
+        {
+            tx.commit()
+                .await
+                .map_err(|e| unavailable("commit a mark", e))?;
+            return Ok(m == generation);
+        }
         // The mark rises or stays; a lower generation returns no row.
         let row: Option<i64> = sqlx::query_scalar(
             "insert into runtime_seal_marks (tenant_id, instance_id, record_uid, generation) \
@@ -151,6 +173,59 @@ mod tests {
     async fn the_postgres_ledger_passes_the_conformance_checks(pool: PgPool) {
         let t = tenant(&pool).await;
         ruum_runtime::kube::ledger::conformance(&PgSealLedger::new(pool), t).await;
+    }
+
+    /// The row version (`xmin`) of a record's mark: a write makes a new one.
+    async fn mark_version(pool: &PgPool, r: &RecordRef) -> String {
+        let mut tx = begin_tenant(pool, r.tenant).await.unwrap();
+        let v: String = sqlx::query_scalar(
+            "select xmin::text from runtime_seal_marks \
+             where tenant_id = $1 and instance_id = $2 and record_uid = $3",
+        )
+        .bind(r.tenant.0)
+        .bind(r.instance.0)
+        .bind(&r.record_uid)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        v
+    }
+
+    /// Kimi, run 17, finding 2: observing the generation that is already the mark (every
+    /// supervisor request's case) writes no new row version; a higher one does, and a lower one
+    /// is refused without a write.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn observing_the_current_mark_writes_nothing(pool: PgPool) {
+        let t = tenant(&pool).await;
+        let r = RecordRef {
+            tenant: t,
+            instance: InstanceId(uuid::Uuid::now_v7()),
+            record_uid: "uid".to_owned(),
+        };
+        let l = PgSealLedger::new(pool.clone());
+        assert!(l.observe(&r, 3).await.unwrap());
+        let first = mark_version(&pool, &r).await;
+        for _ in 0..3 {
+            assert!(l.observe(&r, 3).await.unwrap());
+        }
+        assert_eq!(
+            mark_version(&pool, &r).await,
+            first,
+            "an unchanged mark was written again"
+        );
+        assert!(!l.observe(&r, 2).await.unwrap());
+        assert_eq!(
+            mark_version(&pool, &r).await,
+            first,
+            "a refused generation wrote the mark"
+        );
+        assert!(l.observe(&r, 4).await.unwrap());
+        assert_ne!(
+            mark_version(&pool, &r).await,
+            first,
+            "a higher generation did not raise the mark"
+        );
     }
 
     /// Two replicas claim one pod's launch at the same moment: exactly one wins; two raise the

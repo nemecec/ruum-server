@@ -245,7 +245,9 @@ k -n ruum-deploy rollout status deployment/deploy-controller --timeout=5m >/dev/
 log "the deployer may only write release requests (ops/rbac-check.sh live)"
 bash "$STG/ops/rbac-check.sh" live || die "the deployer, observer, deploy controller or runtime driver has other rights than it should (above)"
 log "gVisor: a pod of the runtime class gvisor on every node, a control pod in ops, the admission rule (ops/gvisor-check.sh)"
-bash "$STG/ops/gvisor-check.sh" >&2 || die "the gVisor check failed (above)"
+# --from-release: step 7 (the supervisor under gVisor) with the live release's supervisor image
+# when it runs the driver, SKIP when the driver is off (Kimi, run 17, finding 4).
+bash "$STG/ops/gvisor-check.sh" --from-release >&2 || die "the gVisor check failed (above)"
 log "deployer kubeconfig (namespaced, review 2 O-1)"
 bash "$STG/ops/deployer-kubeconfig.sh"
 log "observer kubeconfig (read-only troubleshooting, O-51)"

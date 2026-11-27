@@ -2512,6 +2512,29 @@ grep -qF "jq -r '.kubeletconfig.podPidsLimit // empty'" "$gc" && grep -qF 'sup_p
   grep -qF 'echo "raw-$S" > /proc/1/fd/1' "$STG/../../crates/ruum-runtime/tests/supervisor_sandbox.rs" &&
   ok "gvisor-check.sh checks the kubelet's PID limit and the supervisor's protections under gVisor, as the build server's runsc test does (I6-19, I620-3)" ||
   bad "gvisor-check.sh lacks the kubelet PID limit or the supervisor checks (I6-19, I620-3)"
+# Kimi, run 17, findings 4 to 6: the platform step's gVisor check takes the live release's
+# supervisor or says SKIP while the driver is off (it no longer fails every platform step); the
+# switch reaches staging through the platform step of its own commit and is checked with that
+# commit's supervisor; the app script is the same in both checks, opens /proc/1/mem only (with
+# its own /proc/self/mem as the control) and passes no thread check where Node.js did not run.
+grep -qF 'ops/gvisor-check.sh" --from-release' "$STG/k8s/apply.sh" && ! grep -qE 'ops/gvisor-check\.sh" >&2' "$STG/k8s/apply.sh" &&
+  grep -qF 'elif [[ "${1:-}" == --from-release ]]; then' "$gc" && grep -qF 'kubectl -n ruum get deployment ruum-server --ignore-not-found -o json' "$gc" &&
+  grep -qF "printf 'SKIP %s\\n'" "$gc" && grep -qF 'cannot read the live release' "$gc" &&
+  ok "the platform step's gVisor check uses the live release's supervisor, or SKIP while the driver is off" ||
+  bad "the platform step's gVisor check fails without --supervisor-image, or passes without the live release's supervisor"
+grep -qF '2. The platform step from a checkout of the switch commit' "$STG/README.md" &&
+  grep -qF 'ghcr.io/nemecec/ruum-supervisor@sha256:<digest of step 8.1>' "$STG/README.md" &&
+  grep -qF "shows \`tls\` and the supervisor's digest of step 8.1" "$STG/README.md" &&
+  ok "README: the switch runs the platform step of its commit and checks that commit's supervisor" ||
+  bad "README: the switch skips the platform step or checks another supervisor than it deploys"
+sb="$STG/../../crates/ruum-runtime/tests/supervisor_sandbox.rs"
+rs_script="$(sed -n '/^const SCRIPT: &str = r#"$/,/^"#;$/p' "$sb" | sed '1d;$d')"
+sh_script="$(sed -n "/^read -r -d '' SUP_SCRIPT <<'SH' || true$/,/^SH$/p" "$gc" | sed '1d;$d')"
+[[ -n "$rs_script" && "$rs_script" == "$sh_script" ]] && grep -qxF '( : < /proc/1/mem ) 2>/dev/null && echo mem-open || echo mem-refused' <<<"$sh_script" &&
+  grep -qF 'mem-control-open' <<<"$sh_script" && grep -qF 'console.log("workers=" + online);' <<<"$sh_script" &&
+  grep -qF 'grep -qx mem-control-open' "$gc" && ! grep -qF 'grep -qx threads-failed' "$gc" &&
+  ok "the supervisor checks run one app script (Docker test and staging), /proc/1/mem open-only with a control, workers counted" ||
+  bad "the supervisor checks differ, read /proc/1/mem at address 0, or pass the thread check without Node.js"
 bash -n "$STG/ops/gvisor-check.sh" && grep -qF 'the check proves nothing on this node' "$STG/ops/gvisor-check.sh" &&
   ok "gvisor-check.sh needs a control pod that sees the node's kernel (no pass on silence)" || bad "gvisor-check.sh"
 sa="$STG/ops/smoke-apps.sh"

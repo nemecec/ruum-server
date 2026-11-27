@@ -1091,6 +1091,28 @@ async fn object_put(
     {
         obj["metadata"]["ownerReferences"] = r;
     }
+    // The deletion mark is the stored object's (no update clears it); an update that leaves a
+    // deleted object no finalizer removes it, as a real API server does.
+    if let Some(t) = cur.pointer("/metadata/deletionTimestamp").cloned() {
+        obj["metadata"]["deletionTimestamp"] = t;
+        let held = obj
+            .pointer("/metadata/finalizers")
+            .and_then(Value::as_array)
+            .is_some_and(|a| !a.is_empty());
+        if !held {
+            let gone = o.cms.remove(&key).map(|v| {
+                v.pointer("/metadata/uid")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            });
+            drop(o);
+            if let Some(u) = gone {
+                f.deleted(u);
+            }
+            return axum::Json(obj).into_response();
+        }
+    }
     Fake::bump(&mut o, &mut obj);
     o.cms.insert(key, obj.clone());
     axum::Json(obj).into_response()
@@ -1175,7 +1197,27 @@ async fn object_delete(
             f.remove_pod(&ns, &name);
             had
         }
-        "configmaps" => f.objs.lock().unwrap().cms.remove(&key).map(|v| uid(&v)),
+        "configmaps" => {
+            let mut o = f.objs.lock().unwrap();
+            // A real API server keeps an object with finalizers: it sets
+            // `metadata.deletionTimestamp`, answers 200 with the object, and removes it only once
+            // an update leaves no finalizer (Kimi, run 17, finding 1).
+            let held = o.cms.get(&key).is_some_and(|v| {
+                v.pointer("/metadata/finalizers")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| !a.is_empty())
+            });
+            if held {
+                let mut v = o.cms.get(&key).cloned().unwrap();
+                if v.pointer("/metadata/deletionTimestamp").is_none() {
+                    v["metadata"]["deletionTimestamp"] = json!("2026-11-27T12:00:00Z");
+                    Fake::bump(&mut o, &mut v);
+                    o.cms.insert(key, v.clone());
+                }
+                return axum::Json(v).into_response();
+            }
+            o.cms.remove(&key).map(|v| uid(&v))
+        }
         "secrets" => f.objs.lock().unwrap().secrets.remove(&key).map(|v| uid(&v)),
         _ => None,
     };

@@ -986,18 +986,37 @@ impl Inner {
         id: InstanceId,
     ) -> Result<(Record, String, String), RuntimeError> {
         let cm = self.reload(id).await?;
-        let uid = cm
-            .pointer("/metadata/uid")
-            .and_then(Value::as_str)
-            .filter(|u| !u.is_empty())
-            .ok_or_else(|| RuntimeError::Internal {
-                reason: "an instance record has no uid".to_owned(),
-            })?
-            .to_owned();
-        let (rec, rv) = pod::read_record(&cm).ok_or_else(|| RuntimeError::Internal {
-            reason: "an instance record does not read".to_owned(),
-        })?;
-        Ok((rec, rv, uid))
+        record_parts(&cm)
+    }
+
+    /// Forgets the ledger rows of a record whose `DELETE` the API server accepted, once a read
+    /// shows that record (its uid) gone. A finalizer keeps a deleted ConfigMap readable and
+    /// writable under the same uid, and a writer of ConfigMaps can add one: its rows must stay,
+    /// or a seal put back into it would get a second launch (Kimi, run 17, finding 1). A record
+    /// that stays keeps its rows; once it goes without this process seeing it, they are left
+    /// behind (ids only, for a uid that never comes back).
+    async fn forget_deleted(&self, tenant: TenantId, id: InstanceId, record_uid: &str) {
+        match self.api.get(Kind::ConfigMap, &object_name(id)).await {
+            Ok(Some(cm))
+                if cm.pointer("/metadata/uid").and_then(Value::as_str) == Some(record_uid) =>
+            {
+                tracing::warn!(target: "ruum::runtime", instance = %id.0, "a deleted instance record is still there (a finalizer): its seal ledger rows stay");
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(target: "ruum::runtime", code = e.code(), "a deleted instance record cannot be read again: its seal ledger rows stay");
+                return;
+            }
+        }
+        let r = RecordRef {
+            tenant,
+            instance: id,
+            record_uid: record_uid.to_owned(),
+        };
+        if let Err(e) = self.ledger.forget(&r).await {
+            tracing::warn!(target: "ruum::runtime", code = e.code(), "the seal ledger kept the marks of a deleted record");
+        }
     }
 
     fn key(&self) -> &RecordKey {
@@ -1631,16 +1650,11 @@ impl Inner {
                             .delete(Kind::ConfigMap, &object_name(id), None)
                             .await;
                         // The record's uid never comes back, so its marks in the shared ledger
-                        // go with it (backlog I620-9). A failure leaves rows that no seal opens.
+                        // go with it once it is gone (backlog I620-9). A failure leaves rows that
+                        // no seal opens.
                         if deleted.is_ok() && !record_uid.is_empty() {
-                            let r = RecordRef {
-                                tenant: rec.identity.tenant,
-                                instance: id,
-                                record_uid: record_uid.clone(),
-                            };
-                            if let Err(e) = self.ledger.forget(&r).await {
-                                tracing::warn!(target: "ruum::runtime", code = e.code(), "the seal ledger kept the marks of a deleted record");
-                            }
+                            self.forget_deleted(rec.identity.tenant, id, &record_uid)
+                                .await;
                         }
                         self.drop_local(id);
                     }
@@ -2011,12 +2025,23 @@ impl Inner {
         // over every try was put back.
         let mut tries = 0;
         let (rec, rv, rec_uid, s) = loop {
-            let (rec, rv, rec_uid) = match self.record_with_uid(id).await {
-                Ok(r) => r,
+            let cm = match self.reload(id).await {
+                Ok(cm) => cm,
                 Err(RuntimeError::NotFound { .. }) => {
                     return Err(refuse("the instance has no record"));
                 }
                 Err(_) => return Err(not_ready("the record cannot be read")),
+            };
+            // A record the API server is deleting (a finalizer holds it) launches nothing: the
+            // sweep may have forgotten its ledger rows (Kimi, run 17, finding 1).
+            if cm
+                .pointer("/metadata/deletionTimestamp")
+                .is_some_and(|t| !t.is_null())
+            {
+                return Err(refuse("the instance record is being deleted"));
+            }
+            let Ok((rec, rv, rec_uid)) = record_parts(&cm) else {
+                return Err(not_ready("the record cannot be read"));
             };
             if rec.instance != id {
                 return Err(refuse("the record is another instance's"));
@@ -2668,14 +2693,9 @@ impl RuntimeDriver for KubeDriver {
             if deleted.is_ok()
                 && let Some(record_uid) = made_uid
             {
-                let r = RecordRef {
-                    tenant: rec.identity.tenant,
-                    instance: id,
-                    record_uid,
-                };
-                if let Err(e) = inner.ledger.forget(&r).await {
-                    tracing::warn!(target: "ruum::runtime", code = e.code(), "the seal ledger did not forget a record that failed to start");
-                }
+                inner
+                    .forget_deleted(rec.identity.tenant, id, &record_uid)
+                    .await;
             }
             inner.locals.lock().expect("locals lock").remove(&id);
             return Err(e);
@@ -3035,6 +3055,22 @@ fn canonical(ip: IpAddr) -> IpAddr {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
         v4 => v4,
     }
+}
+
+/// The record, its `resourceVersion` and its `metadata.uid` of an instance record ConfigMap.
+fn record_parts(cm: &Value) -> Result<(Record, String, String), RuntimeError> {
+    let uid = cm
+        .pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| RuntimeError::Internal {
+            reason: "an instance record has no uid".to_owned(),
+        })?
+        .to_owned();
+    let (rec, rv) = pod::read_record(cm).ok_or_else(|| RuntimeError::Internal {
+        reason: "an instance record does not read".to_owned(),
+    })?;
+    Ok((rec, rv, uid))
 }
 
 /// The addresses of a pod in its status (`podIPs` and `podIP`; the kubelet writes them).
