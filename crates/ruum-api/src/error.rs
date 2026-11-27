@@ -81,8 +81,10 @@ pub fn user_page(path: &str) -> &'static str {
 /// Middleware: the hint of a `403 user_required` answer names the page of the web UI where the
 /// user does it, with the public URL (`ask the user to do this at https://.../agents`), so an
 /// agent can tell its user where to go (decision 0003-7, BENCHMARK fix 6). MCP tool calls run
-/// through the same router, so they get the same hint. A hint that already is a web URL of a
-/// space page (`<public URL>/t/...`, decision 0004-20) stays as the handler wrote it.
+/// through the same router, so they get the same hint. A more specific hint stays as the handler
+/// wrote it ([`keeps_hint`]): a web URL of a space page (`<public URL>/t/...`, decision 0004-20),
+/// or a hint code that tells the agent what to do instead (decision 0004-26, for example
+/// `dry_run_on_draft_branch`: make a branch and dry-run there).
 pub async fn user_required_hint(
     axum::extract::State(state): axum::extract::State<crate::AppState>,
     req: axum::extract::Request,
@@ -107,12 +109,9 @@ pub async fn user_required_hint(
     if v["error"]["code"] != "user_required" {
         return Response::from_parts(parts, axum::body::Body::from(bytes));
     }
-    // A handler that names the exact page already (decision 0004-20, C-16: for example the
-    // Columns tab of a database for `confirmColumnClasses`) keeps its hint.
-    let origin = state.config.public_url.trim_end_matches('/');
     if v["error"]["hint"]
         .as_str()
-        .is_some_and(|h| h.starts_with(&format!("{origin}/t/")))
+        .is_some_and(|h| keeps_hint(h, &state.config.public_url))
     {
         return Response::from_parts(parts, axum::body::Body::from(bytes));
     }
@@ -129,10 +128,29 @@ pub async fn user_required_hint(
     Response::from_parts(parts, axum::body::Body::from(out))
 }
 
+/// Whether the hint of a `user_required` answer is more specific than the page of the web UI that
+/// [`user_required_hint`] would write, so it stays:
+///
+/// - a web URL of a space page (`<public URL>/t/...`; decision 0004-20, C-16: for example the
+///   Columns tab of a database for `confirmColumnClasses`);
+/// - a hint code (decision 0004-26): one word of lower-case ASCII letters, digits and `_` that
+///   starts with a letter, such as `dry_run_on_draft_branch`. The generic hint of
+///   `Error::user_required` ("ask the user to do it in the web UI") is a sentence, so it is
+///   still replaced by the page.
+pub fn keeps_hint(hint: &str, public_url: &str) -> bool {
+    let origin = public_url.trim_end_matches('/');
+    if hint.starts_with(&format!("{origin}/t/")) {
+        return true;
+    }
+    let mut chars = hint.chars();
+    chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{render, user_page};
-    use ruum_core::{ApiError, ErrorCode};
+    use super::{keeps_hint, render, user_page, user_required_hint};
+    use ruum_core::{ApiError, Error, ErrorCode};
 
     #[tokio::test]
     async fn render_sends_the_status_sqlstate_and_retry_after() {
@@ -168,5 +186,78 @@ mod tests {
         assert_eq!(user_page("/v1/tenants/t"), "/settings");
         assert_eq!(user_page("/v1/tenants"), "/settings");
         assert_eq!(user_page("/v1/me/app-passwords"), "/account");
+    }
+
+    #[test]
+    fn hint_codes_and_space_pages_are_kept() {
+        let url = "https://ruum.localhost/";
+        assert!(keeps_hint("dry_run_on_draft_branch", url));
+        assert!(keeps_hint("write_grant_required", url));
+        assert!(keeps_hint(
+            "https://ruum.localhost/t/acme/n/1?tab=columns",
+            url
+        ));
+        assert!(!keeps_hint("ask the user to do it in the web UI", url));
+        assert!(!keeps_hint("", url));
+        assert!(!keeps_hint("Dry_run", url));
+        assert!(!keeps_hint("_x", url));
+        assert!(!keeps_hint("dry-run", url));
+        assert!(!keeps_hint("see https://ruum.localhost/t/x", url));
+        assert!(!keeps_hint("https://evil.example/t/acme", url));
+    }
+
+    /// T-81: the middleware keeps a hint code (decision 0004-26) and still names the page for
+    /// the generic `user_required` hint.
+    #[tokio::test]
+    async fn the_middleware_keeps_a_hint_code_and_rewrites_the_generic_hint() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+        let (_, _, state) = crate::routes::auth::tests::app();
+        let app = axum::Router::new()
+            .route(
+                "/v1/databases/x/migrations",
+                get(|| async {
+                    crate::error::HttpError(Error::Api(
+                        ApiError::new(ErrorCode::UserRequired, "only on a draft branch")
+                            .with_hint("dry_run_on_draft_branch"),
+                    ))
+                }),
+            )
+            .route(
+                "/v1/agents",
+                get(|| async { crate::error::HttpError(Error::user_required()) }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                user_required_hint,
+            ))
+            .with_state(state.clone());
+        let call = |path: &'static str| {
+            let app = app.clone();
+            async move {
+                let res = app
+                    .oneshot(
+                        axum::http::Request::get(path)
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(res.status().as_u16(), 403);
+                let body = axum::body::to_bytes(res.into_body(), 65536).await.unwrap();
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+            }
+        };
+        let v = call("/v1/databases/x/migrations").await;
+        assert_eq!(v["error"]["code"], "user_required");
+        assert_eq!(v["error"]["hint"], "dry_run_on_draft_branch", "{v}");
+        let v = call("/v1/agents").await;
+        assert_eq!(v["error"]["code"], "user_required");
+        let origin = state.config.public_url.trim_end_matches('/');
+        assert_eq!(
+            v["error"]["hint"],
+            format!("ask the user to do this in the Ruum web UI at {origin}/agents"),
+            "{v}"
+        );
     }
 }
