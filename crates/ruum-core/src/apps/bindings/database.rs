@@ -66,7 +66,7 @@ use crate::databases::app_roles::{AppRoles, MAX_CREDENTIAL_LIFETIME};
 use crate::databases::branches::CreateBranch;
 use crate::databases::{DatabaseRow, DatabaseService};
 use crate::error::{ApiError, Error, ErrorCode, Result};
-use crate::ids::{NodeId, PrincipalId, TenantId};
+use crate::ids::{NodeId, PrincipalId, TenantId, UserId};
 use crate::nodes::{NodeStore, OnConflict};
 use crate::providers::{DataCopy, ProviderState};
 use crate::runtime::{EnvValue, EnvVar, SecretValue};
@@ -118,6 +118,12 @@ pub struct DatabaseBindings {
     /// trash a branch that a new preview of the same draft just chose: that preview then fails
     /// its wait (fail closed; backlog B1D-4).
     branch_lock: tokio::sync::Mutex<()>,
+    /// Test seam: the next row of a preview whose branch was just made fails to be written.
+    #[cfg(test)]
+    pub(crate) fail_next_row: std::sync::atomic::AtomicBool,
+    /// Test seam: the next [`Self::drop_roles`] fails.
+    #[cfg(test)]
+    pub(crate) fail_next_drop: std::sync::atomic::AtomicBool,
 }
 
 impl DatabaseBindings {
@@ -140,6 +146,10 @@ impl DatabaseBindings {
             branch_wait,
             sslmode,
             branch_lock: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            fail_next_row: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_drop: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -211,6 +221,15 @@ impl DatabaseBindings {
     /// Drops the roles of `rows` (their sessions end within 5 seconds). The caller revokes the
     /// rows after this (the role goes before its row).
     pub(crate) async fn drop_roles(&self, tenant: TenantId, rows: &[BindingRow]) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_drop
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::Internal(
+                "test: the role could not be dropped".into(),
+            ));
+        }
         for b in rows.iter().filter(|b| b.kind != BindingKind::Api) {
             self.roles.revoke_binding(tenant, b.id).await?;
         }
@@ -270,11 +289,31 @@ impl DatabaseBindings {
         b: &BindingRow,
     ) -> Result<()> {
         let _choice = self.branch_lock.lock().await;
+        let Some(user) = b.granted_by.effective_user() else {
+            return Ok(());
+        };
+        let ctx = platform_ctx(tenant, b.app_node_id, user);
+        self.trash_unused_locked(store, nodes, &ctx, b.target_node_id, false)
+            .await
+    }
+
+    /// Trashes the branch `branch` when no active row uses it (only a branch, never a live
+    /// database), with `ctx` ([`platform_ctx`]). The caller holds `branch_lock`. With
+    /// `made`, `branch` is the node that `create_branch` just returned (a branch, whose
+    /// `databases` row may not be written yet); else its row must say it is a branch.
+    async fn trash_unused_locked(
+        &self,
+        store: &dyn AppStore,
+        nodes: &dyn NodeStore,
+        ctx: &Context,
+        branch: NodeId,
+        made: bool,
+    ) -> Result<()> {
         let active = store
             .list_bindings(
-                tenant,
+                ctx.tenant,
                 &BindingQuery {
-                    target: Some(b.target_node_id),
+                    target: Some(branch),
                     active_only: true,
                     limit: 1,
                     ..Default::default()
@@ -285,32 +324,44 @@ impl DatabaseBindings {
             return Ok(());
         }
         // Only a branch goes, never a live database.
-        match self.row(tenant, b.target_node_id).await? {
-            Some(r) if r.branch_of.is_some() => {}
-            _ => return Ok(()),
+        if !made {
+            match self.row(ctx.tenant, branch).await? {
+                Some(r) if r.branch_of.is_some() => {}
+                _ => return Ok(()),
+            }
         }
-        let Some(user) = b.granted_by.effective_user() else {
-            return Ok(());
-        };
-        let ctx = Context {
-            tenant,
-            actor: Actor {
-                actor: PrincipalRef {
-                    kind: PrincipalKind::App,
-                    id: PrincipalId(b.app_node_id.0),
-                },
-                on_behalf_of: Some(user),
-            },
-            scope: None,
-            idempotency_key: None,
-        };
-        match nodes.trash(&ctx, b.target_node_id, None).await {
+        match nodes.trash(ctx, branch, None).await {
             Ok(_) => Ok(()),
             // In the trash already, or gone.
             Err(Error::Api(e)) if matches!(e.code, ErrorCode::Conflict | ErrorCode::NotFound) => {
                 Ok(())
             }
             Err(e) => Err(e),
+        }
+    }
+
+    /// Trashes, best effort, a branch that the stage `bindings` of a preview just made when the
+    /// write of its row failed: no row names it, so no end and no repair would ever trash it
+    /// (and it would count against the plan's branch limit, B1D-3). The caller holds
+    /// `branch_lock`. A failure is logged (backlog B1D-9: a sweep of such branches).
+    async fn trash_new_branch(
+        &self,
+        store: &dyn AppStore,
+        nodes: &dyn NodeStore,
+        ctx: &Context,
+        app: NodeId,
+        branch: NodeId,
+    ) {
+        let Some(user) = ctx.actor.effective_user() else {
+            return;
+        };
+        let as_app = platform_ctx(ctx.tenant, app, user);
+        if let Err(e) = self
+            .trash_unused_locked(store, nodes, &as_app, branch, true)
+            .await
+        {
+            tracing::warn!(tenant = %ctx.tenant, %branch, error = %e,
+                "could not trash the branch of a preview whose row was not written");
         }
     }
 
@@ -378,6 +429,23 @@ impl DatabaseBindings {
             tracing::warn!(%tenant, %target, fixes = fixed, "the binding repair fixed app roles");
         }
         Ok(fixed)
+    }
+}
+
+/// The platform acting on a preview's branch: the app `app` as actor, on behalf of `user`, with
+/// no scope (backlog B1D-1).
+fn platform_ctx(tenant: TenantId, app: NodeId, user: UserId) -> Context {
+    Context {
+        tenant,
+        actor: Actor {
+            actor: PrincipalRef {
+                kind: PrincipalKind::App,
+                id: PrincipalId(app.0),
+            },
+            on_behalf_of: Some(user),
+        },
+        scope: None,
+        idempotency_key: None,
     }
 }
 
@@ -468,10 +536,11 @@ impl AppService {
                     }
                 }
             }
-            let branch = match reuse {
-                Some(b) => b,
+            let (branch, made) = match reuse {
+                Some(b) => (b, false),
                 None => {
-                    db.databases
+                    let made = db
+                        .databases
                         .create_branch(
                             ctx,
                             r.target,
@@ -485,32 +554,55 @@ impl AppService {
                         .map_err(|e| branch_refusal(&r.name, e))?
                         .value
                         .node
-                        .id
+                        .id;
+                    (made, true)
                 }
             };
-            let rows = d
-                .store
-                .grant_bindings(
-                    ctx,
-                    &*d.authz,
-                    vec![super::super::store::NewBinding {
-                        id: Uuid::now_v7(),
-                        app_node_id: app,
-                        deployment_id: deployment,
-                        principal_id: deployment,
-                        name: r.name.clone(),
-                        kind: BindingKind::DatabaseBranch,
-                        target_node_id: branch,
-                        role: Some(role),
-                        api: None,
-                        scopes: Vec::new(),
-                        on_behalf_of_user: r.on_behalf_of_user,
-                    }],
-                )
-                .await?;
-            rows.into_iter()
-                .next()
-                .ok_or_else(|| Error::Internal("no binding row was written".into()))?
+            let written = async {
+                #[cfg(test)]
+                if db
+                    .fail_next_row
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(Error::Internal("test: the row was not written".into()));
+                }
+                d.store
+                    .grant_bindings(
+                        ctx,
+                        &*d.authz,
+                        vec![super::super::store::NewBinding {
+                            id: Uuid::now_v7(),
+                            app_node_id: app,
+                            deployment_id: deployment,
+                            principal_id: deployment,
+                            name: r.name.clone(),
+                            kind: BindingKind::DatabaseBranch,
+                            target_node_id: branch,
+                            role: Some(role),
+                            api: None,
+                            scopes: Vec::new(),
+                            on_behalf_of_user: r.on_behalf_of_user,
+                        }],
+                    )
+                    .await
+                    .and_then(|rows| {
+                        rows.into_iter()
+                            .next()
+                            .ok_or_else(|| Error::Internal("no binding row was written".into()))
+                    })
+            }
+            .await;
+            match written {
+                Ok(row) => row,
+                Err(e) => {
+                    // A branch made here that no row names would never be trashed.
+                    if made {
+                        db.trash_new_branch(&*d.store, &*d.nodes, ctx, app, branch)
+                            .await;
+                    }
+                    return Err(e);
+                }
+            }
         };
         db.wait_ready(ctx, row.target_node_id).await?;
         // Fail closed: the target is a masked branch of the bound database, nothing else.

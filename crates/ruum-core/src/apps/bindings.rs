@@ -911,14 +911,24 @@ impl AppService {
                     Ok(row) => granted.push(row),
                     Err(e) => {
                         // The row of this binding, if it was written, ends with the others.
-                        let mine = self.preview_rows(ctx.tenant, deployment).await?;
-                        self.ends()
-                            .revoke(
-                                &app_ctx(ctx.tenant, app),
-                                &mine,
-                                RevokeReason::PreviewExpired,
-                            )
-                            .await?;
+                        // The answer stays `e`: a failure of this clean-up is logged, and the
+                        // end of the run (`end_preview_bindings`) and the repair finish it.
+                        let clean = async {
+                            let mine = self.preview_rows(ctx.tenant, deployment).await?;
+                            self.ends()
+                                .revoke(
+                                    &app_ctx(ctx.tenant, app),
+                                    &mine,
+                                    RevokeReason::PreviewExpired,
+                                )
+                                .await
+                        }
+                        .await;
+                        if let Err(c) = clean {
+                            tracing::warn!(tenant = %ctx.tenant, %app, %deployment, error = %c,
+                                "could not end the rows of a failed stage `bindings`; \
+                                 the end of the run and the repair will");
+                        }
                         return Err(e);
                     }
                 }

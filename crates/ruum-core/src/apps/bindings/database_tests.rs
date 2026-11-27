@@ -574,6 +574,94 @@ async fn a_view_only_deployer_fails_at_the_stage() {
         .await;
 }
 
+/// Review of B-1d, change 2: a branch that the stage made for a preview whose row could not be
+/// written goes to the trash (no row names it, so no end and no repair would). The next preview
+/// of the same draft makes a new branch and is ready.
+#[tokio::test]
+async fn a_branch_whose_row_was_not_written_goes_to_the_trash() {
+    use std::sync::atomic::Ordering;
+    let w = world().await;
+    let live = w.database(w.data, "Shop", "postgres").await;
+    let app = w.app(&w.a(), w.data, "Shop app").await;
+    let yaml = bound("shop", live, "edit");
+    w.db().fail_next_row.store(true, Ordering::SeqCst);
+    let d = w.deploy(&w.a(), app, &yaml, Some("feature")).await.unwrap();
+    let d = w.settled(&w.a(), app, d.id).await;
+    assert_eq!(d.state, DeploymentState::Failed, "{:?}", d.stages);
+    assert!(!w.db().fail_next_row.load(Ordering::SeqCst), "the seam ran");
+    assert!(w.active_of(d.id).await.is_empty());
+    // The branch node (its `databases` row may come only when it is ready) is in the trash.
+    let branches: Vec<NodeId> =
+        w.s.nodes
+            .list_trash(&w.a(), true, crate::paging::PageRequest::default())
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .filter(|n| n.name.starts_with("preview shop"))
+            .map(|n| n.id)
+            .collect();
+    assert_eq!(
+        branches.len(),
+        1,
+        "the branch went to the trash: {:?}",
+        d.stages
+    );
+    let made = branches[0];
+    // Positive control: the next preview of the draft gets a branch of its own and is ready.
+    let next = w.ready(&w.a(), app, &yaml, Some("feature")).await;
+    let r = &w.active_of(next).await[0];
+    assert_ne!(r.target_node_id, made);
+    assert!(!w.in_trash(r.target_node_id).await);
+}
+
+/// Review of B-1d, change 3: when a database binding fails at the stage `bindings` and the
+/// clean-up of the rows written so far fails too, the stage answers the first error (here
+/// `403 binding_not_allowed`, B1D-D1), not the clean-up's; the end of the run finishes the
+/// clean-up.
+#[tokio::test]
+async fn a_failed_stage_answers_its_own_error_when_the_clean_up_fails() {
+    use std::sync::atomic::Ordering;
+    let w = world().await;
+    let readonly = w.database(w.shared, "Readonly", "postgres").await;
+    let app = w.app(&w.a(), w.data, "Shop app").await;
+    // Bob holds edit on Data (the folder binding's row is written first) and view on Shared
+    // (the database binding passes the check; its branch is refused at the stage).
+    let data = w.data;
+    let yaml = format!(
+        "runtime: static\nbindings:\n  files:\n    node: \"node:{data}\"\n    role: view\n  \
+         reports:\n    node: \"node:{readonly}\"\n    role: view\n"
+    );
+    w.db().fail_next_drop.store(true, Ordering::SeqCst);
+    let d = w.deploy(&w.b(), app, &yaml, None).await.unwrap();
+    let d = w.settled(&w.b(), app, d.id).await;
+    assert_eq!(d.state, DeploymentState::Failed, "{:?}", d.stages);
+    assert!(
+        !w.db().fail_next_drop.load(Ordering::SeqCst),
+        "the clean-up ran and failed: {:?}",
+        d.stages
+    );
+    let stage = d.stages.iter().find(|s| s["name"] == "bindings").unwrap();
+    assert_eq!(stage["state"], "failed", "{stage}");
+    assert_eq!(stage["error"]["hint"], "binding_not_allowed", "{stage}");
+    assert_eq!(stage["error"]["details"]["binding"], "reports", "{stage}");
+    // The end of the run (and the repair) finish what the stage left.
+    w.s.apps
+        .end_preview_bindings(w.team.id, Some(app))
+        .await
+        .unwrap();
+    assert!(w.active_of(d.id).await.is_empty());
+    let ended = w
+        .rows(BindingQuery {
+            principal: Some(d.id),
+            ..Default::default()
+        })
+        .await;
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert_eq!(ended[0].name, "files");
+    assert!(w.engine_roles(readonly).await.is_empty());
+}
+
 // ------------------------------------------------------------------ live
 
 /// Done when 3: a publish gives the live principal a `node` row on the live database and a
@@ -904,6 +992,14 @@ async fn the_environment_of_a_start() {
 /// The Postgres engine of the data cluster, or `None` (skipped; never in CI or with
 /// `RUUM_DBENGINE_REQUIRE_POSTGRES`).
 async fn pg_engine() -> Option<Arc<dyn ruum_dbengine::DatabaseEngine>> {
+    pg_engine_with_share(None).await
+}
+
+/// The same with the tenant share `share` (`None`: the engine's default, a tenth of the
+/// budget).
+async fn pg_engine_with_share(
+    share: Option<u32>,
+) -> Option<Arc<dyn ruum_dbengine::DatabaseEngine>> {
     let required = std::env::var_os("CI").is_some()
         || std::env::var_os("RUUM_DBENGINE_REQUIRE_POSTGRES").is_some();
     let Some(mut config) = ruum_dbengine::postgres::PostgresConfig::from_env() else {
@@ -917,6 +1013,7 @@ async fn pg_engine() -> Option<Arc<dyn ruum_dbengine::DatabaseEngine>> {
     // The test databases and their app roles stay in the shared cluster (as in the engine
     // tests): they do not count against the app connection budget.
     config.app_connection_budget = Some(1_000_000);
+    config.app_tenant_share = share;
     match ruum_dbengine::postgres::PostgresEngine::connect(config).await {
         Ok(e) => Some(Arc::new(e)),
         Err(e) => {
@@ -990,16 +1087,9 @@ fn secret_of(env: &[crate::runtime::EnvVar], name: &str) -> String {
     }
 }
 
-/// Done when 4 and 6 on the data cluster: the credentials of a preview on its masked branch
-/// and of the live app on the live database, each reaching only its own database; the
-/// `ruum_mask` functions refused; `app_read` cannot write; the password in no journal entry,
-/// answer or `Debug` output; after the end of the binding the credentials fail within 5 s.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn database_bindings_on_the_data_cluster() {
+/// A world whose databases live on the data cluster of `engine`, with database bindings on.
+async fn pg_world(engine: Arc<dyn ruum_dbengine::DatabaseEngine>) -> World {
     use crate::databases::{DatabaseParts, Engines};
-    let Some(engine) = pg_engine().await else {
-        return;
-    };
     let mut w = world().await;
     let parts = DatabaseParts {
         engines: Engines {
@@ -1016,6 +1106,19 @@ async fn database_bindings_on_the_data_cluster() {
     };
     crate::databases::install(&mut w.s, parts).unwrap();
     enable(&w.s, w.store.clone());
+    w
+}
+
+/// Done when 4 and 6 on the data cluster: the credentials of a preview on its masked branch
+/// and of the live app on the live database, each reaching only its own database; the
+/// `ruum_mask` functions refused; `app_read` cannot write; the password in no journal entry,
+/// answer or `Debug` output; after the end of the binding the credentials fail within 5 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn database_bindings_on_the_data_cluster() {
+    let Some(engine) = pg_engine().await else {
+        return;
+    };
+    let w = pg_world(engine.clone()).await;
     let live = w.database(w.data, "Shop", "postgres").await;
     let other = w.database(w.data, "Other", "postgres").await;
     run_sql(
@@ -1183,4 +1286,58 @@ async fn database_bindings_on_the_data_cluster() {
     assert!(connect(&live_url).await.is_err());
     assert!(connect(&shop).await.is_err());
     assert!(start.elapsed() < Duration::from_secs(5) + Duration::from_secs(2));
+}
+
+/// The tenant share that `scripts/dev.sh env` sets for the dev data cluster
+/// (`RUUM_DATA_APP_TENANT_SHARE`): ten app roles of 5 connections.
+const DEV_TENANT_SHARE: u32 = 50;
+/// The app budget of the dev data cluster (`max_connections=200` in
+/// `deploy/dev/postgres-data/Dockerfile`; the engine's default budget is half of it).
+const DEV_APP_BUDGET: u32 = 200 / 2;
+
+/// Review of B-1d, change 1: the tenant share on the dev data cluster against the card's own
+/// flow (publish an app with one database binding, then two previews of a draft; each new
+/// preview holds a role while the one it supersedes keeps its role to the end of the run). The
+/// engine's default share (a tenth of the budget: 10, two roles) refuses the first draft preview
+/// after the publish (`403 plan_limit_reached`, hint `app_connection_budget`); the share of the
+/// dev settings fits. The share is per tenant and each world is a new tenant, so the cluster
+/// wide budget stays overridden (B1D-8) without hiding the share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_dev_share_fits_a_publish_and_two_draft_previews() {
+    for (share, fits) in [(DEV_APP_BUDGET / 10, false), (DEV_TENANT_SHARE, true)] {
+        let Some(engine) = pg_engine_with_share(Some(share)).await else {
+            return;
+        };
+        let w = pg_world(engine).await;
+        let live = w.database(w.data, "Shop", "postgres").await;
+        let app = w.app(&w.a(), w.data, "Shop app").await;
+        let yaml = bound("shop", live, "edit");
+        let first = w.ready(&w.a(), app, &yaml, Some("feature")).await;
+        w.publish(&w.a(), app, first).await;
+        let second = w.deploy(&w.a(), app, &yaml, Some("feature")).await.unwrap();
+        let second = w.settled(&w.a(), app, second.id).await;
+        if !fits {
+            assert_eq!(
+                second.state,
+                DeploymentState::Failed,
+                "share {share}: {:?}",
+                second.stages
+            );
+            let stage = second
+                .stages
+                .iter()
+                .find(|s| s["name"] == "bindings")
+                .unwrap();
+            assert_eq!(stage["error"]["hint"], "app_connection_budget", "{stage}");
+            continue;
+        }
+        assert_eq!(
+            second.state,
+            DeploymentState::Ready,
+            "share {share}: {:?}",
+            second.stages
+        );
+        let third = w.ready(&w.a(), app, &yaml, Some("feature")).await;
+        assert_eq!(w.active_of(third).await.len(), 1);
+    }
 }
