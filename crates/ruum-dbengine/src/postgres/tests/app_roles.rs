@@ -568,19 +568,100 @@ async fn connection_limits_and_the_budget() {
     assert_eq!(again.role_name, role.role_name);
 }
 
-/// `temp_file_limit` is a role setting the app cannot raise (when the cluster set-up lets
-/// ruum_dbhost set it; the test grants that as the superuser).
+/// Backlog D5-10 (card B-1d): the app roles of one tenant hold at most the tenant's share of
+/// the app budget, counted across its databases under the budget lock; another tenant still
+/// gets a role, an existing role is no new connection, and the comment of a role names its
+/// tenant only by a neutral tag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tenant_holds_at_most_its_share_of_the_budget() {
+    let Some(engine) = engine_with(|c| c.app_tenant_share = Some(2 * c.app_connection_limit)).await
+    else {
+        return;
+    };
+    let a = Fixture::new(&engine).await;
+    // A second database of the same tenant.
+    let a2 = engine
+        .create_database(
+            &conformance::new_database(a.db().tenant_id),
+            &conformance::test_key().0,
+        )
+        .await
+        .unwrap()
+        .database;
+    let first = app_role(&a, RoleKind::AppRead, Uuid::now_v7()).await;
+    engine
+        .create_app_role(&a2, RoleKind::AppWrite, Uuid::now_v7())
+        .await
+        .expect("the second role fits the share");
+    for (db, what) in [(a.db(), "the same database"), (&a2, "another database")] {
+        match engine
+            .create_app_role(db, RoleKind::AppRead, Uuid::now_v7())
+            .await
+        {
+            Err(EngineError::PermissionDenied(m)) => assert_eq!(m, "app_connection_budget"),
+            other => panic!("a third role of the tenant on {what}: {other:?}"),
+        }
+    }
+    // The refused roles left no row.
+    assert_eq!(engine.app_roles(a.db()).await.unwrap().len(), 1);
+    assert_eq!(engine.app_roles(&a2).await.unwrap().len(), 1);
+    // An existing role is no new connection.
+    let again = engine
+        .create_app_role(a.db(), RoleKind::AppRead, first.binding)
+        .await
+        .unwrap();
+    assert_eq!(again.role_name, first.role_name);
+    // Another tenant has a share of its own.
+    let b = Fixture::new(&engine).await;
+    app_role(&b, RoleKind::AppRead, Uuid::now_v7()).await;
+    // The comment holds a tag, not the tenant ID.
+    let mut admin = engine.admin().await.unwrap();
+    let comment = psql(
+        &mut admin,
+        &format!(
+            "SELECT shobj_description(oid, 'pg_authid') FROM pg_roles WHERE rolname = {}",
+            lens::literal(&first.role_name)
+        ),
+    )
+    .await
+    .unwrap();
+    drop(admin);
+    assert_eq!(
+        comment,
+        crate::postgres::app_roles::tenant_tag(a.db().tenant_id)
+    );
+    assert!(
+        !comment.contains(&a.db().tenant_id.to_string()),
+        "{comment}"
+    );
+    assert!(
+        !comment.contains(&a.db().tenant_id.simple().to_string()),
+        "{comment}"
+    );
+}
+
+/// `temp_file_limit` is a role setting the app cannot raise. The cluster set-up
+/// (`deploy/dev/postgres-data/initdb/10-ruum-data.sh`) lets ruum_dbhost set it (backlog D5-3,
+/// card B-1d): no superuser grant here, and the engine requires the limit (the default).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn temp_file_limit_is_set_and_the_app_cannot_raise_it() {
     let Some(engine) = engine().await else { return };
-    if superuser(
-        "postgres",
-        "GRANT SET ON PARAMETER temp_file_limit TO ruum_dbhost",
-    )
-    .is_none()
-    {
-        return;
-    }
+    assert!(
+        engine.config.app_require_temp_file_limit,
+        "the tests run with the default"
+    );
+    let mut admin = engine.admin().await.unwrap();
+    assert_eq!(
+        psql(
+            &mut admin,
+            "SELECT has_parameter_privilege('temp_file_limit', 'SET')::text"
+        )
+        .await
+        .unwrap(),
+        "true",
+        "the cluster set-up grants SET on temp_file_limit to ruum_dbhost"
+    );
+    drop(admin);
     let f = seeded(&engine).await;
     let role = app_role(&f, RoleKind::AppWrite, Uuid::now_v7()).await;
     let mut s = login(

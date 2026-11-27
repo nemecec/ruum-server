@@ -20,6 +20,10 @@
 //! writes the row, and [`AppRoles::repair_node`] drops one that no binding asks for again.
 //! [`AppRoles`] serializes its own calls, so a repair never races an `ensure`.
 //!
+//! **Replicas.** The per-tenant cap holds across server replicas: `ensure_binding_role` takes
+//! [`AppRoleStore::lock_tenant`] (Postgres: an advisory lock of the platform database keyed by
+//! the tenant) from the count to the new row (backlog S-87, card B-1d).
+//!
 //! **Bounds.** A tenant has at most [`MAX_APP_ROLES_PER_TENANT`] app roles (`plan_limit_reached`
 //! beyond). With the engine's connection limit per role (5 on Postgres) a tenant holds at most
 //! 100 connections of the data cluster, and the engine refuses any app role over the cluster's
@@ -100,21 +104,85 @@ pub trait AppRoleStore: Send + Sync {
         kind: RoleKind,
         binding: Uuid,
     ) -> Result<()>;
+    /// A lock of the tenant's app roles that every server replica sees (backlog S-87): held
+    /// from the count of the tenant's rows to the write of a new row, so two replicas never
+    /// both make the 20th role. Released when the guard is dropped.
+    async fn lock_tenant(&self, tenant: TenantId) -> Result<TenantLock>;
+}
+
+/// The guard of [`AppRoleStore::lock_tenant`].
+pub struct TenantLock {
+    _held: Box<dyn Send>,
+}
+
+impl TenantLock {
+    fn new(held: impl Send + 'static) -> Self {
+        Self {
+            _held: Box::new(held),
+        }
+    }
+}
+
+/// How long [`AppRoleStore::lock_tenant`] waits for another replica.
+pub const TENANT_LOCK_WAIT: Duration = Duration::from_secs(10);
+
+fn tenant_lock_busy() -> Error {
+    Error::api(
+        ErrorCode::Unavailable,
+        "another server is changing the database roles of this space; try again",
+    )
 }
 
 // ---------------------------------------------------------------------------- the memory
 
 type Key = (TenantId, NodeId, RoleKind, Uuid);
 
-/// The in-memory store.
+/// The in-memory store. Built over the memory database store
+/// ([`MemoryAppRoleStore::with_databases`]), it drops the rows of a database that is gone
+/// before every read, so a purge on the in-memory services leaves no app role row (backlog
+/// D5-9; the Postgres purge deletes them with every `database_roles` row).
 #[derive(Default)]
 pub struct MemoryAppRoleStore {
     rows: Mutex<HashMap<Key, AppRoleRow>>,
+    databases: Option<Arc<dyn DatabaseStore>>,
+    locks: Mutex<HashMap<TenantId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl MemoryAppRoleStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The store over the database rows of `databases` (see the type docs).
+    pub fn with_databases(databases: Arc<dyn DatabaseStore>) -> Self {
+        Self {
+            databases: Some(databases),
+            ..Self::default()
+        }
+    }
+
+    /// Deletes the tenant's rows whose database row is gone.
+    async fn prune(&self, tenant: TenantId) -> Result<()> {
+        let Some(databases) = &self.databases else {
+            return Ok(());
+        };
+        let nodes: std::collections::BTreeSet<NodeId> = self
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| r.tenant_id == tenant)
+            .map(|r| r.node_id)
+            .collect();
+        for node in nodes {
+            if databases.get(tenant, node).await?.is_none() {
+                self.rows
+                    .lock()
+                    .unwrap()
+                    .retain(|k, _| !(k.0 == tenant && k.1 == node));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -127,6 +195,7 @@ impl AppRoleStore for MemoryAppRoleStore {
         kind: RoleKind,
         binding: Uuid,
     ) -> Result<Option<AppRoleRow>> {
+        self.prune(tenant).await?;
         Ok(self
             .rows
             .lock()
@@ -136,6 +205,7 @@ impl AppRoleStore for MemoryAppRoleStore {
     }
 
     async fn of_binding(&self, tenant: TenantId, binding: Uuid) -> Result<Vec<AppRoleRow>> {
+        self.prune(tenant).await?;
         let mut out: Vec<_> = self
             .rows
             .lock()
@@ -149,6 +219,7 @@ impl AppRoleStore for MemoryAppRoleStore {
     }
 
     async fn of_node(&self, tenant: TenantId, node: NodeId) -> Result<Vec<AppRoleRow>> {
+        self.prune(tenant).await?;
         let mut out: Vec<_> = self
             .rows
             .lock()
@@ -162,6 +233,7 @@ impl AppRoleStore for MemoryAppRoleStore {
     }
 
     async fn count(&self, tenant: TenantId) -> Result<u32> {
+        self.prune(tenant).await?;
         Ok(self
             .rows
             .lock()
@@ -194,6 +266,20 @@ impl AppRoleStore for MemoryAppRoleStore {
             .unwrap()
             .remove(&(tenant, node, kind, binding));
         Ok(())
+    }
+
+    async fn lock_tenant(&self, tenant: TenantId) -> Result<TenantLock> {
+        let lock = self
+            .locks
+            .lock()
+            .unwrap()
+            .entry(tenant)
+            .or_default()
+            .clone();
+        let held = tokio::time::timeout(TENANT_LOCK_WAIT, lock.lock_owned())
+            .await
+            .map_err(|_| tenant_lock_busy())?;
+        Ok(TenantLock::new(held))
     }
 }
 
@@ -337,6 +423,32 @@ impl AppRoleStore for PgAppRoleStore {
         tx.commit().await?;
         Ok(())
     }
+
+    /// A transaction-level advisory lock of the platform database, keyed by the tenant (the
+    /// key names `database_roles` and the tenant ID), in a transaction that the guard holds:
+    /// dropping the guard rolls it back and frees the lock.
+    async fn lock_tenant(&self, tenant: TenantId) -> Result<TenantLock> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "set local lock_timeout = '{}s'",
+            TENANT_LOCK_WAIT.as_secs()
+        )))
+        .execute(&mut *tx)
+        .await?;
+        let locked = sqlx::query(
+            "select pg_advisory_xact_lock(hashtext('database_roles'), hashtext($1::text))",
+        )
+        .bind(tenant)
+        .execute(&mut *tx)
+        .await;
+        match locked {
+            Ok(_) => Ok(TenantLock::new(tx)),
+            Err(sqlx::Error::Database(d)) if d.code().as_deref() == Some("55P03") => {
+                Err(tenant_lock_busy())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------- the service
@@ -349,6 +461,10 @@ pub struct AppRoles {
     max_roles: u32,
     /// Serializes the calls of this process (a repair never races an `ensure`).
     lock: tokio::sync::Mutex<()>,
+    /// A test seam of the S-87 race: `ensure_binding_role` waits (at most 2 s) for this
+    /// barrier after it counted the tenant's rows.
+    #[cfg(test)]
+    pub(crate) after_count: Mutex<Option<Arc<tokio::sync::Barrier>>>,
 }
 
 /// An engine error as a platform error. No engine text reaches a status; none holds a password.
@@ -408,7 +524,23 @@ impl AppRoles {
             engines,
             max_roles: MAX_APP_ROLES_PER_TENANT,
             lock: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            after_count: Mutex::new(None),
         }
+    }
+
+    /// The app role rows of the database `node` of `tenant` (the binding repair of card B-1d).
+    pub async fn rows_of_node(&self, tenant: TenantId, node: NodeId) -> Result<Vec<AppRoleRow>> {
+        self.store.of_node(tenant, node).await
+    }
+
+    /// The app role rows of a binding.
+    pub async fn rows_of_binding(
+        &self,
+        tenant: TenantId,
+        binding: Uuid,
+    ) -> Result<Vec<AppRoleRow>> {
+        self.store.of_binding(tenant, binding).await
     }
 
     /// The same, with another cap of app roles per tenant (tests).
@@ -460,8 +592,18 @@ impl AppRoles {
                 .with_hint("use a postgres database for an app binding"),
             ));
         }
+        // The tenant's lock of every replica (backlog S-87), from the count to the row.
+        let _tenant = self.store.lock_tenant(tenant).await?;
         let existing = self.store.get(tenant, node, kind, binding).await?;
-        if existing.is_none() && self.store.count(tenant).await? >= self.max_roles {
+        let count = self.store.count(tenant).await?;
+        #[cfg(test)]
+        {
+            let seam = self.after_count.lock().unwrap().clone();
+            if let Some(b) = seam {
+                let _ = tokio::time::timeout(Duration::from_secs(2), b.wait()).await;
+            }
+        }
+        if existing.is_none() && count >= self.max_roles {
             return Err(Error::Api(
                 ApiError::new(
                     ErrorCode::PlanLimitReached,
@@ -1053,6 +1195,129 @@ mod tests {
         let a = seed(&pool).await;
         let b = seed(&pool).await;
         store_cases(&PgAppRoleStore::new(pool.clone()), a, b).await;
+    }
+
+    /// Backlog S-87 (card B-1d): the cap of app roles per tenant holds across server replicas.
+    /// Two `AppRoles` instances (two replicas) on one platform database, the tenant at
+    /// `cap - 1` roles, both asked for a new role at once: one gets it, the other gets
+    /// `plan_limit_reached`. The seam makes both wait after their count, so without the
+    /// tenant lock both would count `cap - 1` and both make a role.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_tenant_cap_holds_across_replicas(pool: sqlx::PgPool) {
+        let (t, node, _) = seed_node(&pool, "postgres").await;
+        let engines = Engines::memory();
+        let engine = engines.get(EngineKind::Postgres).unwrap().clone();
+        let created = engine
+            .create_database(
+                &ruum_dbengine::NewDatabase {
+                    tenant_id: t.0,
+                    node_id: node.0,
+                    engine_version: "17".into(),
+                    extensions: Vec::new(),
+                },
+                &ruum_dbengine::conformance::test_key().0,
+            )
+            .await
+            .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("set local ruum.system = 'on'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "insert into databases (tenant_id, node_id, engine, engine_version, cluster, \
+             engine_name, extensions, size_bytes) \
+             values ($1, $2, 'postgres', '17', $3, $4, '{}', 0)",
+        )
+        .bind(t)
+        .bind(node)
+        .bind(&created.database.cluster)
+        .bind(&created.database.engine_name)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let store: Arc<dyn AppRoleStore> = Arc::new(PgAppRoleStore::new(pool.clone()));
+        let databases: Arc<dyn DatabaseStore> =
+            Arc::new(super::super::PgDatabaseStore::new(pool.clone()));
+        for _ in 0..MAX_APP_ROLES_PER_TENANT - 1 {
+            store
+                .put(&AppRoleRow {
+                    tenant_id: t,
+                    node_id: node,
+                    kind: RoleKind::AppRead,
+                    binding_id: Uuid::now_v7(),
+                    role_name: name(),
+                })
+                .await
+                .unwrap();
+        }
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let replica = || {
+            let r = AppRoles::new(store.clone(), databases.clone(), engines.clone());
+            *r.after_count.lock().unwrap() = Some(barrier.clone());
+            r
+        };
+        let (a, b) = (replica(), replica());
+        let (ra, rb) = tokio::join!(
+            a.ensure_binding_role(t, node, Uuid::now_v7(), RoleKind::AppRead),
+            b.ensure_binding_role(t, node, Uuid::now_v7(), RoleKind::AppWrite),
+        );
+        let made = [ra.is_ok(), rb.is_ok()].iter().filter(|x| **x).count();
+        assert_eq!(
+            made, 1,
+            "two replicas made {made} roles over the cap: {ra:?} {rb:?}"
+        );
+        let refused = if ra.is_ok() { rb } else { ra };
+        assert_eq!(code(refused), ErrorCode::PlanLimitReached);
+        assert_eq!(store.count(t).await.unwrap(), MAX_APP_ROLES_PER_TENANT);
+    }
+
+    /// Backlog D5-9 (card B-1d): the memory store over the memory database store leaves no app
+    /// role row after a purge of the database on the in-memory services.
+    #[tokio::test]
+    async fn a_purge_on_the_memory_services_leaves_no_app_role_row() {
+        let w = world().await;
+        let node = database(&w, "postgres", "Purged").await;
+        let keep = database(&w, "postgres", "Kept").await;
+        let store: Arc<dyn AppRoleStore> = Arc::new(MemoryAppRoleStore::with_databases(
+            w.handles.databases.clone(),
+        ));
+        let roles = service(&w, store.clone());
+        let t = w.team.id;
+        roles
+            .ensure_binding_role(t, node, Uuid::now_v7(), RoleKind::AppRead)
+            .await
+            .unwrap();
+        roles
+            .ensure_binding_role(t, keep, Uuid::now_v7(), RoleKind::AppRead)
+            .await
+            .unwrap();
+        assert_eq!(store.count(t).await.unwrap(), 2);
+        // The purge hook of the provider (what the reconciler delivers after `purgeNode`).
+        use crate::providers::Provider;
+        w.s.databases
+            .deps()
+            .provider
+            .deliver_hook(
+                crate::providers::DeliveryId::new(),
+                crate::providers::HookDelivery {
+                    hook: crate::providers::HookKind::Purged,
+                    tenant_id: t,
+                    node_id: Some(node),
+                    seq: Some(1),
+                    target_node_id: None,
+                    data: None,
+                    by: crate::actor::Actor::user(w.alice).into(),
+                    at: crate::now(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(w.handles.databases.get(t, node).await.unwrap().is_none());
+        assert!(store.of_node(t, node).await.unwrap().is_empty());
+        assert_eq!(store.count(t).await.unwrap(), 1);
+        assert_eq!(store.of_node(t, keep).await.unwrap().len(), 1);
     }
 
     /// Migration 0017 opens the kind check for the app kinds: an app row needs a binding, a

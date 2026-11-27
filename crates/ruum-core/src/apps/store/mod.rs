@@ -914,6 +914,18 @@ pub trait AppStore: Send + Sync {
     /// The binding rows of the tenant that match `q`, oldest first, at most `q.limit`.
     async fn list_bindings(&self, tenant: TenantId, q: &BindingQuery) -> Result<Vec<BindingRow>>;
 
+    /// The active `database_branch` rows of the app's binding `name` whose preview has the
+    /// draft label `draft`, oldest first, at most `limit` (card B-1d: a preview of the same
+    /// draft reuses the masked branch of the one it supersedes).
+    async fn draft_branch_bindings(
+        &self,
+        tenant: TenantId,
+        app: NodeId,
+        name: &str,
+        draft: &str,
+        limit: u32,
+    ) -> Result<Vec<BindingRow>>;
+
     /// The active rows of the tenant's previews that ended (their deployment is not
     /// `pending`, `running` or `ready`), of one app or of all, at most `limit`.
     async fn ended_preview_bindings(

@@ -962,6 +962,34 @@ impl AppStore for MemoryAppStore {
             .collect())
     }
 
+    async fn draft_branch_bindings(
+        &self,
+        tenant: TenantId,
+        app: NodeId,
+        name: &str,
+        draft: &str,
+        limit: u32,
+    ) -> Result<Vec<BindingRow>> {
+        let st = self.st();
+        Ok(st
+            .bindings
+            .values()
+            .filter(|b| {
+                b.tenant_id == tenant
+                    && b.app_node_id == app
+                    && b.name == name
+                    && b.kind == BindingKind::DatabaseBranch
+                    && b.is_active()
+                    && st
+                        .deployments
+                        .get(&(tenant, b.deployment_id))
+                        .is_some_and(|d| d.draft.as_deref() == Some(draft))
+            })
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
     async fn ended_preview_bindings(
         &self,
         tenant: TenantId,

@@ -212,6 +212,45 @@ async fn settings_sql(
     Ok((sql, may))
 }
 
+/// The comment on an app role that names its tenant, for the tenant's share of the app budget
+/// (backlog D5-10, card B-1d): this text and [`tenant_tag`]. A comment is readable by every role
+/// of the cluster, so it holds a hash of the tenant ID, never the ID.
+const TENANT_TAG: &str = "ruum: app of ";
+
+/// The neutral tag of a tenant in [`TENANT_TAG`] comments: 16 hex characters of a SHA-256 of
+/// the tenant ID. It links the app roles of one tenant to each other (so the engine can sum
+/// them) and to nothing else.
+pub(crate) fn tenant_tag(tenant: Uuid) -> String {
+    let digest = Sha256::digest(format!("ruum tenant {tenant}").as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{TENANT_TAG}{}", &hex[..16])
+}
+
+/// The sum of the connection limits of the app roles of one tenant (by its [`tenant_tag`]).
+async fn tenant_used(conn: &mut PgConnection, tag: &str) -> Result<i64, EngineError> {
+    let row = sqlx::query(
+        "select coalesce(sum(rolconnlimit), 0)::int8 from pg_catalog.pg_roles
+          where rolname ~ '^r_[0-9a-f]{16}$' and rolconnlimit > 0
+            and pg_catalog.shobj_description(oid, 'pg_authid') = $1",
+    )
+    .persistent(false)
+    .bind(tag)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| internal("read the tenant's share of the app budget", e))?;
+    Ok(row.get(0))
+}
+
+/// The share of the app budget that one tenant's app roles may hold: the setting, or a tenth of
+/// the budget.
+fn tenant_share(engine: &PostgresEngine, budget: i64) -> i64 {
+    engine
+        .config
+        .app_tenant_share
+        .map(i64::from)
+        .unwrap_or(budget / 10)
+}
+
 /// The sum of the connection limits of every app role of the cluster, and the budget.
 async fn budget(
     engine: &PostgresEngine,
@@ -239,12 +278,15 @@ async fn budget(
 /// Makes the cluster role of an app (or nothing when it exists), with its settings and
 /// `CONNECT` on its own database, in one transaction under the budget lock. While the apps of
 /// its database are suspended (`login` false: the database is in the trash), the role is made,
-/// or made again, `NOLOGIN`.
+/// or made again, `NOLOGIN`. A new role must fit the cluster's app budget and the share of
+/// `tenant` (the tenant of the database's `ruum_meta.ident`; backlog D5-10); its comment names
+/// the tenant by [`tenant_tag`].
 async fn make_cluster_role(
     engine: &PostgresEngine,
     database: &str,
     name: &str,
     login: bool,
+    tenant: Uuid,
 ) -> Result<(), EngineError> {
     let mut admin = engine.admin().await?;
     let result = async {
@@ -271,10 +313,20 @@ async fn make_cluster_role(
                     "app_connection_budget".to_string(),
                 ));
             }
+            // The tenant's share of the budget (backlog D5-10): one tenant never takes the
+            // room of all the others. Checked under the same lock as the budget.
+            let tag = tenant_tag(tenant);
+            if tenant_used(&mut admin, &tag).await? + limit > tenant_share(engine, budget) {
+                return Err(EngineError::PermissionDenied(
+                    "app_connection_budget".to_string(),
+                ));
+            }
             let role = ident(name);
             let mut sql = format!(
                 "create role {role} login noinherit nosuperuser nocreatedb nocreaterole \
-                   noreplication nobypassrls connection limit {limit} password null;\n"
+                   noreplication nobypassrls connection limit {limit} password null;\n\
+                 comment on role {role} is {};\n",
+                literal(&tag)
             );
             if !login {
                 sql.push_str(&format!("alter role {role} nologin;\n"));
@@ -607,7 +659,9 @@ async fn create_locked(
             }
         };
         let login = !access_suspended(&mut conn).await?;
-        if let Err(e) = make_cluster_role(engine, &state.name, &row.role_name, login).await {
+        let tenant = ident_tenant(&mut conn, db).await?;
+        if let Err(e) = make_cluster_role(engine, &state.name, &row.role_name, login, tenant).await
+        {
             // Over the budget: no role and no row.
             if matches!(&e, EngineError::PermissionDenied(_)) {
                 let _ = sqlx::query("delete from ruum_meta.roles where role_name = $1")
@@ -632,6 +686,23 @@ async fn create_locked(
         role_name: row.role_name,
         suspended,
     })
+}
+
+/// The tenant of the database of `conn` (a `ruum_dbhost` connection), from its
+/// `ruum_meta.ident`: the database itself says whose share a new role counts against, not the
+/// caller. A database without the row (not a live database of this engine) is refused, and so
+/// is one whose tenant is not the tenant of `db`.
+async fn ident_tenant(conn: &mut PgConnection, db: &DatabaseRef) -> Result<Uuid, EngineError> {
+    let tenant: Option<Uuid> =
+        sqlx::query_scalar("select tenant_id from ruum_meta.ident where id = 1")
+            .persistent(false)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| internal("read the tenant of the database", e))?;
+    match tenant {
+        Some(t) if t == db.tenant_id => Ok(t),
+        _ => Err(EngineError::NotFound),
+    }
 }
 
 /// `app_roles`.
@@ -816,12 +887,19 @@ pub(crate) async fn credentials(
         return Err(internal("set the app role's password", e));
     }
     drop(admin);
+    // The address apps reach (card B-1d): the setting, else the engine's own address.
     let options = engine.config.connect_options();
+    let host = engine
+        .config
+        .app_host
+        .clone()
+        .unwrap_or_else(|| options.get_host().to_string());
+    let port = engine.config.app_port.unwrap_or_else(|| options.get_port());
     Ok(AppCredentials::new(
         row.role_name,
         state.name.clone(),
-        options.get_host().to_string(),
-        options.get_port(),
+        host,
+        port,
         valid_until,
         password,
     ))

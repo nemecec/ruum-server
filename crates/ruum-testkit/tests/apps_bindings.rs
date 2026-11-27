@@ -1,5 +1,5 @@
-//! App acceptance cases of card B-1: bindings without database bindings (the grants of the
-//! preview and live principals, revocation, API bindings that wait for B-3). See
+//! App acceptance cases of cards B-1 and B-1d: bindings (the grants of the
+//! preview and live principals, database bindings, revocation, API bindings that wait for B-3). See
 //! `tests/common/apps.rs` for the rules (planned, pending, passed, failed) and
 //! `docs/TESTING.md`.
 

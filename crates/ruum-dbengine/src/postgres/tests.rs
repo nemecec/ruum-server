@@ -37,9 +37,8 @@ pub(super) async fn engine_with(tune: impl FnOnce(&mut PostgresConfig)) -> Optio
     // The test databases are never dropped, and their app roles (card D-5) stay in the shared
     // cluster: the tests do not count against the app connection budget (one test sets it).
     config.app_connection_budget = Some(1_000_000);
-    // The data clusters of the tests do not grant SET on temp_file_limit (backlog D5-3); the
-    // tests of that refusal turn it on again.
-    config.app_require_temp_file_limit = false;
+    // `app_require_temp_file_limit` stays on (the default): the cluster set-up grants SET on
+    // temp_file_limit to ruum_dbhost (backlog D5-3, card B-1d), so credentials are issued.
     tune(&mut config);
     match PostgresEngine::connect(config).await {
         Ok(e) => Some(e),

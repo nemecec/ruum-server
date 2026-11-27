@@ -304,6 +304,10 @@ pub struct AppParts {
     /// The runtime driver: the in-memory driver until card R-2a/I-4 give the real ones.
     pub runtime: Arc<dyn crate::runtime::RuntimeDriver>,
     pub roles: Arc<dyn roles::RoleStore>,
+    /// The store of the app roles of database bindings (card B-1d): the Postgres store with a
+    /// pool; `None` in memory, where [`install`] builds the memory store over the memory
+    /// database rows (backlog D5-9).
+    pub app_roles: Option<Arc<dyn crate::databases::app_roles::AppRoleStore>>,
 }
 
 /// The in-memory runtime driver, whose usage records go nowhere yet (a static image runs no
@@ -332,6 +336,7 @@ impl AppParts {
             config: AppConfig::default(),
             sites: static_site::StaticSites::in_memory(),
             runtime: memory_runtime(),
+            app_roles: None,
         }
     }
 
@@ -339,6 +344,9 @@ impl AppParts {
     pub fn postgres(pool: sqlx::PgPool) -> Self {
         Self {
             roles: Arc::new(roles::postgres::PgRoleStore::new(pool.clone())),
+            app_roles: Some(Arc::new(crate::databases::app_roles::PgAppRoleStore::new(
+                pool.clone(),
+            ))),
             store: Arc::new(store::postgres::PgAppStore::new(pool)),
             usage: Arc::new(MemoryUsageSink::new()),
             config: AppConfig::from_env(),
@@ -352,6 +360,7 @@ impl AppParts {
 /// `services`, registers it into the shared provider registry (next to `ruum.database`), and
 /// puts the service into `services.apps`. Call it after the database area is installed.
 pub fn install(services: &mut crate::Services, parts: AppParts) -> Result<()> {
+    let app_roles = parts.app_roles.clone();
     services.apps = build(
         services.nodes.clone(),
         services.authz.clone(),
@@ -364,7 +373,34 @@ pub fn install(services: &mut crate::Services, parts: AppParts) -> Result<()> {
             blobs: services.blobs.clone(),
         },
     )?;
+    install_database_bindings(services, app_roles);
     Ok(())
+}
+
+/// Turns on the database bindings of `services.apps` (card B-1d) over the database area of
+/// `services` (its service, store and engines) and `store`, the store of the app roles (`None`:
+/// the memory store over the database rows, backlog D5-9). [`install`] calls it; the in-memory
+/// services of the tests call it themselves. Without it a database binding answers `409
+/// bindings_not_ready` (fail closed).
+pub fn install_database_bindings(
+    services: &crate::Services,
+    store: Option<Arc<dyn crate::databases::app_roles::AppRoleStore>>,
+) {
+    let databases = services.databases.clone();
+    let rows = databases.deps().store.clone();
+    let store = store.unwrap_or_else(|| {
+        Arc::new(crate::databases::app_roles::MemoryAppRoleStore::with_databases(rows.clone()))
+    });
+    let roles = Arc::new(crate::databases::app_roles::AppRoles::new(
+        store,
+        rows,
+        services.database_engines.clone(),
+    ));
+    services
+        .apps
+        .set_database_bindings(Arc::new(bindings::database::DatabaseBindings::new(
+            roles, databases,
+        )));
 }
 
 /// The service and its provider, registered into `registry`.
@@ -445,6 +481,9 @@ pub struct AppService {
     /// The site locks of this process, one per tenant (backlog W2S-1); the store's lock
     /// serializes the processes.
     site_locks: static_gc::SiteLocks,
+    /// The database bindings (card B-1d), once [`install_database_bindings`] ran; shared with
+    /// the binding hooks.
+    db_bindings: bindings::database::DbSlot,
     /// A storage limit for every tenant instead of the plan's (the tests of the static quota).
     #[cfg(test)]
     storage_limit_override: std::sync::Mutex<Option<i64>>,
@@ -542,6 +581,7 @@ impl AppService {
             ),
             live_locks: deployments::LiveLocks::default(),
             site_locks: static_gc::SiteLocks::default(),
+            db_bindings: Default::default(),
             #[cfg(test)]
             storage_limit_override: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -553,6 +593,19 @@ impl AppService {
     /// [`deployments::LiveReleaseHook`]).
     pub fn add_live_hook(&self, hook: Arc<dyn deployments::LiveReleaseHook>) {
         self.hooks.write().expect("hook lock").push(hook);
+    }
+
+    /// Turns on the database bindings (card B-1d; [`install_database_bindings`]).
+    pub fn set_database_bindings(&self, db: Arc<bindings::database::DatabaseBindings>) {
+        *self.db_bindings.write().unwrap_or_else(|e| e.into_inner()) = Some(db);
+    }
+
+    /// The database bindings, when they are on.
+    pub fn database_bindings(&self) -> Option<Arc<bindings::database::DatabaseBindings>> {
+        self.db_bindings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Sets where deployments write the suggestions of `telemetry-privacy.yaml` (card O-2).
