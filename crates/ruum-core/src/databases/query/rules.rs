@@ -1031,7 +1031,8 @@ const TEXT_QUERY_FUNCTIONS: &[&str] = &[
 /// [`TEXT_QUERY_FUNCTIONS`], and dynamic SQL in a body (`EXECUTE` inside a string or body that
 /// is not `EXECUTE FUNCTION` / `EXECUTE PROCEDURE` of a trigger), whose text a check of names
 /// cannot see. Like the other rules this is a check of names: a function that the source
-/// already had and that runs text as SQL is not seen (backlog). `None` for SQLite. The `usize`
+/// already had and that runs text as SQL is not seen (backlog D2-8). Escapes that hide a
+/// name from a check of words (`U&`, `E'\...'`) are refused. `None` for SQLite. The `usize`
 /// is the 1-based number of the statement, as in [`check_migration`].
 pub fn migration_catalog_text_refusal(engine: EngineKind, up: &str) -> Option<(usize, Refusal)> {
     if engine != EngineKind::Postgres {
@@ -1062,6 +1063,27 @@ pub fn migration_catalog_text_refusal(engine: EngineKind, up: &str) -> Option<(u
             continue;
         }
         n += 1;
+        // A name or string written with escapes is not seen by a check of its words: Postgres
+        // reads `U&"\0070g_attrdef"` as `pg_attrdef`, also inside a DO or function body (whose
+        // SQL goes to the main parser), and `E'\x70g_proc'::regclass` as `'pg_proc'`. So escapes
+        // are refused: top-level `U&"..."` names, and `U&` or a backslash escape string (`E'`)
+        // anywhere in a string or body (review of D-2 landing, run 17, 1).
+        let unicode_string = group.windows(3).any(|w| {
+            matches!(w, [Token::Word(u), Token::Ampersand, t]
+                if u.quote_style.is_none()
+                    && u.value.eq_ignore_ascii_case("u")
+                    && !matches!(t, Token::Word(n) if n.quote_style.is_none()))
+        });
+        if unicode_string || check_unicode_names(group).is_err() {
+            return Some((n, refusal("a Unicode-escaped name or string (U&)".into())));
+        }
+        for t in &sig {
+            if !matches!(t, Token::Word(_))
+                && let Some(what) = escape_in_text(&t.to_string())
+            {
+                return Some((n, refusal(what.into())));
+            }
+        }
         // The words of the statement, in order; a word of a string or body is marked.
         let mut words: Vec<(String, bool)> = Vec::new();
         for t in &sig {
@@ -1092,7 +1114,52 @@ pub fn migration_catalog_text_refusal(engine: EngineKind, up: &str) -> Option<(u
                 return Some((n, refusal(format!("information_schema.{view}"))));
             }
             if *in_body && w == "execute" && !matches!(next, Some("function" | "procedure")) {
-                return Some((n, refusal("dynamic SQL (EXECUTE in a body)".into())));
+                return Some((
+                    n,
+                    refusal(
+                        "dynamic SQL (EXECUTE in a body; a string that holds the word execute \
+                         followed by a word other than function or procedure counts too, so \
+                         rephrase such a string)"
+                            .into(),
+                    ),
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// An escape in the text of a string or body token that a check of words cannot read
+/// ([`migration_catalog_text_refusal`]): `U&` directly before a quote (a Unicode-escaped name
+/// or string, also with `UESCAPE`), or an escape string (`E'`, also `E''` inside a quoted
+/// body) that holds a backslash before its closing quote. Fails closed: a literal that only
+/// looks like one (rare) is refused too.
+fn escape_in_text(text: &str) -> Option<&'static str> {
+    let lower = text.to_ascii_lowercase();
+    let b = lower.as_bytes();
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    for (i, &c) in b.iter().enumerate() {
+        let start = i == 0 || !word(b[i - 1]);
+        if c == b'u'
+            && start
+            && b.get(i + 1) == Some(&b'&')
+            && matches!(b.get(i + 2), Some(b'"' | b'\''))
+        {
+            return Some("a Unicode escape (U&) in a string or body");
+        }
+        if c == b'e' && start && b.get(i + 1) == Some(&b'\'') {
+            let mut j = i + 1;
+            while b.get(j) == Some(&b'\'') {
+                j += 1;
+            }
+            while let Some(&d) = b.get(j) {
+                if d == b'\'' {
+                    break;
+                }
+                if d == b'\\' {
+                    return Some("an escape string (E'...' with a backslash) in a string or body");
+                }
+                j += 1;
             }
         }
     }
@@ -1197,6 +1264,27 @@ mod migration_tests {
         refused("insert into sink select table_to_xml('people', true, true, '')::text");
         refused("insert into sink select column_default from information_schema.columns");
         refused("do $$ begin perform 1 from information_schema.routines; end $$");
+        // Escaped names and strings (review of D-2 landing, run 17, 1).
+        refused(
+            "do $$ begin insert into sink(id, v) select 1, U&\"\\0070g_get_expr\"(adbin, adrelid) \
+             from U&\"\\0070g_attrdef\"; end $$",
+        );
+        refused("do $$ begin insert into sink select 1 from u&\"\\0070g_attrdef\"; end $$");
+        refused(
+            "create function f() returns setof text language sql as 'select prosrc from \
+             U&\"\\0070g_proc\"'",
+        );
+        refused("do $$ begin perform 1 from U&\"!0070g_attrdef\" UESCAPE '!'; end $$");
+        refused("insert into sink select 1 from U&\"\\0070g_attrdef\"");
+        refused(
+            "insert into sink select relname from pg_class where oid = U&'\\0070g_rewrite'::regclass",
+        );
+        refused(
+            "insert into sink select relname from pg_class where oid = E'\\x70g_rewrite'::regclass",
+        );
+        refused(
+            "create function f() returns setof oid language sql as 'select E''\\x70g_proc''::regclass::oid'",
+        );
         // Allowed: plain DDL and DML, DO blocks without catalog text or dynamic SQL, triggers,
         // and catalog reads that show no free-form text.
         for up in [
@@ -1208,6 +1296,8 @@ mod migration_tests {
             "insert into beds select 1, relname from pg_class limit 1",
             "insert into beds select 1, table_name from information_schema.tables limit 1",
             "-- pg_proc in a comment\ncreate table c (id int)",
+            "insert into beds values (1, E'no escape here'), (2, 'menu & \"more\"'), (3, 'e')",
+            "create table e (id int); insert into beds values (4, 'a\\b')",
         ] {
             assert!(migration_catalog_text_refusal(pg, up).is_none(), "{up}");
         }
