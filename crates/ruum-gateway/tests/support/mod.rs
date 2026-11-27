@@ -211,6 +211,9 @@ pub struct Instances {
 
 type Tasks = Vec<tokio::task::JoinHandle<()>>;
 
+/// How long [`Instances::close`] waits after the sockets are closed (backlog T-88).
+const CLOSE_SETTLE: Duration = Duration::from_millis(100);
+
 impl Instances {
     /// How long each later instance's port stays closed after it runs.
     pub fn set_listen_delay(&self, d: Duration) {
@@ -281,8 +284,11 @@ impl Instances {
                         let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
                     }
                 });
-                if let Some((_, tasks)) = me.ports.lock().expect("ports").get_mut(&id) {
-                    tasks.push(t);
+                // After `close` the entry is gone: a connection accepted in that moment ends
+                // too, never outlives the stop.
+                match me.ports.lock().expect("ports").get_mut(&id) {
+                    Some((_, tasks)) => tasks.push(t),
+                    None => t.abort(),
                 }
             }
         });
@@ -295,13 +301,30 @@ impl Instances {
         })
     }
 
-    /// The instance's address goes away (its listener and every connection).
-    fn close(&self, id: InstanceId) {
-        if let Some((_, tasks)) = self.ports.lock().expect("ports").remove(&id) {
-            for t in tasks {
-                t.abort();
-            }
+    /// The instance's address goes away (its listener and every connection). It returns when
+    /// the listener and the sockets are closed: `abort` only asks a task to stop, and under load
+    /// (backlog T-88: a strict mutation baseline beside two builds) a connection that the
+    /// gateway kept from before the stop was still open when the next request came, so the
+    /// gateway sent that request into it and answered 502 when it closed under the request,
+    /// instead of a cold start.
+    async fn close(&self, id: InstanceId) {
+        let tasks = self
+            .ports
+            .lock()
+            .expect("ports")
+            .remove(&id)
+            .map(|(_, tasks)| tasks)
+            .unwrap_or_default();
+        for t in &tasks {
+            t.abort();
         }
+        for t in tasks {
+            // An aborted task's future (and its sockets) is dropped before the handle is ready.
+            let _ = t.await;
+        }
+        // The gateway's own end of a kept connection learns of the close when its connection
+        // task runs; give it that turn before the test sends the next request.
+        tokio::time::sleep(CLOSE_SETTLE).await;
     }
 }
 
@@ -1269,7 +1292,7 @@ impl GatewayWorld for World {
             .stop(q.tenant_id, id)
             .await
             .map_err(|e| failed("the stop", e))?;
-        self.instances.close(id);
+        self.instances.close(id).await;
         Ok(())
     }
 

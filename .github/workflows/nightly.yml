@@ -20,9 +20,38 @@ env:
   RUST_TOOLCHAIN: "1.99"
 
 jobs:
-  mutation-check:
-    name: mutation check of the security suites
+  # The whole mutation check takes about 10 hours on one runner, more than the 6 hours a GitHub
+  # job may run (backlog T-82). It runs in shards, one job each (the shards are in
+  # mutation_check.sh, so a new mutation always lands in one). A manual run that names mutations
+  # runs them in one job.
+  mutation-shards:
+    name: shards of the mutation check
     runs-on: ubuntu-24.04
+    outputs:
+      shards: ${{ steps.list.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: list
+        env:
+          MUTATIONS: ${{ github.event.inputs.mutations }}
+        run: |
+          if [ -n "$MUTATIONS" ]; then
+            echo 'shards=["named"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "shards=$(crates/ruum-testkit/scripts/mutation_check.sh --shards)" >> "$GITHUB_OUTPUT"
+          fi
+          cat "$GITHUB_OUTPUT"
+
+  mutation-check:
+    name: mutation check of the security suites (${{ matrix.shard }})
+    needs: mutation-shards
+    runs-on: ubuntu-24.04
+    # The largest shard takes about 3 hours; a stuck shard fails here, before GitHub's 6 hours.
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.mutation-shards.outputs.shards) }}
     # The Postgres mutations (ENV="RUUM_SUITE_BACKEND=postgres ...", the Postgres conformance
     # suites) need a database.
     services:
@@ -54,18 +83,44 @@ jobs:
       # A local key-encryption key (32 random bytes, made in a step below), as scripts/dev.sh env
       # gives on the laptop: the server tests with RUUM_DBHOST_URL need one.
       RUUM_LOCAL_KEK_FILE: /tmp/ruum-ci-tenant-keys.kek
+      # As in ci.yml (see the steps below).
+      RUUM_PG_DUMP: /usr/lib/postgresql/17/bin/pg_dump
+      RUUM_REQUIRE_GATEWAY_ROLE: "1"
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+          # The Docker driver's tests build the static sandbox supervisor for this target (as in
+          # ci.yml, card I6-20; the baseline of the runtime shard fails without it).
+          targets: x86_64-unknown-linux-musl
+      # One cache for all shards (the dependencies are the same); one shard saves it, so the
+      # shards do not fill the repository's cache space.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly-mutations
+          save-if: ${{ matrix.shard == 'dbengine' || matrix.shard == 'named' }}
       # CREATEDB for the per-test databases, CREATE on the main database for the schema in which
       # sqlx keeps its list of test databases (as in ci.yml).
       - name: Role for the tests
         run: |
           psql "postgres://ruum:ruum@localhost:5432/ruum" -c "create role ruum_test login password 'ruum_test' createdb"
           psql "postgres://ruum:ruum@localhost:5432/ruum" -c "grant create on database ruum to ruum_test"
+      # The gateway's database role, as in ci.yml (card G-1a): the gateway lookup mutations need
+      # host_lookup_pg to act as it (RUUM_REQUIRE_GATEWAY_ROLE below), not skip that part.
+      - name: Gateway role for the tests
+        run: |
+          psql "postgres://ruum:ruum@localhost:5432/ruum" -c "do \$\$ begin if not exists (select 1 from pg_roles where rolname = 'ruum_gateway') then create role ruum_gateway nologin; end if; end \$\$"
+          psql "postgres://ruum:ruum@localhost:5432/ruum" -c "grant ruum_gateway to ruum_test"
+      # pg_dump 17 for the engine's export (RUUM_PG_DUMP), as in ci.yml; the runner has 16.
+      - name: PostgreSQL 17 client
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends postgresql-client-17
+          /usr/lib/postgresql/17/bin/pg_dump --version
       # The data cluster of step 2, as in ci.yml (a service container cannot be built).
       - name: Start the data cluster (postgres-data)
         run: |
@@ -98,8 +153,12 @@ jobs:
           MUTATION_STRICT: ${{ vars.MUTATION_STRICT || '1' }}
           RUUM_REQUIRE_IMPLEMENTED: ${{ vars.RUUM_REQUIRE_IMPLEMENTED || '0' }}
           MUTATIONS: ${{ github.event.inputs.mutations }}
+          # "named": the mutations of the manual run, no shard.
+          MUTATION_SHARD: ${{ matrix.shard != 'named' && matrix.shard || '' }}
         # MUTATIONS is split into names on purpose (word splitting).
-        run: crates/ruum-testkit/scripts/mutation_check.sh $MUTATIONS
+        run: |
+          # shellcheck disable=SC2086
+          crates/ruum-testkit/scripts/mutation_check.sh $MUTATIONS
 
   progress:
     name: security suites with RUUM_REQUIRE_IMPLEMENTED=1 (progress report)

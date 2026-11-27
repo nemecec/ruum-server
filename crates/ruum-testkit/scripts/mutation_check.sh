@@ -9,15 +9,20 @@
 # Usage:
 #   crates/ruum-testkit/scripts/mutation_check.sh            # all mutations
 #   crates/ruum-testkit/scripts/mutation_check.sh NAME...    # some, by file name without .sh
+#   crates/ruum-testkit/scripts/mutation_check.sh --shards   # print the shard names as JSON
+#   crates/ruum-testkit/scripts/mutation_check.sh --list     # print the names of MUTATION_SHARD
 #
 # Environment:
 #   MUTATION_STRICT=1      survived and skipped mutations fail the run (use when step 1 is built)
+#   MUTATION_SHARD         run only the mutations of this shard (see `shards` below; backlog T-82:
+#                          the whole check takes about 10 hours, more than one GitHub job may
+#                          run). Ignored when names are given.
 #   MUTATION_TARGET_DIR    the cargo target dir for the copies (default: <repo>/target/mutation);
 #                          the copy itself is in <MUTATION_TARGET_DIR>.work/repo
 #   RUUM_REQUIRE_IMPLEMENTED is passed through to the suites.
 #   DATABASE_URL           needed by the mutations whose ENV picks the Postgres backend
 #                          (eval "$(scripts/dev.sh env)" on the laptop).
-#   CI                     when set, the case filters that the tests refuse under CI (T-26:
+#   CI                     when set (also when empty), the case filters that the tests refuse under CI (T-26:
 #                          RUUM_BUILD_CASES, RUUM_SANDBOX_CASES) are dropped from ENV, so the
 #                          baseline and the mutation run the whole test (backlog T-79).
 #
@@ -54,9 +59,47 @@ sync_copy() {
 # server's strict check, the laptop).
 ci_refused_filters="RUUM_BUILD_CASES RUUM_SANDBOX_CASES"
 
+# The shards of the nightly check (backlog T-82). A mutation belongs to the first shard whose list
+# holds the part of its name before the first "-"; the shard "rest" takes every other mutation, so
+# a mutation with a new prefix still runs. Each shard runs its own baselines, so a prefix whose
+# mutations share test runs stays in one shard. Times of one GitHub runner (run 45703034717):
+# databases about 2 h, apps 1.5 h, dbengine 1 h; each shard should stay under 3 hours.
+# "runtime" holds the Docker driver, build and sandbox mutations, alone in their shard.
+shards="
+databases=databases
+apps=apps
+dbengine=dbengine gateway egress
+runtime=runtime
+telemetry=telemetry
+core=privacy feed authz agents email csrf
+rest=
+"
+
+shard_of() {
+  # $1: a mutation name. Prints its shard.
+  local prefix="${1%%-*}" line name list
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    name="${line%%=*}"
+    list="${line#*=}"
+    case " $list " in
+      *" $prefix "*) printf '%s' "$name"; return ;;
+    esac
+  done <<<"$shards"
+  printf 'rest'
+}
+
+shard_names() {
+  local line
+  while IFS= read -r line; do
+    [ -n "$line" ] && printf '%s\n' "${line%%=*}"
+  done <<<"$shards"
+}
+
 effective_env() {
   # $1: a mutation's ENV. Prints the ENV the cargo test runs get.
-  if [ -z "${CI:-}" ]; then
+  # ${CI+x}: CI set but empty counts as set, as the tests read it (var_os; backlog T-83).
+  if [ -z "${CI+x}" ]; then
     printf '%s' "$1"
     return
   fi
@@ -77,14 +120,39 @@ run_tests() {
   (cd "$copy" && env $2 cargo test $1 >"$work/log" 2>&1)
 }
 
-if [ "$#" -gt 0 ]; then
+shard="${MUTATION_SHARD:-}"
+if [ "${1:-}" = "--shards" ]; then
+  # One JSON array, for a job matrix.
+  shard_names | awk 'BEGIN { printf "[" } { printf "%s\"%s\"", (NR > 1 ? "," : ""), $0 } END { print "]" }'
+  exit 0
+fi
+# No grep -q here: it ends early, and under pipefail the closed pipe would fail the test.
+if [ -n "$shard" ] && ! printf '%s\n' "$(shard_names)" | grep -x -- "$shard" >/dev/null; then
+  echo "MUTATION_SHARD=$shard is not a shard; the shards are: $(shard_names | tr '\n' ' ')" >&2
+  exit 2
+fi
+
+if [ "${1:-}" != "--list" ] && [ "$#" -gt 0 ]; then
   files=()
   for n in "$@"; do files+=("$mutations_dir/$n.sh"); done
 else
-  files=("$mutations_dir"/*.sh)
+  files=()
+  for f in "$mutations_dir"/*.sh; do
+    if [ -z "$shard" ] || [ "$(shard_of "$(basename "$f" .sh)")" = "$shard" ]; then
+      files+=("$f")
+    fi
+  done
+fi
+if [ "${1:-}" = "--list" ]; then
+  for f in "${files[@]}"; do basename "$f" .sh; done
+  exit 0
+fi
+if [ "${#files[@]}" -eq 0 ]; then
+  echo "FAIL: no mutation to run${shard:+ in shard $shard}" >&2
+  exit 2
 fi
 
-echo "mutation check: ${#files[@]} mutations, strict=$strict, copy in $copy"
+echo "mutation check: ${#files[@]} mutations${shard:+ of shard $shard}, strict=$strict, copy in $copy"
 # A fresh copy: every file gets a new mtime, so no build of an earlier run is taken as fresh.
 rm -rf "$copy"
 sync_copy
@@ -98,7 +166,7 @@ trap 'sync_copy || true' EXIT
 # Each line is "ENV|TESTS".
 # Under CI the refused case filters are dropped first (effective_env), so the filtered runs of
 # one test become one baseline run of the whole test.
-if [ -n "${CI:-}" ]; then
+if [ -n "${CI+x}" ]; then
   echo "CI is set: the case filters $ci_refused_filters are dropped from ENV; those mutations run the whole test (T-26, T-79)"
 fi
 # shellcheck disable=SC1090
