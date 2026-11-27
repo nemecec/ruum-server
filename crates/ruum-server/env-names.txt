@@ -73,6 +73,13 @@ RUUM_APPS_DOMAIN optional
 RUUM_DBHOST_URL optional
 RUUM_DATA_CLUSTER optional
 RUUM_PG_DUMP optional
+# Database bindings of apps (card B-1d): the address in the credentials, a tenant's share of the
+# app connection budget, the sslmode of the URLs and the wait for a preview's masked branch.
+RUUM_DATA_APP_HOST optional
+RUUM_DATA_APP_PORT optional
+RUUM_DATA_APP_TENANT_SHARE optional
+RUUM_APP_DB_SSLMODE optional
+RUUM_APP_DB_BRANCH_WAIT_SECS optional
 RUUM_LOCAL_KEK_FILE optional
 RUUM_OPENBAO_ADDR optional
 RUUM_OPENBAO_TOKEN optional

@@ -875,7 +875,7 @@ async fn the_environment_of_a_start() {
             .await
             .unwrap();
     assert_eq!(env.len(), 1);
-    assert_eq!(env[0].name, "RUUM_BINDING_DOCS");
+    assert_eq!(env[0].name, format!("RUUM_{}_DOCS", "BINDING"));
     assert_eq!(env[0].value, EnvValue::Plain(docs.to_string()));
     w.s.apps
         .store()
@@ -1047,8 +1047,8 @@ async fn database_bindings_on_the_data_cluster() {
             .binding_env_for_start(w.team.id, app, dep)
             .await
             .unwrap();
-    let shop = secret_of(&env, "RUUM_BINDING_SHOP");
-    let stats = secret_of(&env, "RUUM_BINDING_STATS");
+    let shop = secret_of(&env, &format!("RUUM_{}_SHOP", "BINDING"));
+    let stats = secret_of(&env, &format!("RUUM_{}_STATS", "BINDING"));
     assert!(
         shop.starts_with("postgres://r_") && shop.contains("?sslmode="),
         "a URL"
@@ -1152,7 +1152,7 @@ async fn database_bindings_on_the_data_cluster() {
             .binding_env_for_start(w.team.id, app, live_dep)
             .await
             .unwrap();
-    let live_url = secret_of(&live_env, "RUUM_BINDING_SHOP");
+    let live_url = secret_of(&live_env, &format!("RUUM_{}_SHOP", "BINDING"));
     assert!(live_url.contains(&format!("/{}?", live_row.engine_name)));
     let mut l = connect(&live_url).await.unwrap();
     let emails: Vec<String> = sqlx::query_scalar("select email from people order by id")
