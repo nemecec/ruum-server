@@ -2027,6 +2027,53 @@ async fn forged_tokens_cost_no_review_and_reviews_are_bounded() {
         );
         assert_eq!(w.fake.token_reviews(), base, "{what} cost a TokenReview");
     }
+    // Claims whose pod name or uid is not in the driver's exact form never reach the API path
+    // (review of I620-G, required change 1): no call of the fake at all.
+    let uid = good.pod_uid.clone();
+    let mut bad_names: Vec<(String, String)> = [
+        "../configmaps/x".to_owned(),
+        format!("{pod_n}/log"),
+        format!("{pod_n}?watch=1"),
+        format!("{pod_n}%2Flog"),
+        pod_n.to_uppercase(),
+        format!("{pod_n}/"),
+        format!("ruum-i--{}", 1),
+        pod_n.replace("-1", "-01"),
+        pod_n.replace("-1", "-+1"),
+        String::new(),
+    ]
+    .into_iter()
+    .map(|n| (n, uid.clone()))
+    .collect();
+    for u in [
+        "../x",
+        "a/b",
+        "x?y",
+        "",
+        "another-uid",
+        &uid.to_uppercase(),
+        &uid.replace('-', ""),
+    ] {
+        bad_names.push((pod_n.clone(), u.to_owned()));
+    }
+    for (name, u) in bad_names {
+        let mut c = good.clone();
+        c.pod = name.clone();
+        c.pod_uid = u.clone();
+        let calls = w.fake.calls.lock().unwrap().len();
+        assert_eq!(
+            d.supervisor_token(&kube_fake::unsigned_token(&c), ip)
+                .await
+                .unwrap_err(),
+            LaunchRefusal::Forbidden,
+            "name {name:?} uid {u:?}"
+        );
+        assert_eq!(
+            w.fake.calls.lock().unwrap().len(),
+            calls,
+            "name {name:?} uid {u:?} reached the API"
+        );
+    }
     // Claims that name the pod at its address: reviewed (and refused), at most the peer's
     // bound in a minute, then 429 without a review.
     let mut answers = Vec::new();
@@ -2050,6 +2097,10 @@ async fn forged_tokens_cost_no_review_and_reviews_are_bounded() {
     let mut cfg = w.cfg.clone();
     cfg.review_burst = 2;
     cfg.review_rate_per_sec = 1;
+    // A tenant's share is at most the bound of all peers (the bound of all peers alone, with
+    // another tenant's peer, is `one_tenant_cannot_spend_every_tenants_reviews`).
+    cfg.tenant_review_burst = 2;
+    cfg.tenant_review_rate_per_sec = 1;
     let g = w.driver_with(
         cfg,
         Arc::new(ruum_runtime::kube::ledger::MemoryLedger::new()),
@@ -2072,6 +2123,152 @@ async fn forged_tokens_cost_no_review_and_reviews_are_bounded() {
         "{} reviews past the bound of all peers",
         w.fake.token_reviews() - before
     );
+}
+
+/// Review of I620-G, required change 3: one tenant's sandboxes that flood the reviews spend
+/// only their tenant's share, so another tenant's review is still made; a refusal spends none
+/// of the peer's allowance. The control: with a share as large as the bound of all peers, the
+/// flood leaves the other tenant `503`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_tenant_cannot_spend_every_tenants_reviews() {
+    let w = world(false).await;
+    let d = w.driver_with(
+        w.cfg.clone(),
+        Arc::new(ruum_runtime::kube::ledger::MemoryLedger::new()),
+    );
+    let mut pods = Vec::new();
+    for _ in 0..2 {
+        let s = d.start(w.service(identity(), None)).await.unwrap();
+        let pod_n = ruum_runtime::kube::pod_name(s.id, 1);
+        assert_eq!(wait_launched(&w, &pod_n).await, 200);
+        let ip: std::net::IpAddr = w.fake.pod(NS, &pod_n).unwrap()["status"]["podIP"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        pods.push((kube_fake::unsigned_token(&claims_of(&w, &pod_n)), ip));
+    }
+    let (flood, flood_ip) = pods[0].clone();
+    let (other, other_ip) = pods[1].clone();
+    for (share, other_reviewed) in [(2, true), (4, false)] {
+        let mut cfg = w.cfg.clone();
+        cfg.peer_reviews_per_minute = 1000;
+        cfg.review_burst = 4;
+        cfg.review_rate_per_sec = 1;
+        cfg.tenant_review_burst = share;
+        cfg.tenant_review_rate_per_sec = 1;
+        let g = w.driver_with(
+            cfg,
+            Arc::new(ruum_runtime::kube::ledger::MemoryLedger::new()),
+        );
+        // The flood: unsigned tokens of the first tenant's pod (each review refuses them), until
+        // the bound answers 503.
+        let mut answers = Vec::new();
+        for _ in 0..8 {
+            let a = g.supervisor_token(&flood, flood_ip).await.unwrap_err();
+            answers.push(a);
+            if a == LaunchRefusal::NotReady {
+                break;
+            }
+        }
+        assert_eq!(
+            answers.last(),
+            Some(&LaunchRefusal::NotReady),
+            "share {share}: no bound: {answers:?}"
+        );
+        let before = w.fake.token_reviews();
+        let a = g.supervisor_token(&other, other_ip).await.unwrap_err();
+        if other_reviewed {
+            assert_eq!(
+                (a, w.fake.token_reviews() - before),
+                (LaunchRefusal::Forbidden, 1),
+                "share {share}: the other tenant's review was not made"
+            );
+        } else {
+            assert_eq!(
+                (a, w.fake.token_reviews() - before),
+                (LaunchRefusal::NotReady, 0),
+                "share {share}: the control"
+            );
+        }
+    }
+    // A request refused by a bucket spends none of the peer's allowance.
+    let mut cfg = w.cfg.clone();
+    cfg.peer_reviews_per_minute = 2;
+    cfg.review_burst = 1;
+    cfg.review_rate_per_sec = 1;
+    cfg.tenant_review_burst = 1;
+    cfg.tenant_review_rate_per_sec = 1;
+    let g = w.driver_with(
+        cfg,
+        Arc::new(ruum_runtime::kube::ledger::MemoryLedger::new()),
+    );
+    assert_eq!(
+        g.supervisor_token(&flood, flood_ip).await.unwrap_err(),
+        LaunchRefusal::Forbidden
+    );
+    for _ in 0..5 {
+        assert_eq!(
+            g.supervisor_token(&flood, flood_ip).await.unwrap_err(),
+            LaunchRefusal::NotReady,
+            "a refused request spent the peer's allowance"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(
+        g.supervisor_token(&flood, flood_ip).await.unwrap_err(),
+        LaunchRefusal::Forbidden,
+        "the second review of the peer's two was not made"
+    );
+}
+
+/// Review of I620-G, required change 2: a launch whose record write the API server refused
+/// with a status that writes nothing (`503`) releases its ledger claim, so the supervisor's next
+/// ask gets the launch; one whose write may have gone through (`500`) keeps the claim, and the
+/// pod gets no launch again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_launch_write_that_surely_failed_does_not_burn_the_launch() {
+    let w = world(false).await;
+    let d = w.driver_with(
+        w.cfg.clone(),
+        Arc::new(ruum_runtime::kube::ledger::MemoryLedger::new()),
+    );
+    for (code, launches_after) in [(503u16, true), (500, false)] {
+        w.fake.skip_launch_once.store(true, Ordering::SeqCst);
+        let s = d.start(w.service(identity(), None)).await.unwrap();
+        let pod_n = ruum_runtime::kube::pod_name(s.id, 1);
+        wait_pod_ip(&w, &pod_n).await;
+        let (tok, ip) = w.pod_token(&pod_n);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !w.record(s.id)["data"]["record"]
+            .as_str()
+            .is_some_and(|t| t.contains("\"sealed\":\"v1."))
+        {
+            assert!(Instant::now() < deadline, "the run was not sealed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Ask until the refused write was tried (earlier asks may wait for the app's start).
+        *w.fake.fail_config_map_put_once.lock().unwrap() = Some(code);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while w.fake.fail_config_map_put_once.lock().unwrap().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "{code}: the launch write was not tried"
+            );
+            assert_eq!(
+                d.supervisor_launch(&tok, ip).await.unwrap_err(),
+                LaunchRefusal::NotReady,
+                "{code}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let next = launch_when_ready(&d, &tok, ip).await;
+        if launches_after {
+            assert!(next.is_ok(), "{code}: the launch was burnt: {next:?}");
+        } else {
+            assert_eq!(next.unwrap_err(), LaunchRefusal::Forbidden, "{code}");
+        }
+    }
 }
 
 /// Backlog I620-2: with TLS on the launch channel the pod's command names the `https` listener

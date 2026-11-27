@@ -341,8 +341,11 @@ network policies or the kubelet's behaviour: on staging `ops/gvisor-check.sh`,
   `KubeDriver::new` keeps it in the process (`MemoryLedger`), for tests and one process alone.
 - `TokenReview`s of the supervisor listener come only after the cheap checks (the token reads
   as the sandbox account's projected token of a pod at the caller's address) and within
-  `peer_reviews_per_minute` (6) per address and `review_rate_per_sec` (20, burst
-  `review_burst` 40) for all (backlog I620-12).
+  `peer_reviews_per_minute` (6) per address, `tenant_review_rate_per_sec` (4, burst
+  `tenant_review_burst` 8) per tenant and `review_rate_per_sec` (20, burst `review_burst` 40)
+  for all (backlog I620-12). The token's pod name and uid must be in the driver's exact form
+  before the pod is read. A launch claim whose seal write surely did not happen is released
+  (`SealLedger::release`).
 - Each process keeps the logs of at most `max_instances` instances (4096), of at most
   `max_tenant_instances` (512) running or scaled-to-zero instances of one tenant (a start past it
   is `runtime_unavailable`, so one tenant never takes every slot; Kimi run 15 I6-1 finding 5,

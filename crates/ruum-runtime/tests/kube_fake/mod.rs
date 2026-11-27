@@ -174,6 +174,9 @@ pub struct Fake {
     pub runtime_class_overhead: Mutex<BTreeMap<String, String>>,
     /// A held read of one ConfigMap (T-85): set by [`Fake::hold_config_map_get`].
     hold_get: Mutex<Option<HoldGet>>,
+    /// The next ConfigMap update answers this status and writes nothing (review of I620-G,
+    /// required change 2).
+    pub fail_config_map_put_once: Mutex<Option<u16>>,
     /// Told when the held read has its answer (from before any later write).
     pub get_held: Notify,
     /// Lets the held read answer.
@@ -342,6 +345,7 @@ impl Fake {
             gc_delay_ms: AtomicU64::new(0),
             runtime_class_overhead: Mutex::new(staging_runtime_class_overhead()),
             hold_get: Mutex::new(None),
+            fail_config_map_put_once: Mutex::new(None),
             get_held: Notify::new(),
             get_release: Notify::new(),
         });
@@ -1060,6 +1064,12 @@ async fn object_put(
         return status(
             StatusCode::METHOD_NOT_ALLOWED,
             "the fake updates ConfigMaps only",
+        );
+    }
+    if let Some(code) = f.fail_config_map_put_once.lock().unwrap().take() {
+        return status(
+            StatusCode::from_u16(code).unwrap(),
+            "the fake refused this update",
         );
     }
     let Ok(mut obj) = serde_json::from_slice::<Value>(&body) else {

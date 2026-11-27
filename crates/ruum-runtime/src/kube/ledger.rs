@@ -44,6 +44,11 @@ pub trait SealLedger: Send + Sync {
     /// `Ok(false)` when the pod was launched before. Atomic.
     async fn claim_launch(&self, record: &RecordRef, pod_uid: &str) -> Result<bool, RuntimeError>;
 
+    /// Takes back the launch claim of `pod_uid` when its launch surely did not happen (the seal
+    /// that lists it was not written, and no answer left): the supervisor's next ask may claim
+    /// it again (review of I620-G, required change 2). A pod that was not claimed is fine.
+    async fn release(&self, record: &RecordRef, pod_uid: &str) -> Result<(), RuntimeError>;
+
     /// Forgets the marks and launches of a record that is deleted (its uid never comes back).
     async fn forget(&self, record: &RecordRef) -> Result<(), RuntimeError>;
 }
@@ -82,6 +87,18 @@ impl SealLedger for MemoryLedger {
             .entry(record.clone())
             .or_default()
             .insert(pod_uid.to_owned()))
+    }
+
+    async fn release(&self, record: &RecordRef, pod_uid: &str) -> Result<(), RuntimeError> {
+        if let Some(l) = self
+            .launches
+            .lock()
+            .expect("ledger launches lock")
+            .get_mut(record)
+        {
+            l.remove(pod_uid);
+        }
+        Ok(())
     }
 
     async fn forget(&self, record: &RecordRef) -> Result<(), RuntimeError> {
@@ -123,6 +140,14 @@ pub async fn conformance(ledger: &dyn SealLedger, tenant: TenantId) {
     );
     assert!(ledger.claim_launch(&a, "pod-2").await.unwrap());
     assert!(ledger.claim_launch(&a2, "pod-3").await.unwrap());
+    // A released claim (the launch surely did not happen) can be claimed again, once; the
+    // release touches no other pod or record, and a release of an unclaimed pod is fine.
+    ledger.release(&a, "pod-2").await.unwrap();
+    ledger.release(&a, "pod-never").await.unwrap();
+    assert!(!ledger.claim_launch(&a, "pod-1").await.unwrap());
+    assert!(!ledger.claim_launch(&a2, "pod-3").await.unwrap());
+    assert!(ledger.claim_launch(&a, "pod-2").await.unwrap());
+    assert!(!ledger.claim_launch(&a, "pod-2").await.unwrap());
     // Forgetting a deleted record leaves the others.
     ledger.forget(&a).await.unwrap();
     assert!(ledger.observe(&a, 1).await.unwrap());

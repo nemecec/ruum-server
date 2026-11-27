@@ -35,6 +35,13 @@ pub(crate) enum Write {
     Gone,
 }
 
+/// A failed [`Api::replace_checked`].
+pub(crate) struct ReplaceError {
+    pub error: RuntimeError,
+    /// The object surely was not written.
+    pub not_written: bool,
+}
+
 /// The answer to a log request.
 pub(crate) enum LogAnswer {
     Stream(reqwest::Response),
@@ -232,18 +239,47 @@ impl Api {
         name: &str,
         body: &Value,
     ) -> Result<Write, RuntimeError> {
+        self.replace_checked(kind, name, body)
+            .await
+            .map_err(|e| e.error)
+    }
+
+    /// [`Api::replace`], and on an error whether the object surely was not written: the request
+    /// never reached the API server (a connect error), or the API server answered with a status
+    /// that writes nothing (`400`, `401`, `403`, `413`, `415`, `422`, `429`, `503`). A timeout,
+    /// a cut answer, `500`, `502` and `504` may hide a write that went through.
+    pub(crate) async fn replace_checked(
+        &self,
+        kind: Kind,
+        name: &str,
+        body: &Value,
+    ) -> Result<Write, ReplaceError> {
         let what = format!("update {} {name}", kind.plural());
-        let r = self
-            .send(
-                &what,
-                self.client.put(self.url(kind, Some(name))).json(body),
-            )
-            .await?;
+        let req = self
+            .auth(self.client.put(self.url(kind, Some(name))).json(body))
+            .map_err(|error| ReplaceError {
+                error,
+                not_written: true,
+            })?;
+        let r = req.send().await.map_err(|e| ReplaceError {
+            not_written: e.is_connect(),
+            error: unavailable(&what, e.without_url()),
+        })?;
         match r.status().as_u16() {
-            200 | 201 => Ok(Write::Done(self.json(&what, r).await?)),
+            200 | 201 => self
+                .json(&what, r)
+                .await
+                .map(Write::Done)
+                .map_err(|error| ReplaceError {
+                    error,
+                    not_written: false,
+                }),
             409 => Ok(Write::Conflict),
             404 => Ok(Write::Gone),
-            _ => Err(self.refused(&what, r).await),
+            code => Err(ReplaceError {
+                not_written: matches!(code, 400 | 401 | 403 | 413 | 415 | 422 | 429 | 503),
+                error: self.refused(&what, r).await,
+            }),
         }
     }
 
