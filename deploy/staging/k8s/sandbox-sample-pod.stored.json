@@ -1,0 +1,281 @@
+{
+  "metadata": {
+    "labels": {
+      "ruum.app": "0190f0f0-0000-7000-8000-000000000002",
+      "ruum.deployment": "0190f0f0-0000-7000-8000-000000000003",
+      "ruum.env": "live",
+      "ruum.instance": "0190f0f0-0000-7000-8000-00000000c0de",
+      "ruum.managed": "ruum-runtime",
+      "ruum.run": "1",
+      "ruum.tenant": "0190f0f0-0000-7000-8000-000000000001"
+    },
+    "name": "ruum-i-0190f0f000007000800000000000c0de-1"
+  },
+  "spec": {
+    "automountServiceAccountToken": false,
+    "containers": [
+      {
+        "command": [
+          "/ruum/bin/ruum-supervisor",
+          "run",
+          "--launch-url",
+          "http://192.0.2.1:8091",
+          "--identity-file",
+          "/ruum/id/token",
+          "--token-file",
+          "/var/run/ruum/token"
+        ],
+        "env": [
+          {
+            "name": "MODE",
+            "value": "sample"
+          },
+          {
+            "name": "RUUM_TOKEN_FILE",
+            "value": "/var/run/ruum/token"
+          },
+          {
+            "name": "HTTPS_PROXY",
+            "value": "http://ruum-egress:3128"
+          },
+          {
+            "name": "HTTP_PROXY",
+            "value": "http://ruum-egress:3128"
+          },
+          {
+            "name": "https_proxy",
+            "value": "http://ruum-egress:3128"
+          },
+          {
+            "name": "http_proxy",
+            "value": "http://ruum-egress:3128"
+          },
+          {
+            "name": "NO_PROXY",
+            "value": "localhost,127.0.0.1"
+          },
+          {
+            "name": "no_proxy",
+            "value": "localhost,127.0.0.1"
+          },
+          {
+            "name": "NODE_USE_ENV_PROXY",
+            "value": "1"
+          }
+        ],
+        "image": "registry.invalid:5000/ruum/sample@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "imagePullPolicy": "IfNotPresent",
+        "name": "app",
+        "ports": [
+          {
+            "containerPort": 8080,
+            "name": "app",
+            "protocol": "TCP"
+          }
+        ],
+        "readinessProbe": {
+          "exec": {
+            "command": [
+              "wget",
+              "-q",
+              "-Y",
+              "off",
+              "-O",
+              "/dev/null",
+              "-T",
+              "2",
+              "http://127.0.0.1:8080/healthz"
+            ]
+          },
+          "failureThreshold": 3,
+          "periodSeconds": 5,
+          "successThreshold": 1,
+          "timeoutSeconds": 5
+        },
+        "resources": {
+          "limits": {
+            "cpu": "250m",
+            "memory": "268435456"
+          },
+          "requests": {
+            "cpu": "250m",
+            "memory": "268435456"
+          }
+        },
+        "securityContext": {
+          "allowPrivilegeEscalation": false,
+          "capabilities": {
+            "drop": [
+              "ALL"
+            ]
+          },
+          "privileged": false,
+          "readOnlyRootFilesystem": true,
+          "runAsGroup": 10001,
+          "runAsNonRoot": true,
+          "runAsUser": 10001,
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          }
+        },
+        "terminationMessagePath": "/dev/termination-log",
+        "terminationMessagePolicy": "File",
+        "volumeMounts": [
+          {
+            "mountPath": "/tmp",
+            "name": "tmp"
+          },
+          {
+            "mountPath": "/var/run/ruum",
+            "name": "run"
+          },
+          {
+            "mountPath": "/ruum/bin",
+            "name": "ruum-bin",
+            "readOnly": true
+          },
+          {
+            "mountPath": "/ruum/id",
+            "name": "ruum-id",
+            "readOnly": true
+          }
+        ]
+      }
+    ],
+    "dnsConfig": {
+      "nameservers": [
+        "127.0.0.1"
+      ]
+    },
+    "dnsPolicy": "None",
+    "enableServiceLinks": false,
+    "hostAliases": [
+      {
+        "hostnames": [
+          "ruum-egress"
+        ],
+        "ip": "192.0.2.10"
+      }
+    ],
+    "initContainers": [
+      {
+        "command": [
+          "/ruum-supervisor",
+          "install",
+          "/ruum/bin/ruum-supervisor"
+        ],
+        "image": "ghcr.io/nemecec/ruum-supervisor@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "imagePullPolicy": "IfNotPresent",
+        "name": "ruum-supervisor",
+        "resources": {
+          "limits": {
+            "cpu": "100m",
+            "memory": "32Mi"
+          },
+          "requests": {
+            "cpu": "100m",
+            "memory": "32Mi"
+          }
+        },
+        "securityContext": {
+          "allowPrivilegeEscalation": false,
+          "capabilities": {
+            "drop": [
+              "ALL"
+            ]
+          },
+          "privileged": false,
+          "readOnlyRootFilesystem": true,
+          "runAsGroup": 10001,
+          "runAsNonRoot": true,
+          "runAsUser": 10001,
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          }
+        },
+        "terminationMessagePath": "/dev/termination-log",
+        "terminationMessagePolicy": "File",
+        "volumeMounts": [
+          {
+            "mountPath": "/ruum/bin",
+            "name": "ruum-bin"
+          }
+        ]
+      }
+    ],
+    "overhead": {
+      "cpu": "50m",
+      "memory": "64Mi"
+    },
+    "preemptionPolicy": "PreemptLowerPriority",
+    "priority": 0,
+    "restartPolicy": "Never",
+    "runtimeClassName": "gvisor",
+    "schedulerName": "default-scheduler",
+    "securityContext": {
+      "fsGroup": 10001,
+      "runAsGroup": 10001,
+      "runAsNonRoot": true,
+      "runAsUser": 10001,
+      "seccompProfile": {
+        "type": "RuntimeDefault"
+      }
+    },
+    "serviceAccount": "ruum-sandbox",
+    "serviceAccountName": "ruum-sandbox",
+    "shareProcessNamespace": false,
+    "terminationGracePeriodSeconds": 10,
+    "tolerations": [
+      {
+        "effect": "NoExecute",
+        "key": "node.kubernetes.io/not-ready",
+        "operator": "Exists",
+        "tolerationSeconds": 300
+      },
+      {
+        "effect": "NoExecute",
+        "key": "node.kubernetes.io/unreachable",
+        "operator": "Exists",
+        "tolerationSeconds": 300
+      }
+    ],
+    "volumes": [
+      {
+        "emptyDir": {
+          "medium": "Memory",
+          "sizeLimit": "67108864"
+        },
+        "name": "tmp"
+      },
+      {
+        "emptyDir": {
+          "medium": "Memory",
+          "sizeLimit": "1Mi"
+        },
+        "name": "run"
+      },
+      {
+        "emptyDir": {
+          "medium": "Memory",
+          "sizeLimit": "16Mi"
+        },
+        "name": "ruum-bin"
+      },
+      {
+        "name": "ruum-id",
+        "projected": {
+          "defaultMode": 288,
+          "sources": [
+            {
+              "serviceAccountToken": {
+                "audience": "ruum-supervisor",
+                "expirationSeconds": 600,
+                "path": "token"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
