@@ -3,7 +3,7 @@
 //! with `RUUM_DBENGINE_REQUIRE_POSTGRES`). Every refusal is shown next to the same deployer
 //! succeeding on an equal target (decision 0006 G).
 
-use super::database::{DatabaseBindings, role_kind};
+use super::database::{DatabaseBindings, Pause, role_kind};
 use super::*;
 use crate::apps::CreateApp;
 use crate::apps::deployments::{CreateDeployment, PublishDeployment, Published, SourceRequest};
@@ -788,6 +788,248 @@ async fn the_role_goes_before_the_release_commits() {
     w.s.apps.set_database_bindings(held);
     w.publish(&w.a(), app, none).await;
     assert!(w.engine_roles(live).await.is_empty());
+}
+
+/// Kimi run 17 B-1d, finding 1: a release that drops a database binding while another binding
+/// keeps the same tuple (the same database and role), or that renames one, drops the old role
+/// before it commits. When the role cannot be dropped, the release does not happen; before
+/// the fix the release committed and the role stayed.
+#[tokio::test]
+async fn a_dropped_or_renamed_database_binding_loses_its_role_before_the_release() {
+    use std::sync::atomic::Ordering;
+    let w = world().await;
+    let live = w.database(w.data, "Shop", "postgres").await;
+    let app = w.app(&w.a(), w.data, "Shop app").await;
+    let two = format!(
+        "runtime: static\nbindings:\n  primary:\n    node: \"node:{live}\"\n    role: edit\n  \
+         reports:\n    node: \"node:{live}\"\n    role: edit\n"
+    );
+    let dep = w.ready(&w.a(), app, &two, None).await;
+    let first = w.publish(&w.a(), app, dep).await;
+    assert_eq!(w.engine_roles(live).await.len(), 2);
+    let live_of = |w: &World| {
+        let s = w.s.apps.store().clone();
+        let tenant = w.team.id;
+        async move {
+            s.get_app(tenant, app)
+                .await
+                .unwrap()
+                .unwrap()
+                .live_deployment_id
+        }
+    };
+    let a = w.a();
+    let try_publish = |dep: Uuid| {
+        w.s.apps.publish_deployment(
+            &a,
+            app,
+            dep,
+            PublishDeployment::default(),
+            "https://ruum.test",
+        )
+    };
+    // `reports` goes, `primary` keeps the same tuple.
+    let one = w
+        .ready(&w.a(), app, &bound("primary", live, "edit"), None)
+        .await;
+    w.db().fail_next_drop.store(true, Ordering::SeqCst);
+    let r = try_publish(one).await;
+    assert!(
+        !w.db().fail_next_drop.load(Ordering::SeqCst),
+        "a role drop was tried"
+    );
+    assert!(
+        r.is_err(),
+        "the release committed although the role of `reports` could not be dropped"
+    );
+    assert_eq!(
+        live_of(&w).await,
+        Some(first),
+        "the old release keeps serving"
+    );
+    let second = w.publish(&w.a(), app, one).await;
+    let rows = w.active_of(app.0).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].name, "primary");
+    let on_live = w.engine_roles(live).await;
+    assert_eq!(on_live.len(), 1, "{on_live:?}");
+    assert_eq!(on_live[0].binding, rows[0].id);
+    // `primary` is renamed to `main`: the same database and role.
+    let renamed = w
+        .ready(&w.a(), app, &bound("main", live, "edit"), None)
+        .await;
+    w.db().fail_next_drop.store(true, Ordering::SeqCst);
+    let r = try_publish(renamed).await;
+    assert!(
+        r.is_err(),
+        "the release committed although the role of `primary` could not be dropped"
+    );
+    assert_eq!(live_of(&w).await, Some(second));
+    w.publish(&w.a(), app, renamed).await;
+    let rows2 = w.active_of(app.0).await;
+    assert_eq!(rows2.len(), 1, "{rows2:?}");
+    assert_eq!(rows2[0].name, "main");
+    let on_live = w.engine_roles(live).await;
+    assert_eq!(on_live.len(), 1, "{on_live:?}");
+    assert_eq!(on_live[0].binding, rows2[0].id);
+    assert!(
+        w.store
+            .of_binding(w.team.id, rows[0].id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Kimi run 17 B-1d, finding 2 (the end's side): a repair that runs between the drop of a role
+/// and the revoke of its row makes the role again; the end drops it again after the revoke.
+#[tokio::test]
+async fn a_repair_inside_an_end_leaves_no_role() {
+    let w = world().await;
+    let live = w.database(w.data, "Shop", "postgres").await;
+    let app = w.app(&w.a(), w.data, "Shop app").await;
+    let dep = w
+        .ready(&w.a(), app, &bound("shop", live, "edit"), None)
+        .await;
+    w.publish(&w.a(), app, dep).await;
+    let row = w.active_of(app.0).await.remove(0);
+    let none = w.ready(&w.a(), app, "runtime: static\n", None).await;
+    let db = w.db();
+    let store = w.s.apps.store().clone();
+    let pause = Pause::arm(&db.pause_after_drop);
+    let a = w.a();
+    let (published, repaired) = tokio::join!(w.publish(&a, app, none), async {
+        pause.reached.notified().await;
+        assert!(
+            w.engine_roles(live).await.is_empty(),
+            "the end dropped the role"
+        );
+        let fixed = db.repair_target(&*store, w.team.id, live).await.unwrap();
+        pause.go.notify_one();
+        fixed
+    });
+    assert_ne!(published, dep, "the release without the binding is live");
+    assert_eq!(
+        repaired, 1,
+        "the repair made the role of the active row again"
+    );
+    assert!(w.active_of(app.0).await.is_empty());
+    assert!(
+        w.engine_roles(live).await.is_empty(),
+        "a role outlived the end of its binding"
+    );
+    assert!(
+        w.store
+            .of_binding(w.team.id, row.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Kimi run 17 B-1d, finding 2 (the repair's side): a repair that read a row as active before
+/// an end and makes its role after the whole end reads the row again and drops the role.
+#[tokio::test]
+async fn a_repair_from_a_stale_read_leaves_no_role() {
+    let w = world().await;
+    let live = w.database(w.data, "Shop", "postgres").await;
+    let app = w.app(&w.a(), w.data, "Shop app").await;
+    let dep = w
+        .ready(&w.a(), app, &bound("shop", live, "edit"), None)
+        .await;
+    w.publish(&w.a(), app, dep).await;
+    let row = w.active_of(app.0).await.remove(0);
+    let none = w.ready(&w.a(), app, "runtime: static\n", None).await;
+    let db = w.db();
+    let store = w.s.apps.store().clone();
+    let dropped = Pause::arm(&db.pause_after_drop);
+    let read = Pause::arm(&db.pause_after_rows);
+    let ended = tokio::sync::Notify::new();
+    let a = w.a();
+    let (published, repaired, ()) = tokio::join!(
+        async {
+            let id = w.publish(&a, app, none).await;
+            ended.notify_one();
+            id
+        },
+        async {
+            // The repair starts after the drop: it reads no role and the still active row.
+            dropped.reached.notified().await;
+            db.repair_target(&*store, w.team.id, live).await.unwrap()
+        },
+        async {
+            // The end goes on (revoke, second drop) only after the repair read the rows; the
+            // repair makes the role only after the whole end.
+            read.reached.notified().await;
+            dropped.go.notify_one();
+            ended.notified().await;
+            read.go.notify_one();
+        }
+    );
+    assert_ne!(published, dep, "the release without the binding is live");
+    assert!(repaired >= 1, "{repaired}");
+    assert!(w.active_of(app.0).await.is_empty());
+    assert!(
+        w.engine_roles(live).await.is_empty(),
+        "a role made from a stale read outlived the end"
+    );
+    assert!(
+        w.store
+            .of_binding(w.team.id, row.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Kimi run 17 B-1d, finding 3: a publish between the live check of a start and its read of
+/// the rows must not hand the old live deployment the rows of the new release.
+#[tokio::test]
+async fn a_start_of_a_replaced_live_deployment_gets_no_rows_of_the_next_release() {
+    let w = world().await;
+    let one = folder(&w.s, &w.a(), w.data, "Docs one").await;
+    let two = folder(&w.s, &w.a(), w.data, "Docs two").await;
+    let app = w.app(&w.a(), w.data, "Shop app").await;
+    let yaml = |n: NodeId| {
+        format!("runtime: static\nbindings:\n  docs:\n    node: \"node:{n}\"\n    role: view\n")
+    };
+    let dep = w.ready(&w.a(), app, &yaml(one), None).await;
+    let first = w.publish(&w.a(), app, dep).await;
+    let env =
+        w.s.apps
+            .binding_env_for_start(w.team.id, app, first)
+            .await
+            .unwrap();
+    assert_eq!(env[0].value, EnvValue::Plain(one.to_string()));
+    let next = w.ready(&w.a(), app, &yaml(two), None).await;
+    let db = w.db();
+    let pause = Pause::arm(&db.pause_after_live_check);
+    let a = w.a();
+    let (env, second) = tokio::join!(
+        w.s.apps.binding_env_for_start(w.team.id, app, first),
+        async {
+            pause.reached.notified().await;
+            let id = w.publish(&a, app, next).await;
+            pause.go.notify_one();
+            id
+        }
+    );
+    match env {
+        Err(e) => {
+            assert_eq!(e.http_status(), 409, "{e:?}");
+            assert_eq!(
+                e.to_api().details.as_deref().cloned().unwrap_or_default()["reason"],
+                "deployment_not_running"
+            );
+        }
+        Ok(env) => panic!("the replaced live deployment got an environment: {env:?}"),
+    }
+    let env =
+        w.s.apps
+            .binding_env_for_start(w.team.id, app, second)
+            .await
+            .unwrap();
+    assert_eq!(env[0].value, EnvValue::Plain(two.to_string()));
 }
 
 // ------------------------------------------------------------------ the end of bindings

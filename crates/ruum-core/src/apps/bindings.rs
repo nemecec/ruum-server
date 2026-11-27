@@ -1021,7 +1021,11 @@ impl AppService {
     /// live deployment gives back ([`Self::live_bindings_complete`]). So a committed release
     /// never leaves a dropped grant active. Rows whose tuple stays implied (a renamed binding,
     /// a changed `on_behalf_of_user`) end after the release, in [`Self::sync_live_bindings`],
-    /// so the tuple never goes away in between.
+    /// so the tuple never goes away in between. A database row is the exception (Kimi run 17
+    /// B-1d, finding 1): its app role belongs to the row, not to the tuple, so a row on a
+    /// planned database that no planned binding keeps as it is (dropped while another binding
+    /// keeps the tuple, renamed, or with another `on_behalf_of_user`) ends here too, and its
+    /// role goes before the release commits.
     pub(crate) async fn revoke_unplanned_live(
         &self,
         ctx: &Context,
@@ -1039,11 +1043,20 @@ impl AppService {
                 })
             })
             .collect();
+        let databases: std::collections::HashSet<NodeId> = planned
+            .iter()
+            .filter(|r| r.kind == ResolvedKind::Database && r.grants_role())
+            .map(|r| r.target)
+            .collect();
         let dropped: Vec<BindingRow> = self
             .active_live_rows(ctx.tenant, app)
             .await?
             .into_iter()
-            .filter(|a| binding_tuple(a).is_none_or(|t| !implied.contains(&t)))
+            .filter(|a| {
+                binding_tuple(a).is_none_or(|t| !implied.contains(&t))
+                    || (databases.contains(&a.target_node_id)
+                        && !planned.iter().any(|r| r.same_as(a)))
+            })
             .collect();
         if !dropped.is_empty() {
             // A database row's role is dropped before its row ends (card B-1d).
@@ -1101,7 +1114,7 @@ impl AppService {
             // The app role of each new database row, after its row (card B-1d).
             if let Some(db) = self.db() {
                 for b in made.iter().filter(|b| databases.contains(&b.name)) {
-                    db.ensure_role(b).await?;
+                    db.ensure_role(&*d.store, b).await?;
                 }
             }
         }
@@ -1643,6 +1656,8 @@ impl Ends<'_> {
         }
         if let Some(db) = &self.db {
             db.drop_roles(ctx.tenant, rows).await?;
+            #[cfg(test)]
+            database::Pause::hold(&db.pause_after_drop).await;
         }
         let ids: Vec<Uuid> = rows.iter().map(|b| b.id).collect();
         let ended = self
@@ -1650,6 +1665,14 @@ impl Ends<'_> {
             .revoke_bindings(ctx, self.authz, &ids, reason)
             .await?;
         if let Some(db) = &self.db {
+            // Again after the revoke (Kimi run 17 B-1d, finding 2): a repair or a grant that
+            // read a row as active before the revoke may have made its role again after the
+            // first drop ([`database::DatabaseBindings::ensure_role`]). The rows have ended, so
+            // a failure here is logged; the repair of the database drops the role.
+            if let Err(e) = db.drop_roles(ctx.tenant, rows).await {
+                tracing::warn!(tenant = %ctx.tenant, error = %e,
+                    "could not drop the app roles of ended bindings again");
+            }
             db.trash_unused_branches(self.store, self.nodes, ctx.tenant, &ended)
                 .await;
         }

@@ -25,6 +25,8 @@
 //! the preview's branch) and gives the live principal a `node` row on it and an app role there,
 //! after the release commits. The rows (and so the roles) that a release drops end before it
 //! commits (the parent module), so no old credential outlives the release it was dropped in.
+//! A database row ends there also when another binding keeps its tuple (a role belongs to its
+//! row, not to the tuple: Kimi run 17 B-1d, finding 1).
 //!
 //! # Credentials
 //!
@@ -51,6 +53,10 @@
 //!   is retried each round; a release that failed is set right by the repair of unplanned live
 //!   rows) drops it for good. No credential is issued for it in between unless a start asks
 //!   for the still active row;
+//! - a repair (or a grant) that read a row as active while an end runs: the end drops the
+//!   roles, revokes the rows and drops the roles again, and every role made reads its row
+//!   again after it is made ([`DatabaseBindings::ensure_role`]), so no role outlives a
+//!   completed end (Kimi run 17 B-1d, finding 2);
 //! - a `database_roles` row whose binding has no active row (a role of an ended or purged
 //!   binding) is dropped by the repair of its database.
 //!
@@ -124,6 +130,44 @@ pub struct DatabaseBindings {
     /// Test seam: the next [`Self::drop_roles`] fails.
     #[cfg(test)]
     pub(crate) fail_next_drop: std::sync::atomic::AtomicBool,
+    /// Test seam: the next end waits here after it dropped the roles, before it revokes the
+    /// rows.
+    #[cfg(test)]
+    pub(crate) pause_after_drop: std::sync::Mutex<Option<Arc<Pause>>>,
+    /// Test seam: the next [`Self::repair_target`] waits here after it read the active rows.
+    #[cfg(test)]
+    pub(crate) pause_after_rows: std::sync::Mutex<Option<Arc<Pause>>>,
+    /// Test seam: the next [`AppService::binding_env_for_start`] waits here after its check of
+    /// the live deployment.
+    #[cfg(test)]
+    pub(crate) pause_after_live_check: std::sync::Mutex<Option<Arc<Pause>>>,
+}
+
+/// A test seam that stops a call once: the call notifies `reached` and waits for `go`.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Pause {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) go: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl Pause {
+    /// Arms `slot` and returns the pause.
+    pub(crate) fn arm(slot: &std::sync::Mutex<Option<Arc<Pause>>>) -> Arc<Pause> {
+        let p = Arc::new(Pause::default());
+        *slot.lock().unwrap() = Some(p.clone());
+        p
+    }
+
+    /// Stops here once when `slot` is armed.
+    pub(crate) async fn hold(slot: &std::sync::Mutex<Option<Arc<Pause>>>) {
+        let armed = slot.lock().unwrap().take();
+        if let Some(p) = armed {
+            p.reached.notify_one();
+            p.go.notified().await;
+        }
+    }
 }
 
 impl DatabaseBindings {
@@ -150,6 +194,12 @@ impl DatabaseBindings {
             fail_next_row: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_next_drop: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            pause_after_drop: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            pause_after_rows: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            pause_after_live_check: std::sync::Mutex::new(None),
         }
     }
 
@@ -199,14 +249,36 @@ impl DatabaseBindings {
     }
 
     /// Makes the role of an active row on its database (made, or the one that exists).
-    pub(crate) async fn ensure_role(&self, b: &BindingRow) -> Result<()> {
+    /// Makes the app role of the row `b` and then reads the row again: when an end revoked
+    /// it in between, the role goes again (Kimi run 17 B-1d, finding 2). An end drops the
+    /// roles, revokes the rows and drops the roles again ([`super::Ends::revoke`]), so a role
+    /// made from a stale read of an active row never outlives the end: either this second
+    /// read sees the revoked row, or the end's second drop comes after this role.
+    pub(crate) async fn ensure_role(&self, store: &dyn AppStore, b: &BindingRow) -> Result<()> {
         let role = b
             .role
             .ok_or_else(|| Error::Internal("a database binding without a role".into()))?;
         self.roles
             .ensure_binding_role(b.tenant_id, b.target_node_id, b.id, role_kind(role))
-            .await
-            .map(|_| ())
+            .await?;
+        let still = store
+            .list_bindings(
+                b.tenant_id,
+                &BindingQuery {
+                    principal: Some(b.principal_id),
+                    target: Some(b.target_node_id),
+                    active_only: true,
+                    limit: ROWS_PER_QUERY,
+                    ..Default::default()
+                },
+            )
+            .await?
+            .iter()
+            .any(|a| a.id == b.id);
+        if !still {
+            self.roles.revoke_binding(b.tenant_id, b.id).await?;
+        }
+        Ok(())
     }
 
     /// Whether a row's target is a database (its role lives on the data cluster).
@@ -400,6 +472,8 @@ impl DatabaseBindings {
                 break;
             }
         }
+        #[cfg(test)]
+        Pause::hold(&self.pause_after_rows).await;
         let want: BTreeMap<Uuid, &BindingRow> = active
             .iter()
             .filter(|b| b.kind != BindingKind::Api && b.role.is_some())
@@ -418,7 +492,7 @@ impl DatabaseBindings {
         for b in want.values() {
             let kind = role_kind(b.role.unwrap_or(Role::View));
             if !have.iter().any(|r| r.binding_id == b.id && r.kind == kind) {
-                self.ensure_role(b).await?;
+                self.ensure_role(store, b).await?;
                 fixed += 1;
             }
         }
@@ -611,7 +685,7 @@ impl AppService {
             }
             _ => return Err(branch_not_ready()),
         }
-        db.ensure_role(&row).await?;
+        db.ensure_role(&*d.store, &row).await?;
         Ok(row)
     }
 
@@ -669,6 +743,10 @@ impl AppService {
                 if row.live_deployment_id != Some(deployment) {
                     return Err(not_running());
                 }
+                #[cfg(test)]
+                if let Some(db) = self.db() {
+                    Pause::hold(&db.pause_after_live_check).await;
+                }
                 app.0
             }
             Environment::Preview => {
@@ -722,6 +800,20 @@ impl AppService {
                 .await?;
             let url = format!("{}?sslmode={}", creds.expose_url(), db.sslmode);
             env.insert(name, EnvValue::Secret(SecretValue::new(url)));
+        }
+        // The live principal is shared by every release: a publish between the check above
+        // and the read of the rows would hand this deployment the rows of the next release
+        // (Kimi run 17 B-1d, finding 3). The rows of a release are written after its switch,
+        // so the deployment must still be the live one after the read.
+        if dep.environment == Environment::Live {
+            let row = d
+                .store
+                .get_app(tenant, app)
+                .await?
+                .ok_or_else(|| Error::not_found("app"))?;
+            if row.live_deployment_id != Some(deployment) {
+                return Err(not_running());
+            }
         }
         Ok(env
             .into_iter()
