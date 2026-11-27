@@ -47,7 +47,8 @@
 //! their operations seed them (they keep the field names). The seeded W has one live
 //! deployment whose manifest declares the roles `member` (default) and `approver`, the entered
 //! secret `STRIPE_KEY` and the generated secret `SESSION_KEY`, an external API `orders` with the
-//! scopes `orders.read` and `orders.write`, and a binding `db` with role `edit` on D. Both tenants
+//! scopes `orders.read` and `orders.write`, and a binding `docs` with role `view` on `Projects`
+//! (D is a SQLite database, which an app cannot bind: card B-1d, backlog D5-2). Both tenants
 //! have the platform admin's approval of public apps and custom domains. The pending publish
 //! request of W is a request of `agent` (seeded through the store; its `view` scope cannot
 //! publish through the API). I is a `report` issue of W in `Projects` (the reporter is not a
@@ -1290,8 +1291,8 @@ mod seed {
         })
         .await;
         let (s2, c) = (s.clone(), member_ctx.clone());
-        let (app, deployment, database, plan, v1) =
-            (t.app, t.app_deployment, t.database, t.plan, t.v1);
+        let (app, deployment, projects, plan, v1) =
+            (t.app, t.app_deployment, t.projects, t.plan, t.v1);
         if let Some(d) = step("app live deployment", async move {
             use ruum_core::apps::store::{
                 Archive, DeploymentSource, DeploymentState, Environment, NewDeployment,
@@ -1299,7 +1300,7 @@ mod seed {
             let manifest = serde_json::json!({
                 "runtime": "node22",
                 "start": "node server.js",
-                "bindings": { "db": { "node": format!("node:{database}"), "role": "edit" } },
+                "bindings": { "docs": { "node": format!("node:{projects}"), "role": "view" } },
                 "secrets": {
                     "STRIPE_KEY": { "entered": true },
                     "SESSION_KEY": { "generate": "random-32-bytes" },
