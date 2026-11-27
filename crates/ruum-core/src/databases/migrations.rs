@@ -40,6 +40,12 @@
 //!    statement_not_allowed` with the statement's number in `message` (hint
 //!    `remove_transaction_control` for transaction control). `CREATE SCHEMA` and `CREATE
 //!    EXTENSION` pass the rules and fail on the engine rights (`422 migration_failed`).
+//!    For a caller who is not a person with `manage` (every agent, a person with `edit` on a
+//!    draft branch), also the catalog-text rule ([`rules::migration_catalog_text_refusal`]):
+//!    `up` runs as the schema owner, and a draft branch keeps the source's function bodies,
+//!    comments and non-secret defaults, so reading them (also from a DO body or with dynamic
+//!    SQL) is `422 statement_not_allowed`, hint `catalog_text_needs_manage` (Kimi review of D-2,
+//!    run 17). A caller of [`DatabaseService::run_migration`] (W-3a) checks it the same way.
 //! 5. An agent on real data without `approval_id`: an applied migration of the same name
 //!    answers its stored result (nothing runs); else a pending approval of A-2
 //!    ([`DatabaseService::request_migration`]: reason `migration`, `planned_columns` from
@@ -792,6 +798,19 @@ impl DatabaseService {
             .map_err(|e| Error::Internal(format!("the statement check stopped: {e}")))?
             .map_err(|(n, r)| refused_statement(n, r))?;
         let manage_person = ctx.actor.is_user() && node.my_role.is_some_and(|r| r >= Role::Manage);
+        // The catalog's free-form text (function bodies, defaults, comments) is not behind the
+        // lens and a draft branch keeps the source's: only a person with manage reads it in up.
+        if !manage_person {
+            let up = req.up.clone();
+            if let Some((n, r)) = tokio::task::spawn_blocking(move || {
+                rules::migration_catalog_text_refusal(engine, &up)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("the statement check stopped: {e}")))?
+            {
+                return Err(refused_statement(n, r));
+            }
+        }
         // 5. An agent on real data waits for a person.
         let mut approval = None;
         if let Some(a) = agent
