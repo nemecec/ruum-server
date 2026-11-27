@@ -115,8 +115,29 @@ else
   S_INT="$(ip ruum ruum-server-internal):8493" S_PG="$(ip data pg-rw):5432" S_SPICE="$(ip authz spicedb):8443"
   S_DNS="$(ip kube-system kube-dns):53" S_META=169.254.169.254:80 S_NET=1.1.1.1:443
   SB=("$S_EG" "$S_GW" "$S_SRV" "$S_INT" "$S_PG" "$S_SPICE" "$S_DNS" "$S_META" "$S_NET")
-  out="$(kubectl -n ruum-apps run sandbox-probe --image=$IMG --restart=Never --rm -i --quiet \
-    --overrides='{"spec":{"runtimeClassName":"gvisor","automountServiceAccountToken":false,"securityContext":{"runAsNonRoot":true,"runAsUser":65534,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"sandbox-probe","image":"'$IMG'","command":["sh","-c","'"$(probe_cmd "${SB[@]}")"'"],"securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}}}]}}' 2>&1)"
+  # The admission rules of ruum-apps (k8s/manifests/apps-admission.yaml, I6-20) admit only the
+  # shape of a sandbox with its supervisor, so the probe pod has the shape of the positive control
+  # of ops/gvisor-check.sh (pod_spec): the ServiceAccount ruum-sandbox, the init container
+  # ruum-supervisor (here only `true`) that mounts only ruum-bin, ruum-bin read-only in the app
+  # container, and the one projected token of the audience ruum-supervisor (600 s). The app
+  # container runs the probe. The network policies of ruum-apps select every pod ({}), so this
+  # pod gets the same rules as a real sandbox.
+  sb_spec="$(jq -cn --arg img "$IMG" --arg cmd "$(probe_cmd "${SB[@]}")" '{spec: {
+    restartPolicy: "Never",
+    runtimeClassName: "gvisor",
+    serviceAccountName: "ruum-sandbox",
+    automountServiceAccountToken: false,
+    securityContext: { runAsNonRoot: true, runAsUser: 65534, runAsGroup: 65534, seccompProfile: { type: "RuntimeDefault" } },
+    volumes: [{name: "ruum-bin", emptyDir: {medium: "Memory"}},
+      {name: "ruum-id", projected: {sources: [{serviceAccountToken: {path: "token", audience: "ruum-supervisor", expirationSeconds: 600}}]}}],
+    containers: [{
+      name: "sandbox-probe", image: $img, command: ["sh", "-c", $cmd],
+      resources: { requests: { cpu: "10m", memory: "16Mi" }, limits: { memory: "32Mi" } },
+      securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } },
+      volumeMounts: [{name: "ruum-bin", mountPath: "/ruum/bin", readOnly: true}, {name: "ruum-id", mountPath: "/ruum/id", readOnly: true}]
+    }]
+  }} | .spec.initContainers = [.spec.containers[0] | .name = "ruum-supervisor" | .command = ["true"] | .volumeMounts = [{name: "ruum-bin", mountPath: "/ruum/bin"}]]')"
+  out="$(kubectl -n ruum-apps run sandbox-probe --image=$IMG --restart=Never --rm -i --quiet --overrides="$sb_spec" 2>&1)"
   check sandbox "$out" "$S_EG" open
   for t in "$S_GW" "$S_SRV" "$S_INT" "$S_PG" "$S_SPICE" "$S_DNS" "$S_META" "$S_NET"; do check sandbox "$out" "$t" closed; done
 fi

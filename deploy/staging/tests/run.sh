@@ -2332,6 +2332,14 @@ grep -qF 'refused "with a projected token of the API' "$gc" && grep -qF 'refused
   grep -qF 'refused "with a writable supervisor volume"' "$gc" && grep -qF 'refused "with another ServiceAccount"' "$gc" &&
   grep -qF "in the shape of the sandbox supervisor passes the admission rules (the positive control)" "$gc" &&
   ok "gvisor-check.sh proves the pod rules live (token, Secret, envFrom, supervisor volume, account, positive control)" || bad "gvisor-check.sh does not check the pod rules"
+# The sandbox probe of netpol-probe.sh is a pod in ruum-apps, so it must have the supervisor's shape
+# (I6-20), or the admission policy refuses it and every sandbox path reads "nothing".
+np="$STG/ops/netpol-probe.sh"
+grep -qF 'runtimeClassName: "gvisor"' "$np" && grep -qF 'serviceAccountName: "ruum-sandbox"' "$np" && grep -qF 'automountServiceAccountToken: false' "$np" &&
+  grep -qF 'serviceAccountToken: {path: "token", audience: "ruum-supervisor", expirationSeconds: 600}' "$np" &&
+  grep -qF '.name = "ruum-supervisor" | .command = ["true"] | .volumeMounts = [{name: "ruum-bin", mountPath: "/ruum/bin"}]' "$np" &&
+  grep -qF '{name: "ruum-bin", mountPath: "/ruum/bin", readOnly: true}' "$np" && grep -qF -- '--overrides="$sb_spec"' "$np" &&
+  ok "netpol-probe.sh starts its sandbox probe in the supervisor's shape (the admission rules of ruum-apps)" || bad "netpol-probe.sh's sandbox probe lacks the supervisor's shape, so ruum-apps refuses it"
 grep -qF 'want yes "$r" - create tokenreviews.authentication.k8s.io' "$STG/ops/rbac-check.sh" && grep -qF 'want yes "$r" "$APPS_NS" get pods log' "$STG/ops/rbac-check.sh" &&
   ok "rbac-check.sh live checks the runtime driver's rights" || bad "rbac-check.sh does not check the runtime driver"
 grep -qF 'for verb in create get list watch patch update delete deletecollection; do want no "$r" "$APPS_NS" "$verb" secrets; done' "$STG/ops/rbac-check.sh" &&
