@@ -1082,6 +1082,41 @@ async fn a_repair_inside_a_revoke_of_another_replica_leaves_no_role() {
     );
 }
 
+/// Kimi run 17 B-1d, finding 2 (a maker's side, outside the repair): a grant or a stage that
+/// read its row as active and makes the role after the row ended reads the row again and drops
+/// the role (`DatabaseBindings::ensure_role`).
+#[tokio::test]
+async fn a_role_made_for_a_row_that_ended_goes_again() {
+    let w = world().await;
+    let live = w.database(w.data, "Shop", "postgres").await;
+    let app = w.app(&w.a(), w.data, "Shop app").await;
+    let dep = w
+        .ready(&w.a(), app, &bound("shop", live, "edit"), None)
+        .await;
+    w.publish(&w.a(), app, dep).await;
+    let stale = w.active_of(app.0).await.remove(0);
+    let none = w.ready(&w.a(), app, "runtime: static\n", None).await;
+    w.publish(&w.a(), app, none).await;
+    assert!(w.engine_roles(live).await.is_empty());
+    // The maker still holds its read of the row as active.
+    assert!(stale.is_active());
+    w.db()
+        .ensure_role(&**w.s.apps.store(), &stale)
+        .await
+        .unwrap();
+    assert!(
+        w.engine_roles(live).await.is_empty(),
+        "a role made for an ended row stayed"
+    );
+    assert!(
+        w.store
+            .of_binding(w.team.id, stale.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 /// Kimi run 17 B-1d, finding 3: a publish between the live check of a start and its read of
 /// the rows must not hand the old live deployment the rows of the new release.
 #[tokio::test]

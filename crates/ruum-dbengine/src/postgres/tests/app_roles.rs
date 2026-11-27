@@ -1302,6 +1302,66 @@ async fn a_role_made_during_a_purge_goes_with_it() {
     assert_eq!(role_count(&creator, &made.role_name).await, "0");
 }
 
+/// A drop and a password of another server replica wait for a create of the same database
+/// (Kimi run 17 B-1d, third re-check): without the lifecycle lock, a create that read the list
+/// before the drop made the role again under the same name after it, with no row in
+/// `ruum_meta.roles`, and a password could be set on it; no later drop by binding found it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drop_and_a_password_wait_for_a_create_of_another_replica() {
+    let Some(creator) = engine().await else {
+        return;
+    };
+    let creator = Arc::new(creator);
+    let other = Arc::new(engine_with(|_| {}).await.expect("a second engine"));
+    let f = seeded(&creator).await;
+    let binding = Uuid::now_v7();
+    let a = app_role(&f, RoleKind::AppRead, binding).await;
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let go = Arc::new(tokio::sync::Notify::new());
+    *creator.create_pause.lock() = Some((reached.clone(), go.clone()));
+    let db = f.db().clone();
+    let create = {
+        let (engine, db) = (creator.clone(), db.clone());
+        tokio::spawn(async move {
+            engine
+                .create_app_role(&db, RoleKind::AppRead, binding)
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(30), reached.notified())
+        .await
+        .expect("the create holds the lock");
+    let role = a.role_ref().unwrap();
+    let password = {
+        let (engine, role) = (other.clone(), role.clone());
+        tokio::spawn(async move {
+            engine
+                .app_credentials(&role, Duration::from_secs(60))
+                .await
+                .map(|c| c.role_name.clone())
+        })
+    };
+    let dropped = {
+        let (engine, role) = (other.clone(), role.clone());
+        tokio::spawn(async move { engine.drop_app_role(&role).await })
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!password.is_finished(), "the password waits for the create");
+    assert!(!dropped.is_finished(), "the drop waits for the create");
+    go.notify_one();
+    let made = create.await.unwrap().expect("the create");
+    assert_eq!(made.role_name, a.role_name, "the create found the role");
+    dropped.await.unwrap().expect("the drop");
+    // The password came before or after the drop; after it, the role is gone.
+    let _ = password.await.unwrap();
+    assert_eq!(role_count(&creator, &a.role_name).await, "0");
+    assert!(
+        creator.app_roles(&db).await.unwrap().is_empty(),
+        "no app role is left in the list"
+    );
+    creator.drop_database(&db).await.unwrap();
+}
+
 /// A read of the app roles that fails stops the purge (Kimi run 15 on D-5, second review): no
 /// drop with a role left out, unmarked and inside the budget; the next try drops both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

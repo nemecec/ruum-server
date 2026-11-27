@@ -83,6 +83,7 @@ use crate::role::{RoleKind, RoleRef};
 use rand::TryRng;
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, PgConnection, Row};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -506,8 +507,8 @@ pub(crate) async fn forget_access(conn: &mut PgConnection) -> Result<(), EngineE
 }
 
 /// A lock of the whole cluster on the life of the database `name` (an advisory lock of a
-/// session of its own, keyed by the name): `create_app_role`, `suspend_app_access` /
-/// `resume_app_access` and `drop_database` hold it, so these steps of different server
+/// session of its own, keyed by the name): `create_app_role`, `drop_app_role`,
+/// `app_credentials`, `suspend_app_access` / `resume_app_access` and `drop_database` hold it, so these steps of different server
 /// replicas never interleave (Kimi run 15 on D-5, third round). Held until the returned
 /// session closes ([`unlock`]); a session that breaks or is dropped ends and lets it go.
 /// Take it before the per-process locks of the database (`ops`, the gate).
@@ -811,7 +812,9 @@ fn scram_verifier(password: &str) -> Result<String, EngineError> {
     ))
 }
 
-/// `app_credentials`.
+/// `app_credentials`, under the database's lifecycle lock (Kimi run 17 B-1d, third re-check):
+/// a password is never set on a role that another replica's `drop_app_role` is dropping, or
+/// that another replica's `create_app_role` made again from a stale read of the list.
 pub(crate) async fn credentials(
     engine: &PostgresEngine,
     role: &RoleRef,
@@ -819,6 +822,18 @@ pub(crate) async fn credentials(
 ) -> Result<AppCredentials, EngineError> {
     require_app(role)?;
     let state = engine.resolve(role.database()).await?;
+    let lock = lifecycle_lock(engine, &state.name).await?;
+    let r = credentials_locked(engine, state, role, valid_for).await;
+    unlock(lock).await;
+    r
+}
+
+async fn credentials_locked(
+    engine: &PostgresEngine,
+    state: Arc<DbState>,
+    role: &RoleRef,
+    valid_for: Duration,
+) -> Result<AppCredentials, EngineError> {
     let _gate = engine.enter(&state).await?;
     let _ops = state.ops.lock().await;
     let row = find(engine, &state, role)
@@ -1228,10 +1243,24 @@ pub(crate) async fn strip_in_tx(
     Ok(())
 }
 
-/// `drop_app_role`.
+/// `drop_app_role`, under the database's lifecycle lock (Kimi run 17 B-1d, third re-check):
+/// without it, another replica's `create_app_role` that read the list before this drop made the
+/// role again under the same name after it, with no row in `ruum_meta.roles`, so no later drop
+/// by binding found it.
 pub(crate) async fn drop_role(engine: &PostgresEngine, role: &RoleRef) -> Result<(), EngineError> {
     require_app(role)?;
     let state = engine.resolve(role.database()).await?;
+    let lock = lifecycle_lock(engine, &state.name).await?;
+    let r = drop_role_locked(engine, state, role).await;
+    unlock(lock).await;
+    r
+}
+
+async fn drop_role_locked(
+    engine: &PostgresEngine,
+    state: Arc<DbState>,
+    role: &RoleRef,
+) -> Result<(), EngineError> {
     let _gate = engine.enter(&state).await?;
     let _ops = state.ops.lock().await;
     let Some(row) = find(engine, &state, role).await? else {
