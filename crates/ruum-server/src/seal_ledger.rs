@@ -81,6 +81,27 @@ impl SealLedger for PgSealLedger {
         Ok(row.is_some())
     }
 
+    async fn release(&self, r: &RecordRef, pod_uid: &str) -> Result<(), RuntimeError> {
+        let mut tx = begin_tenant(&self.pool, r.tenant)
+            .await
+            .map_err(|e| unavailable("open a transaction", e))?;
+        sqlx::query(
+            "delete from runtime_launches \
+             where tenant_id = $1 and instance_id = $2 and record_uid = $3 and pod_uid = $4",
+        )
+        .bind(r.tenant.0)
+        .bind(r.instance.0)
+        .bind(&r.record_uid)
+        .bind(pod_uid)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| unavailable("release a launch", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| unavailable("commit a release", e))?;
+        Ok(())
+    }
+
     async fn forget(&self, r: &RecordRef) -> Result<(), RuntimeError> {
         let mut tx = begin_tenant(&self.pool, r.tenant)
             .await

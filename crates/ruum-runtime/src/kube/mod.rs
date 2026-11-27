@@ -210,6 +210,12 @@ pub struct KubeConfig {
     pub peer_reviews_per_minute: u32,
     pub review_rate_per_sec: u32,
     pub review_burst: u32,
+    /// The share of one tenant's sandboxes in those reviews, per second with a burst (the tenant
+    /// is the label of the pod at the peer's address, which the driver wrote): past it the
+    /// tenant's peers get `503`, so one tenant cannot keep the bound of all peers spent (review
+    /// of I620-G, required change 3). At most the bound of all peers.
+    pub tenant_review_rate_per_sec: u32,
+    pub tenant_review_burst: u32,
 }
 
 impl KubeConfig {
@@ -263,6 +269,8 @@ impl KubeConfig {
             peer_reviews_per_minute: 6,
             review_rate_per_sec: 20,
             review_burst: 40,
+            tenant_review_rate_per_sec: 4,
+            tenant_review_burst: 8,
         }
     }
 
@@ -336,8 +344,15 @@ impl KubeConfig {
         if self.peer_reviews_per_minute == 0
             || self.review_rate_per_sec == 0
             || self.review_burst == 0
+            || self.tenant_review_rate_per_sec == 0
+            || self.tenant_review_burst == 0
         {
             return bad("the token review bounds must be above zero");
+        }
+        if self.tenant_review_rate_per_sec > self.review_rate_per_sec
+            || self.tenant_review_burst > self.review_burst
+        {
+            return bad("a tenant's share of the token reviews is at most the bound of all peers");
         }
         if self.pids_limit.is_some_and(|p| p < 64) {
             return bad("the PID limit is at least 64");
@@ -440,6 +455,8 @@ struct Inner {
     /// peers together (last refill, tokens): backlog I620-12.
     peer_reviews: Mutex<HashMap<IpAddr, (Instant, u32)>>,
     review_bucket: Mutex<(Instant, f64)>,
+    /// The token bucket of each tenant's share (last refill, tokens).
+    tenant_reviews: Mutex<HashMap<TenantId, (Instant, f64)>>,
 }
 
 /// The Kubernetes driver (see the module docs).
@@ -525,6 +542,7 @@ impl KubeDriver {
             peers: Mutex::new(HashMap::new()),
             peer_reviews: Mutex::new(HashMap::new()),
             review_bucket: Mutex::new((Instant::now(), f64::from(review_burst))),
+            tenant_reviews: Mutex::new(HashMap::new()),
         });
         let sweeper = tokio::runtime::Handle::try_current()
             .ok()
@@ -1719,36 +1737,65 @@ impl Inner {
         e.1 <= PEER_REQUESTS
     }
 
-    /// One more `TokenReview` for `peer`, within the bounds of backlog I620-12: per peer
-    /// address ([`KubeConfig::peer_reviews_per_minute`], else `TooMany`) and for every peer
-    /// together ([`KubeConfig::review_rate_per_sec`] with a burst of
-    /// [`KubeConfig::review_burst`], else `NotReady`: the supervisor asks again).
-    fn review_budget(&self, peer: IpAddr) -> Result<(), LaunchRefusal> {
-        {
-            let mut m = self.peer_reviews.lock().expect("peer reviews lock");
-            if m.len() > 65_536 {
-                m.retain(|_, (at, _)| at.elapsed() < PEER_REVIEW_WINDOW);
-            }
-            let e = m.entry(peer).or_insert((Instant::now(), 0));
-            if e.0.elapsed() >= PEER_REVIEW_WINDOW {
-                *e = (Instant::now(), 0);
-            }
-            if e.1 >= self.cfg.peer_reviews_per_minute {
-                tracing::warn!(target: "ruum::runtime", %peer, "too many token reviews for one address");
-                return Err(LaunchRefusal::TooMany);
-            }
-            e.1 += 1;
+    /// One more `TokenReview` for `peer` (a pod of `tenant`), within the bounds of backlog
+    /// I620-12: per peer address ([`KubeConfig::peer_reviews_per_minute`], else `TooMany`), per
+    /// tenant ([`KubeConfig::tenant_review_rate_per_sec`] with a burst of
+    /// [`KubeConfig::tenant_review_burst`]) and for every peer together
+    /// ([`KubeConfig::review_rate_per_sec`] with a burst of [`KubeConfig::review_burst`]); past
+    /// either bucket `NotReady` (the supervisor asks again). A refused request spends nothing:
+    /// the peer's allowance and both buckets count only a review that is made (review of
+    /// I620-G, required change 3).
+    fn review_budget(&self, peer: IpAddr, tenant: TenantId) -> Result<(), LaunchRefusal> {
+        // One order of the locks: the peers, the tenants, all peers.
+        let mut m = self.peer_reviews.lock().expect("peer reviews lock");
+        if m.len() > 65_536 {
+            m.retain(|_, (at, _)| at.elapsed() < PEER_REVIEW_WINDOW);
+        }
+        let e = m.entry(peer).or_insert((Instant::now(), 0));
+        if e.0.elapsed() >= PEER_REVIEW_WINDOW {
+            *e = (Instant::now(), 0);
+        }
+        if e.1 >= self.cfg.peer_reviews_per_minute {
+            tracing::warn!(target: "ruum::runtime", %peer, "too many token reviews for one address");
+            return Err(LaunchRefusal::TooMany);
+        }
+        let refill = |b: &mut (Instant, f64), rate: u32, burst: u32| {
+            let add = b.0.elapsed().as_secs_f64() * f64::from(rate);
+            b.1 = (b.1 + add).min(f64::from(burst));
+            b.0 = Instant::now();
+        };
+        let mut t = self.tenant_reviews.lock().expect("tenant reviews lock");
+        if t.len() > 65_536 {
+            let (rate, burst) = (
+                self.cfg.tenant_review_rate_per_sec,
+                self.cfg.tenant_review_burst,
+            );
+            t.retain(|_, b| {
+                refill(b, rate, burst);
+                b.1 < f64::from(burst)
+            });
+        }
+        let tb = t
+            .entry(tenant)
+            .or_insert((Instant::now(), f64::from(self.cfg.tenant_review_burst)));
+        refill(
+            tb,
+            self.cfg.tenant_review_rate_per_sec,
+            self.cfg.tenant_review_burst,
+        );
+        if tb.1 < 1.0 {
+            tracing::warn!(target: "ruum::runtime", tenant = %tenant.0, "the token reviews of one tenant's sandboxes are at their share");
+            return Err(LaunchRefusal::NotReady);
         }
         let mut b = self.review_bucket.lock().expect("review bucket lock");
-        let burst = f64::from(self.cfg.review_burst);
-        let refill = b.0.elapsed().as_secs_f64() * f64::from(self.cfg.review_rate_per_sec);
-        b.1 = (b.1 + refill).min(burst);
-        b.0 = Instant::now();
+        refill(&mut b, self.cfg.review_rate_per_sec, self.cfg.review_burst);
         if b.1 < 1.0 {
             tracing::warn!(target: "ruum::runtime", "the token reviews of all sandboxes are at their bound");
             return Err(LaunchRefusal::NotReady);
         }
         b.1 -= 1.0;
+        tb.1 -= 1.0;
+        e.1 += 1;
         Ok(())
     }
 
@@ -1805,7 +1852,17 @@ impl Inner {
         if !ips.iter().any(|ip| canonical(*ip) == peer) {
             return Err(refuse("the token's pod is not at the peer's address"));
         }
-        self.review_budget(peer)?;
+        // The driver wrote the pod's labels (an app cannot write its pod).
+        let tenant = pod
+            .pointer(&format!(
+                "/metadata/labels/{}",
+                crate::driver::LABEL_TENANT.replace('/', "~1")
+            ))
+            .and_then(Value::as_str)
+            .and_then(|t| uuid::Uuid::parse_str(t).ok())
+            .map(TenantId)
+            .ok_or_else(|| refuse("the token's pod names no tenant"))?;
+        self.review_budget(peer, tenant)?;
         let status = self
             .api
             .token_review(bearer, &self.cfg.supervisor_audience)
@@ -1892,16 +1949,7 @@ impl Inner {
             tracing::info!(target: "ruum::runtime", pod = pod_n, reason = why, "a supervisor request must wait");
             LaunchRefusal::NotReady
         };
-        let (object, run) = pod_n
-            .rsplit_once('-')
-            .ok_or_else(|| refuse("not a sandbox pod name"))?;
-        let run: u32 = run.parse().map_err(|_| refuse("not a sandbox pod name"))?;
-        let id = object
-            .strip_prefix("ruum-i-")
-            .filter(|h| h.len() == 32)
-            .and_then(|h| uuid::Uuid::parse_str(h).ok())
-            .map(InstanceId)
-            .ok_or_else(|| refuse("not a sandbox pod name"))?;
+        let (id, run) = sandbox_pod(pod_n).ok_or_else(|| refuse("not a sandbox pod name"))?;
         let pod = self
             .api
             .get(Kind::Pod, pod_n)
@@ -2032,10 +2080,47 @@ impl Inner {
             return Err(LaunchRefusal::TooMany);
         }
         let (pod_n, pod_uid) = self.review(bearer, peer).await?;
-        let mut claimed = false;
+        // The ledger claim of this request, and whether a seal that lists the launch may have
+        // been written. A claim whose launch surely did not happen (nothing written, no answer)
+        // is released, so the supervisor's next ask can take it (review of I620-G, required
+        // change 2); one whose write may have gone through is kept: the run then ends rather
+        // than risk a second launch.
+        let mut claim: Option<RecordRef> = None;
+        let mut maybe_written = false;
+        let out = self
+            .launch_once(
+                &pod_n,
+                &pod_uid,
+                peer,
+                launch,
+                &mut claim,
+                &mut maybe_written,
+            )
+            .await;
+        if out.is_err()
+            && !maybe_written
+            && let Some(r) = claim
+            && let Err(e) = self.ledger.release(&r, &pod_uid).await
+        {
+            tracing::warn!(target: "ruum::runtime", pod = %pod_n, code = e.code(), "the seal ledger did not release a launch that did not happen");
+        }
+        out
+    }
+
+    /// The body of [`Inner::supervisor`] after the review: `claim` is set once this request
+    /// claimed the launch in the ledger, `maybe_written` once a seal that lists it may be stored.
+    async fn launch_once(
+        &self,
+        pod_n: &str,
+        pod_uid: &str,
+        peer: IpAddr,
+        launch: bool,
+        claim: &mut Option<RecordRef>,
+        maybe_written: &mut bool,
+    ) -> Result<Vec<u8>, LaunchRefusal> {
         for _ in 0..SEAL_TRIES {
-            let (s, mut rec, rv, rec_uid) = self.authorize(&pod_n, &pod_uid, peer, launch).await?;
-            let launched = s.launched.contains(&pod_uid);
+            let (s, mut rec, rv, rec_uid) = self.authorize(pod_n, pod_uid, peer, launch).await?;
+            let launched = s.launched.iter().any(|u| u == pod_uid);
             if !launch {
                 if !launched {
                     tracing::warn!(target: "ruum::runtime", pod = %pod_n, "a token request before the launch was refused");
@@ -2054,14 +2139,14 @@ impl Inner {
             // The shared claim first (backlog I620-9): whatever seal a replica reads (also one
             // put back that hides an earlier launch), the ledger answers each pod once. A ledger
             // that cannot be asked claims nothing: the supervisor asks again.
-            if !claimed {
+            if claim.is_none() {
                 let r = RecordRef {
                     tenant: rec.identity.tenant,
                     instance: rec.instance,
                     record_uid: rec_uid.clone(),
                 };
-                match self.ledger.claim_launch(&r, &pod_uid).await {
-                    Ok(true) => claimed = true,
+                match self.ledger.claim_launch(&r, pod_uid).await {
+                    Ok(true) => *claim = Some(r),
                     Ok(false) => {
                         tracing::warn!(target: "ruum::runtime", pod = %pod_n, "a second launch of a pod was refused (the seal ledger)");
                         return Err(LaunchRefusal::Forbidden);
@@ -2071,11 +2156,14 @@ impl Inner {
                         return Err(LaunchRefusal::NotReady);
                     }
                 }
+            } else if claim.as_ref().is_some_and(|c| c.record_uid != rec_uid) {
+                // The record was made again between two tries: the claim is of the old one.
+                return Err(LaunchRefusal::NotReady);
             }
             // Once per pod in the record too (the cache): the pod's uid is sealed into the
             // launched list before the answer.
             let mut next = s.clone();
-            next.launched.push(pod_uid.clone());
+            next.launched.push(pod_uid.to_owned());
             while next.launched.len() > MAX_LAUNCHED {
                 next.launched.remove(0);
             }
@@ -2085,8 +2173,14 @@ impl Inner {
                 return Err(LaunchRefusal::NotReady);
             };
             rec.sealed = Some(text);
-            match self.put(&rec, &rv).await {
-                Ok(true) => {
+            let body = pod::record_body(&self.cfg, &rec, Some(rv.as_str()));
+            match self
+                .api
+                .replace_checked(Kind::ConfigMap, &object_name(rec.instance), &body)
+                .await
+            {
+                Ok(Write::Done(_)) => {
+                    *maybe_written = true;
                     if let Err(e) = self.fresh_gen(&rec, &rec_uid, next.generation).await {
                         tracing::warn!(target: "ruum::runtime", code = e.code(), "the seal ledger did not take a new generation");
                     }
@@ -2102,8 +2196,15 @@ impl Inner {
                     };
                     return serde_json::to_vec(&answer).map_err(|_| LaunchRefusal::NotReady);
                 }
-                Ok(false) => continue,
-                Err(_) => return Err(LaunchRefusal::NotReady),
+                Ok(Write::Conflict) => continue,
+                Ok(Write::Gone) => return Err(LaunchRefusal::NotReady),
+                Err(e) => {
+                    if !e.not_written {
+                        *maybe_written = true;
+                    }
+                    tracing::warn!(target: "ruum::runtime", pod = %pod_n, code = e.error.code(), not_written = e.not_written, "the launch seal was not written");
+                    return Err(LaunchRefusal::NotReady);
+                }
             }
         }
         Err(LaunchRefusal::NotReady)
@@ -2544,21 +2645,38 @@ impl RuntimeDriver for KubeDriver {
             .api
             .create(Kind::ConfigMap, &pod::record_body(&inner.cfg, &rec, None))
             .await;
-        match made {
-            Ok(Write::Done(_)) => {}
+        let made_uid = match made {
+            Ok(Write::Done(v)) => v
+                .pointer("/metadata/uid")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             other => {
                 inner.locals.lock().expect("locals lock").remove(&id);
                 return Err(other.err().unwrap_or_else(|| RuntimeError::Internal {
                     reason: format!("the instance record {name} exists already"),
                 }));
             }
-        }
+        };
         if let Err(e) = inner.begin_run(&rec, Some(&fresh)).await {
             let _ = inner.api.delete(Kind::Pod, &pod_name(id, 1), Some(0)).await;
-            let _ = inner
+            let deleted = inner
                 .api
                 .delete(Kind::ConfigMap, &object_name(id), None)
                 .await;
+            // The marks `begin_run` may have raised go with the record (review of I620-G,
+            // required change 5a). A record that stays is the sweep's, which forgets them.
+            if deleted.is_ok()
+                && let Some(record_uid) = made_uid
+            {
+                let r = RecordRef {
+                    tenant: rec.identity.tenant,
+                    instance: id,
+                    record_uid,
+                };
+                if let Err(e) = inner.ledger.forget(&r).await {
+                    tracing::warn!(target: "ruum::runtime", code = e.code(), "the seal ledger did not forget a record that failed to start");
+                }
+            }
             inner.locals.lock().expect("locals lock").remove(&id);
             return Err(e);
         }
@@ -2919,8 +3037,6 @@ fn canonical(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// The `exp` claim of a JWT (seconds), read without checking the signature: the `TokenReview`
-/// checked the token; this only bounds how long its answer is kept.
 /// The addresses of a pod in its status (`podIPs` and `podIP`; the kubelet writes them).
 fn pod_ips(pod: &Value) -> Vec<IpAddr> {
     let mut ips: Vec<IpAddr> = pod
@@ -2985,12 +3101,40 @@ fn projected_claims(
     }
     let name = k.pointer("/pod/name").and_then(Value::as_str)?;
     let uid = k.pointer("/pod/uid").and_then(Value::as_str)?;
-    if name.is_empty() || uid.is_empty() || name.len() > 253 || uid.len() > 64 {
+    // Unverified input goes into the API path of the pod read: only the driver's own pod name
+    // and a uid in the API server's form pass (review of I620-G, required change 1).
+    sandbox_pod(name)?;
+    if !canonical_uid(uid) {
         return None;
     }
     Some((name.to_owned(), uid.to_owned()))
 }
 
+/// The instance and run of a sandbox pod name, only in the exact form [`pod_name`] writes
+/// (`ruum-i-<32 lower-case hex digits>-<run>`, no sign or leading zero): so the name is a
+/// single path segment of letters, digits and dashes.
+fn sandbox_pod(name: &str) -> Option<(InstanceId, u32)> {
+    let (object, run) = name.rsplit_once('-')?;
+    let hex = object.strip_prefix("ruum-i-")?;
+    if hex.len() != 32
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    let id = InstanceId(uuid::Uuid::parse_str(hex).ok()?);
+    let run: u32 = run.parse().ok()?;
+    (pod_name(id, run) == name).then_some((id, run))
+}
+
+/// A uid in the form the API server writes (a lower-case hyphenated UUID).
+fn canonical_uid(uid: &str) -> bool {
+    uuid::Uuid::parse_str(uid).is_ok_and(|u| u.hyphenated().to_string() == uid)
+}
+
+/// The `exp` claim of a JWT (seconds), read without checking the signature: the `TokenReview`
+/// checked the token; this only bounds how long its answer is kept.
 fn jwt_exp(token: &str) -> Option<i64> {
     use base64::Engine;
     let payload = token.split('.').nth(1)?;

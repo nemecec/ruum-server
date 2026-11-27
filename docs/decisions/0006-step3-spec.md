@@ -425,3 +425,20 @@ Kubernetes driver stays off on staging until the person turns it on (0008-5).
    the platform; `nix` (0.31, already in the tree) becomes a direct workspace dependency so the
    workspace keeps `unsafe_code = "forbid"`. The supervisor image needs a build and a pin of its
    own (a card for `.github/workflows/images.yml`, decision 0008-3).
+7. **Revised by card I620-G (2026-11-27, provisional; backlog I620-2), replacing parts of points
+   1, 4 and 6.**
+   - *Point 4:* the launch channel is **TLS 1.3 with a pinned certificate**. Every server replica
+     derives one Ed25519 key from the record key (`RecordKey::derive("ruum-supervisor-tls-v1")`)
+     and builds the same self-signed certificate; the driver writes `--server-pin sha256:<SHA-256
+     of the certificate>` into the pod's command, and the supervisor accepts only that
+     certificate. `RUUM_KUBE_SUPERVISOR_NETWORK=tls` is the default (chart
+     `runtime.supervisorNetwork: tls`); `encrypted` (plain HTTP over a node network that
+     KubeSpan or the CNI's WireGuard encrypts) stays possible. The server refuses to start the
+     driver with neither. Why not a mesh: `docs/STEP3.md` "Transport".
+   - *Points 1 and 6:* the supervisor also links `rustls` (TLS 1.3 only, the `aws-lc-rs`
+     provider) and `sha2`. So it is no longer "std, `nix` and `serde_json`" only, and the
+     primitives of `aws-lc` (C and assembly) are its only C code. `rustls`, `tokio-rustls` and
+     `aws-lc-rs` become workspace dependencies (all were in the tree already). `aws-lc-rs` and
+     not `ring`, so the tree's `rustls` keeps one provider.
+   - The launch ledger (backlog I620-9) and the review pre-check with its bounds (I620-12) are in
+     `docs/STEP3.md` "The sandbox supervisor".

@@ -349,9 +349,14 @@ secret.
        the app container has no `startedAt` (and has not ended), or the pod no address, the
        answer is `503` and the supervisor asks again; an ended app container is refused. The
        ConfigMap's seal is the encrypted cache of the values; the ledger is the authority of the
-       generation and the launches. A launch whose claim is written but whose answer is lost (the
-       connection broke, the record write kept failing) is not answered again: the run ends as
-       exited (exit 125), as for any failed launch.
+       generation and the launches. A claim whose launch surely did not happen is taken back
+       (the seal could not be made, every write try lost its race, the record was made again,
+       or the API server refused the record write with a status that writes nothing: `4xx`
+       other than `404`/`409`, `429`, `503`, or the connection was never made), so the
+       supervisor's next ask gets the launch. A claim whose write may have gone through (a
+       timeout, a cut answer, `500`, `502`, `504`) or whose answer was lost is kept and not
+       answered again: the run ends as exited (exit 125), as for any failed launch. A second
+       launch would cost more than one run.
    - **The pod's identity.** Sandbox pods run as the ServiceAccount `ruum-sandbox` of
      `ruum-apps`, which has no RoleBinding. The pod mounts one projected service account token
      with the audience `ruum-supervisor`, `expirationSeconds: 600` (refreshed by the kubelet), at
@@ -373,10 +378,12 @@ secret.
    - **The checks of the server**, for each request, all of them, before any value is read.
      First the cheap ones, which cost the API server no `TokenReview` (backlog I620-12): the
      bearer reads (unverified) as a projected token of `system:serviceaccount:ruum-apps:ruum-sandbox`
-     for the audience `ruum-supervisor`, unexpired, naming one pod (`kubernetes.io.pod`), and
-     that pod exists with that uid at the connection's peer address. Then within the review
-     bounds (per peer address 6 a minute, else `429`; all peers together 20 a second with a burst
-     of 40, else `503`): a `TokenReview` with `spec.audiences: ["ruum-supervisor"]`, and its
+     for the audience `ruum-supervisor`, unexpired, naming one pod (`kubernetes.io.pod`) by a
+     name in the driver's exact form (`ruum-i-<32 hex>-<run>`) and a uid in UUID form (nothing
+     else reaches the API path), and that pod exists with that uid at the connection's peer
+     address. Then within the review bounds (per peer address 6 a minute, else `429`; per tenant,
+     by the pod's tenant label, 4 a second with a burst of 8, and all peers together 20 a second
+     with a burst of 40, else `503`; a refused request spends none of them): a `TokenReview` with `spec.audiences: ["ruum-supervisor"]`, and its
      answer names the same pod and has
      `authenticated: true`, no error, `ruum-supervisor` in `status.audiences`, the user exactly
      `system:serviceaccount:ruum-apps:ruum-sandbox`, and exactly one value in each of the extra
