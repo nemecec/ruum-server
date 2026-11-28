@@ -14,11 +14,13 @@
 #    without a session goes to the gateway's sign-in (/.ruum/v1/auth/start) and from there to the
 #    platform's /v1/auth/login; a public app answers 200 at once. Not set: SKIP.
 # 4. A node22 app (RUUM_STAGING_SMOKE_NODE22, or STG_SMOKE_NODE22_HOST): the same checks. Only with
-#    RUUM_STAGING_SMOKE_NODE22_READY=1. The Kubernetes runtime driver and the sandbox directory
-#    exist (backlog I6-1), but no node22 app can be live on staging yet: the deploy pipeline
-#    refuses runtime node22 (runtime_not_ready), staging has no builder and no registry, and
-#    nothing makes the spec of a deployment's instance. Until those land the check prints
-#    BLOCKED (deploy/staging/README.md "The runtime driver").
+#    RUUM_STAGING_SMOKE_NODE22_READY=1, after README "node22 apps on staging" (card I6-13): the
+#    deploy pipeline builds node22 apps when the server has the Kubernetes builder, but the
+#    Kubernetes runtime driver, the builder and the cluster registry stay off on staging until the
+#    person turns them on (decision 0008-5). Until then the check prints BLOCKED. A public test
+#    app (STG_SMOKE_NODE22_PUBLIC=1) must answer 200, and with STG_SMOKE_NODE22_BODY its page must
+#    hold that text: that proves the instance runs in its sandbox behind the gateway (a gateway
+#    502 or a sign-in redirect fails). A private app gets the sign-in checks only.
 # Content behind the sign-in (the page itself) is the person's browser check (README "The app
 # runtime"): agents cannot sign in.
 set -uo pipefail
@@ -101,10 +103,23 @@ fi
 
 # 4. A node22 app.
 node="${RUUM_STAGING_SMOKE_NODE22:-$(secret STG_SMOKE_NODE22_HOST)}"
+public="${RUUM_STAGING_SMOKE_NODE22_PUBLIC:-$(secret STG_SMOKE_NODE22_PUBLIC)}"
+body="${RUUM_STAGING_SMOKE_NODE22_BODY:-$(secret STG_SMOKE_NODE22_BODY)}"
 if [[ "${RUUM_STAGING_SMOKE_NODE22_READY:-}" != 1 ]]; then
-  echo "BLOCKED node22 app: the Kubernetes runtime driver (I6-1) is off on staging until S-89, node22 deploys are refused (runtime_not_ready) and staging has no builder or registry yet; the gateway answers 502 after the sign-in"
+  echo "BLOCKED node22 app: the Kubernetes runtime driver, the builder and the cluster registry are off on staging (decision 0008-5); README \"node22 apps on staging\" turns them on, then RUUM_STAGING_SMOKE_NODE22_READY=1"
 elif [[ -n "$node" && "$node" == *".$APPS" ]]; then
   app_checks node22 "$node"
+  if [[ "$public" == 1 ]]; then
+    page="$(c -o - -w '\n%{http_code}' "https://$node/" 2>/dev/null || true)"
+    code="${page##*$'\n'}"
+    if [[ "$code" != 200 ]]; then
+      fail "node22: the public app $node answers ${code:-nothing}, not 200 (502: the gateway has no running instance; see the deployment's stages and the server log)"
+    elif [[ -n "$body" && "$page" != *"$body"* ]]; then
+      fail "node22: the page of $node does not hold STG_SMOKE_NODE22_BODY"
+    else
+      pass "node22: the public app $node answers 200 from its sandbox${body:+ with the expected text}"
+    fi
+  fi
 else
   fail "node22 app: RUUM_STAGING_SMOKE_NODE22_READY=1 needs STG_SMOKE_NODE22_HOST under $APPS"
 fi

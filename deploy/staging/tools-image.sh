@@ -9,7 +9,8 @@
 #
 # What is in it:
 #   - the base TOOLS_BASE_IMAGE of versions.env (Alpine, pinned by digest), with bash, coreutils,
-#     curl, jq, openssl and socat (tunnel-relay.sh) from that Alpine release;
+#     curl, jq, openssl, socat (tunnel-relay.sh) and apache2-utils (htpasswd: the cluster
+#     registry's bcrypt hashes, card I6-13) from that Alpine release;
 #   - OpenTofu, talosctl, kubectl, helm, helmfile, cosign, hcloud and hcloud-upload-image, each
 #     downloaded by setup.sh at the version of versions.env and checked against its SHA-256 there
 #     (the same pins as CI);
@@ -40,7 +41,7 @@ image_name() {
 build_script() {
   cat <<'SH'
 set -eu
-apk add --no-cache bash coreutils curl jq openssl socat ca-certificates >/dev/null
+apk add --no-cache bash coreutils curl jq openssl socat ca-certificates apache2-utils >/dev/null
 RUUM_TOOLS_BIN=/usr/local/bin bash /src/setup.sh
 arch="$(uname -m)"
 case "$arch" in aarch64) p=linux_arm64 ;; x86_64) p=linux_amd64 ;; *) echo "unsupported $arch" >&2; exit 1 ;; esac

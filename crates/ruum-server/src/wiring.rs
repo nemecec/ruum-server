@@ -302,6 +302,7 @@ pub fn install_apps(
                 );
             }
             tokio::spawn(sweep_builds(b.builder.clone()));
+            tokio::spawn(mirror_base(b.builder.clone()));
             tracing::info!("node22 deployments: the Kubernetes builder (card I6-13)");
         }
         services.sandboxes = Some(Arc::new(
@@ -515,6 +516,30 @@ async fn sweep_builds(builder: Arc<ruum_runtime::builder::kube::KubeBuilder>) {
                 tracing::warn!(target: "ruum::runtime", code = e.code(), "the sweep of build pods failed")
             }
         }
+    }
+}
+
+/// Copies the node22 base image into the cluster registry once (P-84), trying again every
+/// minute while the registry or Docker Hub cannot be reached. Builds fail until it is there.
+async fn mirror_base(builder: Arc<ruum_runtime::builder::kube::KubeBuilder>) {
+    loop {
+        match builder
+            .mirror_base(
+                "https://registry-1.docker.io",
+                "https://auth.docker.io/token",
+            )
+            .await
+        {
+            Ok(true) => {
+                tracing::info!(target: "ruum::runtime", "the node22 base image is mirrored into the cluster registry");
+                return;
+            }
+            Ok(false) => return,
+            Err(e) => {
+                tracing::warn!(target: "ruum::runtime", error = %e, "the node22 base image is not in the cluster registry yet; trying again in a minute")
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
     }
 }
 

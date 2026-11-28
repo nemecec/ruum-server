@@ -366,6 +366,24 @@ live() {
   patch_refused "$r" ruum
   want no "$r" - create pods
   want no "$r" - list secrets
+  # The Kubernetes builder (card I6-13, charts/platform builder-rbac.yaml): the build pods in
+  # ruum-builds and their logs, nothing else there; the build pods' account has no right.
+  for verb in create get list delete; do want yes "$r" ruum-builds "$verb" pods; done
+  want yes "$r" ruum-builds get pods log
+  for verb in create get list watch patch update delete deletecollection; do want no "$r" ruum-builds "$verb" secrets; done
+  for sub in exec attach portforward; do want no "$r" ruum-builds create pods "$sub"; done
+  for verb in update patch; do want no "$r" ruum-builds "$verb" pods status; done
+  want no "$r" ruum-builds patch pods
+  want no "$r" ruum-builds create configmaps
+  want no "$r" ruum-builds create serviceaccounts token
+  want no "$r" ruum-registry get secrets
+  want no "$r" ruum-registry create pods
+  local bu="system:serviceaccount:ruum-builds:ruum-build"
+  for verb in get list create; do
+    want no "$bu" ruum-builds "$verb" pods
+    want no "$bu" ruum-builds "$verb" secrets
+  done
+  want no "$bu" - create tokenreviews.authentication.k8s.io
   local o="system:serviceaccount:$OBSERVER_NS:$OBSERVER" resource
   for ns in ruum edge ruum-deploy; do
     for resource in pods events events.events.k8s.io deployments.apps daemonsets.apps replicasets.apps jobs.batch; do
@@ -421,7 +439,7 @@ live() {
     done
     audit_rights "$identity" - "$allowed"
   done
-  [[ $fail == 0 ]] && echo "rbac-check: the live deployer may only write release requests; the controller has the deploy rights and no Secret; the observer is read-only; the runtime driver has its sandbox rights in ruum-apps and TokenReviews only and no verb on Secrets (a no-op patch is refused); the sandbox account has none"
+  [[ $fail == 0 ]] && echo "rbac-check: the live deployer may only write release requests; the controller has the deploy rights and no Secret; the observer is read-only; the runtime driver has its sandbox rights in ruum-apps and TokenReviews only and no verb on Secrets (a no-op patch is refused); the sandbox account has none; the builder has the build pods of ruum-builds only and the build account has none"
   return "$fail"
 }
 

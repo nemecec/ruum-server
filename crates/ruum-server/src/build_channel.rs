@@ -165,14 +165,14 @@ mod tests {
     }
 }
 
-/// The build pod's program for real (card I6-13): `RUUM_BUILD_SCRIPT_E2E=1` on a host with
-/// Docker and the runtime `runsc` (the build server). A fake API server plays the cluster: it
-/// runs each build pod as a gVisor container of the pinned `node:22-alpine` platform image,
-/// with the pod's command, environment, user and size-limited writable folders. The channel is
-/// this module's router on the supervisor listener's TLS identity, so the program's pin, the
-/// token, the address check, `npm ci`, the build command and the output upload all run for
-/// real. The registry is not there, so a build whose output arrived and was read ends at the
-/// registry (`Unavailable`), and a build whose command fails ends with its log.
+/// The Kubernetes builder end to end on Docker (card I6-13): `RUUM_BUILD_SCRIPT_E2E=1` on a host
+/// with Docker and the runtime `runsc` (the build server; it pulls from Docker Hub). A fake API
+/// server plays the cluster: it runs each build pod as a gVisor container with the pod's image,
+/// command, environment, user and writable folders. The channel is this module's router on the
+/// supervisor listener's TLS identity, and the registry is a `registry:2` of the run. So the base
+/// mirror, the program's pin, the token, the address check, `npm ci` with an install script, the
+/// build command, the output upload, the assembly and the push all run for real, and the built
+/// image then serves on `$PORT` in gVisor. A build whose command fails ends with its log.
 #[cfg(test)]
 mod e2e {
     use super::*;
@@ -187,8 +187,6 @@ mod e2e {
     use std::collections::HashMap;
     use std::process::Command;
     use std::sync::Mutex;
-
-    const IMAGE_REPO: &str = "library/node";
 
     fn docker(args: &[&str]) -> Result<String, String> {
         let o = Command::new("docker")
@@ -372,10 +370,41 @@ mod e2e {
             .await
             .unwrap();
         let port = listener.local_addr().unwrap().port();
+        // A registry of this run (anonymous; staging's has users), reachable by the engine at
+        // 127.0.0.1 (an insecure registry Docker allows there).
+        let reg = format!("{}-registry", label.split('=').nth(1).unwrap());
+        docker(&[
+            "run",
+            "-d",
+            "--name",
+            &reg,
+            "--label",
+            &label,
+            "-p",
+            "127.0.0.1::5000",
+            "registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373",
+        ])
+        .expect("a registry");
+        let port_line = docker(&["port", &reg, "5000/tcp"]).unwrap();
+        let reg_port = port_line
+            .lines()
+            .next()
+            .unwrap()
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .to_owned();
+        let node_registry = format!("127.0.0.1:{reg_port}");
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(&node_registry).is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         let mut cfg = KubeBuilderConfig::new(
             &api_url,
-            "docker.io",
-            "http://127.0.0.1:9",
+            &node_registry,
+            &format!("http://{node_registry}"),
             &gateway,
             port,
             ChannelTls {
@@ -383,7 +412,6 @@ mod e2e {
                 pin: tls.pin.clone(),
             },
         );
-        cfg.base_repository = IMAGE_REPO.to_owned();
         // The platform of this engine (the build server is arm64; staging's nodes are amd64).
         cfg.node_arch = docker(&["info", "-f", "{{.Architecture}}"]).expect("docker info");
         let builder = Arc::new(
@@ -399,13 +427,14 @@ mod e2e {
                 let _ = stopped.await;
             },
         ));
+        let ident = WorkloadIdentity {
+            tenant: TenantId::new(),
+            app: NodeId::new(),
+            deployment: uuid::Uuid::now_v7(),
+            environment: Environment::Preview,
+        };
         let input = |archive| BuildInput {
-            identity: WorkloadIdentity {
-                tenant: TenantId::new(),
-                app: NodeId::new(),
-                deployment: uuid::Uuid::now_v7(),
-                environment: Environment::Preview,
-            },
+            identity: ident,
             runtime: "node22".into(),
             archive,
             limits: Limits {
@@ -430,7 +459,6 @@ mod e2e {
                 "require('http').createServer((q,s)=>s.end('hi')).listen(process.env.PORT)\n",
             ),
         ]);
-        let err = builder.build(input(ok)).await.unwrap_err();
         let cleanup = || {
             if let Ok(ids) = docker(&["ps", "-aq", "--filter", &format!("label={label}")]) {
                 for id in ids.lines().filter(|l| !l.is_empty()) {
@@ -438,8 +466,29 @@ mod e2e {
                 }
             }
         };
-        let at_registry = matches!(&err, RuntimeError::Unavailable { reason } if reason.starts_with("the registry"));
-        if !at_registry {
+        // The base image into the registry (P-84), once.
+        let mirrored = builder
+            .mirror_base(
+                "https://registry-1.docker.io",
+                "https://auth.docker.io/token",
+            )
+            .await;
+        if let Err(e) = &mirrored {
+            cleanup();
+            panic!("the base image mirror failed: {e}");
+        }
+        assert!(
+            !builder
+                .mirror_base(
+                    "https://registry-1.docker.io",
+                    "https://auth.docker.io/token"
+                )
+                .await
+                .unwrap(),
+            "the second mirror finds the base there"
+        );
+        let built = builder.build(input(ok)).await;
+        if let Err(err) = &built {
             if let Ok(ids) = docker(&["ps", "-aq", "--filter", &format!("label={label}")]) {
                 for id in ids.lines() {
                     let o = Command::new("docker").args(["logs", id]).output().unwrap();
@@ -451,7 +500,61 @@ mod e2e {
                 }
             }
             cleanup();
-            panic!("the build did not reach the registry step: {err:?}");
+            panic!("the build failed: {err:?}");
+        }
+        let out = built.unwrap();
+        let ruum_core::runtime::ImageRef::Oci(digest) = &out.image else {
+            panic!("not an OCI image");
+        };
+        assert!(
+            out.logs
+                .iter()
+                .any(|l| l.text.contains("ruum-build: output")),
+            "{:?}",
+            out.logs
+        );
+        // The image runs in gVisor and serves on $PORT: the build's output and its start command.
+        let image = format!(
+            "{node_registry}/{}@{digest}",
+            ruum_runtime::repository(&ident)
+        );
+        let run = format!("{}-app", reg);
+        let started = docker(&[
+            "run",
+            "-d",
+            "--name",
+            &run,
+            "--label",
+            &label,
+            "--runtime",
+            "runsc",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--user",
+            "10001:10001",
+            "-e",
+            "PORT=8080",
+            &image,
+        ]);
+        let mut answer = String::new();
+        if started.is_ok() {
+            for _ in 0..50 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                if let Ok(a) = docker(&["exec", &run, "wget", "-qO-", "http://127.0.0.1:8080/"]) {
+                    answer = a;
+                    break;
+                }
+            }
+        }
+        let files =
+            docker(&["exec", &run, "cat", "/app/dist.txt", "/app/post.txt"]).unwrap_or_default();
+        if answer != "hi" || !files.contains("built") || !files.contains("postinstall ran") {
+            let logs = docker(&["logs", &run]).unwrap_or_default();
+            cleanup();
+            panic!(
+                "the built image does not serve: start {started:?}, answer {answer:?}, files {files:?}, logs {logs}"
+            );
         }
         // A build command that fails: the build fails with the end of its log.
         let bad = tar(&[

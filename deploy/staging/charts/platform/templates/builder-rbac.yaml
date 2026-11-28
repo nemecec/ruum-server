@@ -1,0 +1,107 @@
+# The rights of the Kubernetes builder (card I6-13; crates/ruum-runtime src/builder/kube.rs): the
+# ServiceAccount of ruum-server may make, read, list and delete the build pods in ruum-builds and
+# read their logs, nothing else there. No Secret verb, no exec, attach or port-forward. The
+# admission rules of ruum-builds (k8s/manifests/builds-admission.yaml) limit what it may create.
+# Keep rules on one line: ops/rbac-check.sh checks each line.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ruum-builder
+  namespace: ruum-builds
+rules:
+  - { apiGroups: [""], resources: [pods], verbs: [create, get, list, delete] }
+  - { apiGroups: [""], resources: [pods/log], verbs: [get] }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ruum-builder
+  namespace: ruum-builds
+subjects:
+  - kind: ServiceAccount
+    name: ruum-server
+    namespace: ruum
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ruum-builder
+---
+# The identity of the build pods: no RoleBinding anywhere, no token (automount off, and the pods
+# mount none).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ruum-build
+  namespace: ruum-builds
+automountServiceAccountToken: false
+---
+# Build pods: nothing reaches them.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: ruum-builds
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+# Build pods reach the egress proxy (the npm registry) and the server's build channel (port
+# 8092), nothing else: no DNS, no other pod, no platform service, no metadata address.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: builds-only-to-egress-and-channel
+  namespace: ruum-builds
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ruum }
+          podSelector:
+            matchLabels: { app: ruum-egress }
+      ports:
+        - { protocol: TCP, port: 3128 }
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ruum }
+          podSelector:
+            matchLabels: { app: ruum-server }
+      ports:
+        - { protocol: TCP, port: 8092 }
+---
+# The server's build channel: only build pods reach it, on its own port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: build-channel-from-builds
+  namespace: ruum
+spec:
+  podSelector:
+    matchLabels: { app: ruum-server }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ruum-builds }
+      ports:
+        - { protocol: TCP, port: 8092 }
+---
+# The egress proxy: build pods reach it too (the npm registry; it identifies a build by its
+# registered address like a sandbox).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-from-builds
+  namespace: ruum
+spec:
+  podSelector:
+    matchLabels: { app: ruum-egress }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ruum-builds }
+      ports:
+        - { protocol: TCP, port: 3128 }

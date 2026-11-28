@@ -832,6 +832,87 @@ impl KubeBuilder {
             .map_err(|_| ChannelRefusal::NotFound)
     }
 
+    /// Copies the base image of the nodes' platform (the pinned index's entry) from Docker Hub
+    /// into the cluster registry's base repository, byte for byte, unless it is there already
+    /// (P-84 "mirror ruum-base/node22"). Every blob and the manifest are checked against their
+    /// digests; the push uses the builder's credential. The build pods and the assembly read the
+    /// base from there only. `hub` is the Docker Hub registry (`https://registry-1.docker.io`),
+    /// `auth` its token service.
+    pub async fn mirror_base(&self, hub: &str, auth: &str) -> Result<bool, RuntimeError> {
+        let push = registry::RepositoryPush::new(
+            &self.cfg.registry_url,
+            self.cfg.base_repository.clone(),
+            self.cfg.base_repository.clone(),
+            self.cfg.credential.clone(),
+            self.cfg.token_realm.as_deref(),
+        )?;
+        if push.base_manifest(&self.base_manifest).await.is_ok() {
+            return Ok(false);
+        }
+        let arch = oci::engine_architecture(&self.cfg.node_arch)?;
+        let d = oci::select_manifest(super::EMBEDDED_INDEX, arch)?;
+        let un = |what: &str, e: &dyn std::fmt::Display| RuntimeError::Unavailable {
+            reason: format!("mirroring the base image ({what}): {e}"),
+        };
+        let c = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| un("client", &e))?;
+        #[derive(serde::Deserialize)]
+        struct Tok {
+            token: String,
+        }
+        let tok: Tok = c
+            .get(format!(
+                "{auth}?service=registry.docker.io&scope=repository:library/node:pull"
+            ))
+            .send()
+            .await
+            .map_err(|e| un("token", &e))?
+            .json()
+            .await
+            .map_err(|e| un("token", &e))?;
+        let from = format!("{}/v2/library/node", hub.trim_end_matches('/'));
+        let manifest = c
+            .get(format!("{from}/manifests/{}", d.digest))
+            .bearer_auth(&tok.token)
+            .header("Accept", &d.media_type)
+            .send()
+            .await
+            .map_err(|e| un("manifest", &e))?
+            .bytes()
+            .await
+            .map_err(|e| un("manifest", &e))?;
+        if OciDigest::of(&manifest) != self.base_manifest {
+            return Err(un("manifest", &"the manifest does not match the pin"));
+        }
+        let m = oci::parse_manifest(&manifest)?;
+        for b in std::iter::once(&m.config).chain(m.layers.iter()) {
+            let data = c
+                .get(format!("{from}/blobs/{}", b.digest))
+                .bearer_auth(&tok.token)
+                .send()
+                .await
+                .map_err(|e| un("blob", &e))?
+                .bytes()
+                .await
+                .map_err(|e| un("blob", &e))?;
+            if OciDigest::of(&data).as_str() != b.digest {
+                return Err(un(
+                    "blob",
+                    &format!("{} does not match its digest", b.digest),
+                ));
+            }
+            push.push_blob(&OciDigest::parse(&b.digest)?, data).await?;
+        }
+        let got = push.push_manifest(&d.media_type, manifest).await?;
+        if got != self.base_manifest {
+            return Err(un("manifest", &"the registry stored another digest"));
+        }
+        Ok(true)
+    }
+
     /// The pods of builds that this or another server process left behind: the pods of the
     /// builder in the namespace that no running build of this process owns and that are older
     /// than `age`. Deletes them; the count. (A server that restarts mid-build leaves its pod.)

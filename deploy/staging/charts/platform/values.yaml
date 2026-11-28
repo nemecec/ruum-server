@@ -55,3 +55,22 @@ deployController:
   image: ""
   # The commit of main the image was built from (40 hex); k8s/apply.sh sets it.
   commit: ""
+
+# The cluster registry of app images (card I6-13; templates/registry.yaml): zot, by digest. Off
+# until the README's "node22 apps" steps turn it on. Pull for the nodes (user ruum-pull, Talos
+# RegistryAuthConfig), push for the builder (ruum-push), no anonymous access. Images are pushed
+# and run by digest only; garbage collection removes blobs that no manifest names (failed
+# pushes). Manifests are kept: only the platform knows which deployments can still serve or roll
+# back (backlog I613-4).
+registry:
+  enabled: false
+  image: ghcr.io/project-zot/zot-linux-amd64:v2.1.20@sha256:95a837a0afacf5b7edc0c92493f04beee6891989b8d2fd50a00cf65a1e6d4fd5
+  # A fixed address in the service range: containerd on the nodes has no cluster DNS, so the
+  # Talos mirror of registry.ruum.internal:5000 points here (talos/patches, tofu var
+  # registry_pull_password). Inside 10.96.0.0/12, the Talos default service subnet.
+  clusterIP: 10.96.0.50
+  size: 20Gi
+  storageClass: local-path
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 512Mi }

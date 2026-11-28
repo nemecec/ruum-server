@@ -121,6 +121,9 @@ k apply -f "$HERE/manifests/runtimeclass.yaml" >/dev/null
 # instance Secret (Kimi run 15 I6-1 finding 4), before anything can make one.
 log "the admission rules of ruum-apps: gVisor only, instance Secrets only (backlog S-83, I6-1)"
 k apply -f "$HERE/manifests/apps-admission.yaml" >/dev/null
+# The build pods of the Kubernetes builder (card I6-13): their shape, and no Secret in ruum-builds.
+log "the admission rules of ruum-builds: the build pod's shape only, no Secret (card I6-13)"
+k apply -f "$HERE/manifests/builds-admission.yaml" >/dev/null
 
 log "secrets, one per consumer"
 # CNPG: the backup writer key only (object read/write, no delete; review 1 B-3).
@@ -223,6 +226,24 @@ printf 'control-token=%s\n' "$STG_EGRESS_CONTROL_TOKEN" | secret ruum ruum-egres
 if [[ -n "${STG_RUUM_RUNTIME_RECORD_KEY:-}" ]]; then
   [[ "$STG_RUUM_RUNTIME_RECORD_KEY" =~ ^[0-9a-f]{64}$ ]] || die "STG_RUUM_RUNTIME_RECORD_KEY is not 64 lowercase hexadecimal characters"
   printf 'record-key=%s\n' "$STG_RUUM_RUNTIME_RECORD_KEY" | secret ruum ruum-runtime-record-key
+fi
+# The cluster registry (card I6-13): two users, pull for the nodes (Talos RegistryAuthConfig) and
+# push for the builder; no anonymous access. The registry reads bcrypt hashes (htpasswd of the
+# tools image); the builder reads its password from a file in the server pods. Optional until
+# the registry is turned on (secrets-init.sh makes both).
+if [[ -n "${STG_REGISTRY_PULL_PASSWORD:-}" && -n "${STG_REGISTRY_PUSH_PASSWORD:-}" ]]; then
+  [[ "$STG_REGISTRY_PULL_PASSWORD" =~ ^[A-Za-z0-9]{32,}$ && "$STG_REGISTRY_PUSH_PASSWORD" =~ ^[A-Za-z0-9]{32,}$ ]] ||
+    die "STG_REGISTRY_PULL_PASSWORD and STG_REGISTRY_PUSH_PASSWORD must be 32 or more letters and digits"
+  # bcrypt salts are random: the Secret is made once (delete it to rotate the passwords).
+  if ! k -n ruum-registry get secret ruum-registry-auth >/dev/null 2>&1; then
+    {
+      htpasswd -nbB -C 10 ruum-pull "$STG_REGISTRY_PULL_PASSWORD" | head -1
+      htpasswd -nbB -C 10 ruum-push "$STG_REGISTRY_PUSH_PASSWORD" | head -1
+    } | k create secret generic ruum-registry-auth -n ruum-registry --from-file=htpasswd=/dev/stdin \
+      --dry-run=client -o yaml | k apply -f - >/dev/null
+    log "secret ruum-registry/ruum-registry-auth"
+  fi
+  printf 'push-password=%s\n' "$STG_REGISTRY_PUSH_PASSWORD" | secret ruum ruum-registry-push
 fi
 deny_before="$(k -n ruum get configmap ruum-egress-deny -o jsonpath='{.data.deny}' 2>/dev/null || true)"
 k -n ruum create configmap ruum-egress-deny --from-literal="deny=$STG_EGRESS_DENY" --dry-run=client -o yaml |

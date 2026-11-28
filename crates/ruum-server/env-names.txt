@@ -135,3 +135,15 @@ RUUM_GALLERY_DIR optional
 RUUM_GALLERY_STRICT optional
 # Writes gallery/reference/app-yaml.md again (crates/ruum-core/src/templates/tests.rs).
 RUUM_WRITE_GALLERY_REFERENCE test
+# The node22 builder on Kubernetes (card I6-13).
+RUUM_BUILDER optional
+RUUM_BUILD_REGISTRY_URL optional
+RUUM_BUILD_PUSH_USER optional
+RUUM_BUILD_PUSH_PASSWORD_FILE optional
+RUUM_BUILD_CHANNEL_SERVICE optional
+RUUM_BUILD_CHANNEL_LISTEN optional
+RUUM_BUILD_NAMESPACE optional
+RUUM_BUILD_OUTPUT_MAX optional
+RUUM_BUILD_MAX_PARALLEL optional
+RUUM_BUILD_TENANT_MAX optional
+RUUM_BUILD_SCRIPT_E2E test
