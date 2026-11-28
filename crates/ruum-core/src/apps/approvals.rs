@@ -28,7 +28,7 @@
 //! `manage` on every database that the request lists (`changes.migrations`,
 //! `changes.planned_columns`) and that the decision's `classes` name. Else `403
 //! permission_denied`; the error names no database. A request that is not pending is `409
-//! conflict`. `comment` has at most 500 characters. `telemetry_fields` are confirmed as
+//! conflict`. `comment` has at most 500 characters and no NUL. `telemetry_fields` are confirmed as
 //! `confirmAppTelemetryFields` confirms them (`manage` on the app, the same rules) before the
 //! decision is stored; when that is refused, the request stays pending. `classes` must each name
 //! a planned column of the request (else `422` with the pointer of the entry) and are stored on
@@ -866,7 +866,10 @@ impl AppService {
 
     /// `getAppApproval`: `edit` on the app; an agent gets `404` for a request it did not make.
     /// With `wait` (capped as `getAppDeployment`'s long poll) the call returns as soon as the
-    /// status changes, else after the wait with the same state.
+    /// status changes, else after the wait with the same state. Only a `pending` or `approved`
+    /// request can still change (a decision, a use, its expiry); a request in a final state
+    /// (`denied`, `used`, `expired`) returns at once, so a waited read of an old request does
+    /// not hold the call or read the store again (review of W-3b, 1).
     pub async fn get_approval(
         &self,
         ctx: &Context,
@@ -887,10 +890,10 @@ impl AppService {
         let first = read().await?;
         let start = crate::now();
         let wait = wait.min(self.deps.config.max_wait).min(super::MAX_WAIT);
-        if wait.is_zero() {
+        let status = status_at(&first, start);
+        if wait.is_zero() || !matches!(status, "pending" | "approved") {
             return Ok(view(&first, public_url, start));
         }
-        let status = status_at(&first, start);
         let deadline = tokio::time::Instant::now() + wait;
         loop {
             let notified = self.changed.notified();
@@ -902,7 +905,9 @@ impl AppService {
             if status_at(&a, at) != status || left.is_zero() {
                 return Ok(view(&a, public_url, at));
             }
-            // A pending request also changes when it expires.
+            // A pending or approved request also changes when it expires. Here the status is
+            // still the first one (pending or approved), so `expires_at` is ahead: past it, the
+            // status read above would have been `expired` and the call would have returned.
             let to_expiry = Duration::try_from(a.expires_at - at).unwrap_or(Duration::ZERO);
             let nap = left
                 .min(self.deps.config.poll_every)
@@ -943,6 +948,14 @@ impl AppService {
             .is_some_and(|c| c.chars().count() > COMMENT_MAX_CHARS)
         {
             return Err(invalid("comment has at most 500 characters", "/comment"));
+        }
+        // Postgres `text` cannot hold U+0000: refuse it here, the same for every store (review of
+        // W-3b, 2).
+        if req.comment.as_ref().is_some_and(|c| c.contains('\0')) {
+            return Err(invalid(
+                "comment must not contain a NUL character",
+                "/comment",
+            ));
         }
         let telemetry = req.telemetry_fields.unwrap_or_default();
         let classes = req.classes.unwrap_or_default();

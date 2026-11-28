@@ -51,9 +51,10 @@
 //! (D is a SQLite database, which an app cannot bind: card B-1d, backlog D5-2). Both tenants
 //! have the platform admin's approval of public apps and custom domains. The pending publish
 //! request of W is a request of `agent` for a ready preview of W (card W-3b; seeded through the
-//! store; its `view` scope cannot publish through the API). I is a `report` issue of W in `Projects` (the reporter is not a
-//! member, so it has a receipt token); K is a project template whose setup makes a database and
-//! an app; the setup made the project `<prefix>-from-kit` in `Projects`.
+//! store; its `view` scope cannot publish through the API). I is a `report` issue of W in
+//! `Projects` (the reporter is not a member, so it has a receipt token); K is a project template
+//! whose setup makes a database and an app; the setup made the project `<prefix>-from-kit` in
+//! `Projects`.
 //!
 //! The tag T was made by `member`. The upload sessions were started by `member`. The web session
 //! and the WebDAV app password belong to `member`. The invitation is for a new email address with the role `member`. The

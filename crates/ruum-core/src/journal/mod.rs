@@ -90,8 +90,9 @@ pub enum EventType {
     /// rule of its own.
     AppTelemetryFieldsConfirmed,
     /// A person decided an agent's publish request (card W-3b). On the app node, IDs, the
-    /// decision and a count only; it changes no person's or agent's view of any node, so it
-    /// needs no feed rule of its own.
+    /// decision and a count only. It changes no person's or agent's view of any node, but it
+    /// has a feed rule of its own (`journal::feed`): it reaches only those who read publish
+    /// requests, `edit` on the app, and an agent only for its own request (review R14).
     AppApprovalDecided,
     /// A type written by a newer release; the name as written (interned, see
     /// [`EventType::from_wire`]).

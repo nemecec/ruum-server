@@ -1156,7 +1156,8 @@ async fn who_decides_and_with_which_rights() {
         .await
         .unwrap_err();
     assert_eq!(e.http_status(), 403);
-    // The body: a long comment, classes for a column that is not planned, lists with a deny.
+    // The body: a long comment, a comment with NUL (Postgres `text` cannot hold it), classes for
+    // a column that is not planned, lists with a deny.
     let e = w
         .decide(
             &w.o(),
@@ -1167,6 +1168,17 @@ async fn who_decides_and_with_which_rights() {
         .await
         .unwrap_err();
     assert_eq!(e.http_status(), 422);
+    let e = w
+        .decide(
+            &w.o(),
+            app,
+            id,
+            json!({ "decision": "approve", "comment": "a\u{0}b" }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.http_status(), 422);
+    assert_eq!(e.to_api().details.unwrap()["pointer"], "/comment");
     let e = w
         .decide(
             &w.o(),
@@ -1630,6 +1642,74 @@ async fn get_with_wait_returns_when_the_person_decides() {
     let (v, took) = waiter.await.unwrap();
     assert_eq!(v["status"], "approved");
     assert!(took < Duration::from_secs(10), "{took:?}");
+}
+
+/// A waited read of a request in a final state (`expired`, `denied`, `used`) returns at once: it
+/// can never change, so the call neither holds nor reads the store in a loop (review of W-3b, 1;
+/// before the fix an expired request was read every 10 ms for the whole wait).
+#[tokio::test]
+async fn get_with_wait_returns_at_once_for_a_final_state() {
+    let w = world().await;
+    let app = w.app("Final").await;
+    let site = w
+        .site("site", &[("app.yaml", MANIFEST), ("index.html", INDEX)])
+        .await;
+    let agent = w.agent(w.editor).await;
+    let dep = w.preview(&agent, app, site).await;
+    let waited = |id: Uuid| {
+        let (w, agent) = (&w, agent.clone());
+        async move {
+            let t = std::time::Instant::now();
+            let v =
+                w.s.apps
+                    .get_approval(&agent, app, id, Duration::from_secs(20), URL)
+                    .await
+                    .unwrap();
+            let took = t.elapsed();
+            assert!(
+                took < Duration::from_secs(2),
+                "{} took {took:?}",
+                v["status"]
+            );
+            v["status"].as_str().unwrap().to_owned()
+        }
+    };
+    // Expired: pending past its time.
+    let expired = Uuid::now_v7();
+    w.s.apps
+        .store()
+        .insert_approval(
+            &agent,
+            NewApproval {
+                id: expired,
+                app_node_id: app,
+                deployment_id: dep,
+                changes: json!({}),
+                bound_archive_hash: [0; 32],
+                bound_manifest_hash: [0; 32],
+                bound_bindings: json!([]),
+                expires_at: crate::now() - time::Duration::seconds(1),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(waited(expired).await, "expired");
+    // Denied.
+    let denied = w.ask(&agent, app, dep).await;
+    w.decide(&w.o(), app, denied, json!({ "decision": "deny" }))
+        .await
+        .unwrap();
+    assert_eq!(waited(denied).await, "denied");
+    // Used.
+    let used = w.ask(&agent, app, dep).await;
+    w.decide(&w.o(), app, used, json!({ "decision": "approve" }))
+        .await
+        .unwrap();
+    assert!(matches!(
+        w.publish(&agent, app, dep, Some(used)).await.unwrap(),
+        Published::Live(_)
+    ));
+    assert_eq!(waited(used).await, "used");
 }
 
 /// `app.approval_decided` in the changes feed reaches only those who read publish requests:
