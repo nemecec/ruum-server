@@ -658,16 +658,20 @@ refuses to render.
 The binding that S-89 asked for exists (card I6-20), and the gate rows of card I620-G are built
 (I620-1 the published supervisor image, I620-2 TLS on the launch channel, I620-3 the gVisor
 proofs, I620-9 the shared launch ledger, I620-12 the bound on TokenReviews, I6-19 the kubelet
-PID limit; T-85 and I620-13 before them). The driver stays off until the person decides
-(decision 0008-5). Each step stops on the first error; the live release keeps serving.
+PID limit; T-85 and I620-13 before them). Card I620-R built the last driver rows (I620-16 the
+first seal binds the record as made, I620-8 a pod that its seal does not name is ended, I620-10
+the platform PriorityClass setting, I620-14 a clear error for a record too large for its
+ConfigMap, I620-11 parked Docker rings, and the start deadline of I6-21). The driver stays off
+until the person decides (decision 0008-5). Each step stops on the first error; the live release
+keeps serving.
 
 The person:
 
 1. Decide to turn it on: a line in `docs/decisions/0008-person-decisions-2026-11-13.md` item 5
    (or a new decision), after reading `docs/STEP3.md` "The sandbox supervisor" (threat model,
    known limits) and decision 0006 I. The open rows that stay accepted while only test values
-   run: `docs/backlog/2026-11-26-i620.md` "Open after card I620-G" (among them I620-6 and
-   I620-15, both a hostile app's harm to its own run only).
+   run: `docs/backlog/2026-11-26-i620.md` "Open after card I620-R" (I620-4, I620-5, I620-7 and
+   the person's I620-6 and I620-15, both a hostile app's harm to its own run only).
 2. GitHub, once, after the first `images.yml` run on main that publishes it: the package
    `ruum-supervisor` public (Your profile, Packages, `ruum-supervisor`, Package settings, "Change
    visibility", Public), like `ruum-gateway`. Until then `ops/deploy-chart.sh` finds no
@@ -679,8 +683,8 @@ The person:
 
 The orchestrator (the platform first, then the checks, then the switch):
 
-4. **The release with the gate**: deploy a commit of main that holds card I620-G
-   (`deploy/staging/deploy.sh <sha>`). Its migration step adds `runtime_seal_marks` and
+4. **The release with the gate**: deploy a commit of main that holds cards I620-G and I620-R
+   (`deploy/staging/deploy.sh <sha>`; no migration of its own in I620-R). Its migration step adds `runtime_seal_marks` and
    `runtime_launches` (expand only); its `images.yml` run published
    `ghcr.io/nemecec/ruum-supervisor:<sha>` with provenance (the Digest line of the run's summary,
    `GH_TOKEN=$(gh auth token --user nemecec) gh run view <run id> --repo nemecec/ruum-server`).
@@ -726,6 +730,14 @@ The orchestrator (the platform first, then the checks, then the switch):
      Secrets ...; the sandbox account has none".
    - `deploy/staging/tool.sh kubectl -n ruum get secret ruum-runtime-record-key -o name` answers
      the Secret (never print its data).
+   - **No cluster-wide default PriorityClass** (backlog I620-10): `deploy/staging/tool.sh kubectl
+     get priorityclass -o custom-columns=NAME:.metadata.name,DEFAULT:.globalDefault` shows `true`
+     for no class (the system classes show `<none>` or `false`). With one, the Priority admission
+     plugin writes it into every sandbox pod and the driver's read-back refuses each (fails
+     closed; the pod read-back line of step 7 fails the same way). Then stop: a card adds a class
+     for the sandboxes (value and preemption policy) and the chart's
+     `RUUM_KUBE_PRIORITY_CLASS`, `RUUM_KUBE_PRIORITY_VALUE` and `RUUM_KUBE_PREEMPTION_POLICY`
+     with exactly the class's values.
 8. **The switch**: in a change of the chart values (`charts/ruum/values.yaml`, a card, after the
    person's line of step 1), `runtime.kubernetes: true` (`runtime.supervisorNetwork` stays `tls`;
    `runtime.supervisorImage` comes from `ops/deploy-chart.sh`). Merge it to main, then in this
@@ -765,8 +777,12 @@ The orchestrator (the platform first, then the checks, then the switch):
     supervisor is non-dumpable under gVisor); the server logs show one launch per pod and no
     `refused` line for it, and `select count(*) from runtime_launches` (the platform database, as
     the admin) grows by one per pod. A pod made by hand as a copy of it gets no launch (`a
-    supervisor request was refused` in the server log, exit 125). (`kill -9 1` from the app ends
-    the sandbox under gVisor, I620-15: not a check.)
+    supervisor request was refused` in the server log), and about a minute after the run's start
+    the server ends the run as killed and deletes the copy (`... that its run's seal does not
+    name ... is ended (backlog I620-8)`). An app whose image does not pull stays `starting` and
+    ends as killed after 10 minutes (`... past the start deadline is ended (backlog I6-21)`). In
+    normal operation neither line appears. (`kill -9 1` from the app ends the sandbox under
+    gVisor, I620-15: not a check.)
 
 Going back: `runtime.kubernetes: false` and a deploy. The ServiceAccounts, the Role, the
 ClusterRole, the admission policy and the record key stay; they are harmless (nothing else
