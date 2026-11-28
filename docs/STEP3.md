@@ -385,16 +385,21 @@ secret.
      per tenant 40 a second with a burst of 120, and all tenants together 400 a second with a
      burst of 800, else `503` (Kimi, run 17, re-check finding 1, backlog I620-17). The tenant is
      the one of the token's cached review, or of the address: the sweep lists the sandbox pods
-     every `sweep_every` and maps each pod's addresses to its tenant label (a pod being deleted
-     is left out; the map is made again each time, so an address another pod took over follows
-     it), and the pre-check adds the pod it found at the address. So a sandbox that forges
-     tokens, also for pods that do not exist, pays from its own tenant's share before the pod
-     read. A request from an address of no known tenant takes from the unknown addresses' share
-     (100 a second, a burst of 200, within the bound of all), never from the rest of the bound
-     of all (second re-check findings 1 and 2). The driver refuses bounds that cannot serve its
-     instance caps with half again as headroom: a review per sandbox per review lifetime (60 s)
-     and a request per token poll (30 s), per tenant (`max_tenant_instances`) and in all
-     (`max_instances`) (second re-check finding 3).
+     every `sweep_every` and maps each pod's addresses to its tenant label and uid (a pod being
+     deleted is left out; the map is made again from each list, and stays as it is while a list
+     fails), and the pre-check adds the pod it found at the address. An entry counts only for
+     the pod it names: a token that claims the pod at its own address pays from that pod's
+     tenant's share before the pod read; any other claim (an address another pod took over, a
+     pod that does not exist) is a request of no known tenant. Those take from the unknown
+     addresses' share (100 a second, a burst of 200), which is apart from the bound of all, and
+     pay for the pod read only; once the pod's tenant is known the request goes on in that
+     tenant's share and the bound of all. A pre-check that fails (the claimed pod does not
+     exist, has another uid, is at another address or names no tenant) holds the address for
+     30 s: it gets `429` with no pod read and no share spent. A real supervisor's claims never
+     fail the pre-check. The driver refuses bounds that cannot serve its instance caps with half
+     again as headroom (rounded up): a review per sandbox per review lifetime (60 s) and a
+     request per token poll (30 s), per tenant (`max_tenant_instances`) and in all
+     (`max_instances`) (second and third re-checks).
      First the cheap ones, which cost the API server no `TokenReview` (backlog I620-12): the
      bearer reads (unverified) as a projected token of `system:serviceaccount:ruum-apps:ruum-sandbox`
      for the audience `ruum-supervisor`, unexpired, naming one pod (`kubernetes.io.pod`) by a

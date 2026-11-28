@@ -2441,11 +2441,12 @@ async fn one_tenant_cannot_spend_every_tenants_requests() {
     }
 }
 
-/// Kimi, run 17, second re-check findings 1 and 2: the tenant of an address comes from the pods
-/// the sweep lists, so a sandbox whose forged tokens name a pod that does not exist (no pod read
-/// ever reveals its tenant) still pays from its own tenant's share; requests from an address of
-/// no known pod spend only the unknown addresses' share, never the bound of all; and an address
-/// that another tenant's pod took over is that tenant's after the next sweep.
+/// Kimi, run 17, second and third re-checks: the tenant of an address comes from the pods the
+/// sweep lists (and the pre-check), bound to the pod's uid. A sandbox whose forged tokens name a
+/// pod that does not exist gets one pod read, then its address waits in quarantine (`429`, no
+/// read, no share spent). Requests from addresses of no known tenant spend only their own share,
+/// never the known tenants' bound of all, even when that share is spent. An address that another
+/// tenant's pod took over is not charged to its former tenant, also before the next sweep.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn requests_that_reveal_no_tenant_spend_no_other_tenants_share() {
     let w = world(false).await;
@@ -2469,7 +2470,7 @@ async fn requests_that_reveal_no_tenant_spend_no_other_tenants_share() {
         ruum_runtime::kube::pod_name(ruum_core::runtime::InstanceId(uuid::Uuid::now_v7()), 1);
     ghost.pod_uid = uuid::Uuid::now_v7().hyphenated().to_string();
     let ghost = kube_fake::unsigned_token(&ghost);
-    let driver = || {
+    let driver = |unknown_burst: u32| {
         let mut cfg = w.cfg.clone();
         // Few instances, so the small bounds below pass the driver's capacity check.
         cfg.max_instances = 8;
@@ -2478,66 +2479,79 @@ async fn requests_that_reveal_no_tenant_spend_no_other_tenants_share() {
         cfg.request_rate_per_sec = 1;
         cfg.tenant_request_burst = 3;
         cfg.tenant_request_rate_per_sec = 1;
-        cfg.unknown_request_burst = 2;
+        cfg.unknown_request_burst = unknown_burst;
         cfg.unknown_request_rate_per_sec = 1;
         w.driver_with(
             cfg,
             Arc::new(ruum_runtime::kube::ledger::MemoryLedger::new()),
         )
     };
-    let flood = |g: Arc<KubeDriver>, tok: String, ip: std::net::IpAddr| async move {
-        let mut answers = Vec::new();
-        for _ in 0..8 {
-            let a = g.supervisor_token(&tok, ip).await.map(|_| ());
-            let stop = a == Err(LaunchRefusal::NotReady);
-            answers.push(a);
-            if stop {
-                break;
-            }
-        }
-        answers
+    let pod_reads = || {
+        w.fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, verb, r)| verb == "get" && r == "pods")
+            .count()
     };
-    // 1. A tenant's own address, a pod that does not exist: its share, then 503.
-    let g = driver();
+    // 1. A tenant's own address, a pod that does not exist: one pod read, then quarantine.
+    let g = driver(2);
     g.sweep().await;
-    let answers = flood(g.clone(), ghost.clone(), a_ip).await;
+    let before = pod_reads();
+    let mut answers = Vec::new();
+    for _ in 0..5 {
+        answers.push(g.supervisor_token(&ghost, a_ip).await.map(|_| ()));
+    }
     assert_eq!(
         answers,
         vec![
             Err(LaunchRefusal::Forbidden),
-            Err(LaunchRefusal::Forbidden),
-            Err(LaunchRefusal::Forbidden),
-            Err(LaunchRefusal::NotReady)
+            Err(LaunchRefusal::TooMany),
+            Err(LaunchRefusal::TooMany),
+            Err(LaunchRefusal::TooMany),
+            Err(LaunchRefusal::TooMany)
         ],
-        "a tenant's address past its share"
+        "a failed pre-check's address was not held"
     );
+    assert_eq!(pod_reads() - before, 1, "a held address read pods");
     assert!(
         g.supervisor_token(&b_tok, b_ip).await.is_ok(),
         "the other tenant was refused"
     );
-    // 2. An address of no pod: the unknown addresses' share only.
-    let g = driver();
+    // 2. Addresses of no pod spend their whole share; the known tenants' bound stays.
+    let g = driver(6);
     g.sweep().await;
-    let nowhere: std::net::IpAddr = "10.123.0.9".parse().unwrap();
-    let answers = flood(g.clone(), ghost.clone(), nowhere).await;
+    let mut answers = Vec::new();
+    for i in 1..=7 {
+        let ip: std::net::IpAddr = format!("10.123.0.{i}").parse().unwrap();
+        answers.push(g.supervisor_token(&ghost, ip).await.map(|_| ()));
+    }
     assert_eq!(
-        answers,
-        vec![
-            Err(LaunchRefusal::Forbidden),
-            Err(LaunchRefusal::Forbidden),
-            Err(LaunchRefusal::NotReady)
-        ],
-        "an unknown address past its share"
+        answers
+            .iter()
+            .filter(|a| **a == Err(LaunchRefusal::Forbidden))
+            .count(),
+        6
     );
+    assert_eq!(answers.last(), Some(&Err(LaunchRefusal::NotReady)));
     assert!(
         g.supervisor_token(&b_tok, b_ip).await.is_ok(),
-        "a known tenant was refused after an unknown address's flood"
+        "unknown addresses spent a known tenant's capacity"
     );
     // 3. The first tenant spends its share, its pod goes, and the second tenant's pod gets its
-    // address: after the next sweep the address is the second tenant's.
-    let g = driver();
+    // address: the second tenant is answered there before any sweep, and after one.
+    let g = driver(2);
     g.sweep().await;
-    let answers = flood(g.clone(), a_tok.clone(), a_ip).await;
+    let mut answers = Vec::new();
+    for _ in 0..6 {
+        let a = g.supervisor_token(&a_tok, a_ip).await.map(|_| ());
+        let stop = a == Err(LaunchRefusal::NotReady);
+        answers.push(a);
+        if stop {
+            break;
+        }
+    }
     assert_eq!(answers.last(), Some(&Err(LaunchRefusal::NotReady)));
     w.fake.remove_pod(NS, &a_pod);
     let moved = a_ip.to_string();
@@ -2545,13 +2559,15 @@ async fn requests_that_reveal_no_tenant_spend_no_other_tenants_share() {
         st["podIP"] = serde_json::json!(moved);
         st["podIPs"] = serde_json::json!([{ "ip": moved }]);
     });
-    g.sweep().await;
     let a = g.supervisor_token(&b_tok, a_ip).await;
     assert!(
         a.is_ok(),
         "a reused address was charged to its former tenant: {:?}",
         a.err()
     );
+    g.sweep().await;
+    let a = g.supervisor_token(&b_tok, a_ip).await;
+    assert!(a.is_ok(), "after the sweep: {:?}", a.err());
 }
 
 /// Kimi, run 17, second re-check finding 3: the review and request bounds must serve the
@@ -2584,6 +2600,28 @@ async fn bounds_too_low_for_the_instance_caps_are_refused() {
     let mut c = w.cfg.clone();
     c.tenant_request_rate_per_sec = 10;
     assert!(!ok(c), "10 requests a second for 512 instances of a tenant");
+    // Rounded up: 61 instances need more than one review a second (61 * 1.5 / 60).
+    let mut c = w.cfg.clone();
+    c.max_instances = 61;
+    c.max_tenant_instances = 61;
+    c.review_rate_per_sec = 4;
+    c.review_burst = 8;
+    c.tenant_review_rate_per_sec = 1;
+    c.tenant_review_burst = 1;
+    assert!(!ok(c), "one review a second for 61 instances");
+    let mut c = w.cfg.clone();
+    c.max_instances = 40;
+    c.max_tenant_instances = 40;
+    c.review_rate_per_sec = 4;
+    c.review_burst = 8;
+    c.tenant_review_rate_per_sec = 1;
+    c.tenant_review_burst = 1;
+    assert!(ok(c), "one review a second for 40 instances");
+    // No overflow at the largest caps: refused, no panic.
+    let mut c = w.cfg.clone();
+    c.max_instances = usize::MAX;
+    c.max_tenant_instances = usize::MAX;
+    assert!(!ok(c), "the largest caps");
 }
 
 /// Review of I620-G, required change 2: a launch whose record write the API server refused

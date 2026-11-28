@@ -90,9 +90,11 @@ const PEER_REQUESTS: u32 = 30;
 const PEER_WINDOW: Duration = Duration::from_secs(10);
 /// The window of [`KubeConfig::peer_reviews_per_minute`].
 const PEER_REVIEW_WINDOW: Duration = Duration::from_secs(60);
-/// How long the tenant of the pod found at a peer address is kept without a sweep that lists it
-/// (pod addresses are reused; the sweep makes the map again every `sweep_every`).
-const PEER_TENANT_TTL: Duration = Duration::from_secs(60);
+/// How long an address whose pre-check failed (its token claimed a pod that does not exist,
+/// has another uid, is elsewhere or names no tenant) gets `429` at once, with no pod read and
+/// no request share spent (Kimi, run 17, third re-check finding 1). A real supervisor's claims
+/// never fail the pre-check.
+const PEER_QUARANTINE: Duration = Duration::from_secs(30);
 /// How long after the app container's start its supervisor may take the launch data (it tries
 /// for 60 s while the seal of its run is written).
 const LAUNCH_WINDOW_SECS: i64 = 120;
@@ -230,9 +232,10 @@ pub struct KubeConfig {
     pub request_rate_per_sec: u32,
     pub request_burst: u32,
     /// The share of requests from addresses whose tenant is not known yet (no pod of the
-    /// sweep's list or of an earlier pre-check is at the address): within the bound of all, so
-    /// requests that never reveal a tenant cannot spend it (Kimi, run 17, second re-check
-    /// finding 1).
+    /// sweep's list or of an earlier pre-check is at the address, or another pod than the
+    /// claimed one): apart from the bound of all, so requests that never reveal a tenant cannot
+    /// spend known tenants' capacity (Kimi, run 17, second re-check finding 1, third re-check
+    /// finding 2). It pays for the pre-check's pod read only.
     pub unknown_request_rate_per_sec: u32,
     pub unknown_request_burst: u32,
 }
@@ -402,13 +405,14 @@ impl KubeConfig {
         // review expires) and a request per token poll (30 s), so a tenant at its instance cap,
         // and all instances, are served in steady state; a tenant's cap of new sandboxes gets
         // its reviews within the supervisor's 60 s launch window.
-        let need = |instances: usize, per: u64| (instances as u64).saturating_mul(3) / 2 / per;
+        // In u128 and rounded up (third re-check finding 3): instances * 3/2 / per.
+        let need =
+            |instances: usize, per: u64| (instances as u128 * 3).div_ceil(u128::from(per) * 2);
         let ttl = REVIEW_TTL.as_secs();
-        if u64::from(self.tenant_review_rate_per_sec) < need(self.max_tenant_instances, ttl)
-            || u64::from(self.review_rate_per_sec) < need(self.max_instances, ttl)
-            || u64::from(self.tenant_request_rate_per_sec)
-                < need(self.max_tenant_instances.saturating_mul(2), 60)
-            || u64::from(self.request_rate_per_sec) < need(self.max_instances.saturating_mul(2), 60)
+        if u128::from(self.tenant_review_rate_per_sec) < need(self.max_tenant_instances, ttl)
+            || u128::from(self.review_rate_per_sec) < need(self.max_instances, ttl)
+            || u128::from(self.tenant_request_rate_per_sec) < need(self.max_tenant_instances, 30)
+            || u128::from(self.request_rate_per_sec) < need(self.max_instances, 30)
         {
             return bad(
                 "the token review and supervisor request bounds are too low for max_tenant_instances and max_instances",
@@ -523,9 +527,15 @@ struct Inner {
     request_bucket: Mutex<(Instant, f64)>,
     /// The share of requests from addresses of no known tenant.
     unknown_requests: Mutex<(Instant, f64)>,
-    /// The tenant of the pod the pre-check found at a peer address, and when.
-    peer_tenants: Mutex<HashMap<IpAddr, (TenantId, Instant)>>,
+    /// The tenant and the uid of the pod at a peer address (the sweep's list, and the
+    /// pre-check), and when it was noted.
+    peer_tenants: Mutex<HashMap<IpAddr, PeerPod>>,
+    /// The addresses whose pre-check failed, and since when ([`PEER_QUARANTINE`]).
+    refused_peers: Mutex<HashMap<IpAddr, Instant>>,
 }
+
+/// The pod at a peer address: its tenant, its uid and when it was noted.
+type PeerPod = (TenantId, String, Instant);
 
 /// A positive `TokenReview` kept: the pod name and uid, its tenant (the pod's label, read by the
 /// pre-check), and until when.
@@ -621,6 +631,7 @@ impl KubeDriver {
             request_bucket: Mutex::new((Instant::now(), f64::from(request_burst))),
             unknown_requests: Mutex::new((Instant::now(), f64::from(unknown_burst))),
             peer_tenants: Mutex::new(HashMap::new()),
+            refused_peers: Mutex::new(HashMap::new()),
         });
         let sweeper = tokio::runtime::Handle::try_current()
             .ok()
@@ -1890,8 +1901,10 @@ impl Inner {
 
     /// One more whole supervisor request, within its bounds (Kimi, run 17, re-check finding 1):
     /// of `tenant`'s share when known, and of all tenants together when `all`; with `all` and
-    /// no tenant, of the unknown addresses' share too (second re-check finding 1). Past any
-    /// `NotReady` (the supervisor asks again). A refused request spends nothing.
+    /// no tenant, of the unknown addresses' share instead of the bound of all, so unknown
+    /// addresses never spend known tenants' capacity (second re-check finding 1, third re-check
+    /// finding 2). Past any `NotReady` (the supervisor asks again). A refused request spends
+    /// nothing.
     fn request_budget(&self, all: bool, tenant: Option<TenantId>) -> Result<(), LaunchRefusal> {
         // One order of the locks: the tenants, the unknown addresses, all.
         let (rate, burst) = (
@@ -1929,7 +1942,7 @@ impl Inner {
             tracing::warn!(target: "ruum::runtime", "the supervisor requests from addresses of no known tenant are at their share");
             return Err(LaunchRefusal::NotReady);
         }
-        if all {
+        if all && tenant.is_some() {
             let mut g = self.request_bucket.lock().expect("request bucket lock");
             refill(
                 &mut g,
@@ -1962,7 +1975,7 @@ impl Inner {
             crate::driver::LABEL_TENANT.replace('/', "~1")
         );
         let now = Instant::now();
-        let mut fresh: HashMap<IpAddr, (TenantId, Instant)> = HashMap::new();
+        let mut fresh: HashMap<IpAddr, PeerPod> = HashMap::new();
         for p in pods {
             if p.pointer("/metadata/deletionTimestamp").is_some() {
                 continue;
@@ -1975,35 +1988,63 @@ impl Inner {
             else {
                 continue;
             };
+            let Some(uid) = p.pointer("/metadata/uid").and_then(Value::as_str) else {
+                continue;
+            };
             for ip in pod_ips(p) {
-                fresh.insert(canonical(ip), (tenant, now));
+                fresh.insert(canonical(ip), (tenant, uid.to_owned(), now));
             }
         }
         let mut m = self.peer_tenants.lock().expect("peer tenants lock");
-        for (ip, (tenant, at)) in m.iter() {
-            if *at >= since {
-                fresh.insert(*ip, (*tenant, *at));
+        for (ip, e) in m.iter() {
+            if e.2 >= since {
+                fresh.insert(*ip, e.clone());
             }
         }
         *m = fresh;
     }
 
-    /// The tenant of the pod the pre-check last found at `peer` (within [`PEER_TENANT_TTL`]).
-    fn peer_tenant(&self, peer: IpAddr) -> Option<TenantId> {
+    /// The tenant of the pod known at `peer` when that pod is the one the token claims
+    /// (`pod_uid`). An entry of another pod (the address was reused, and the sweep has not seen
+    /// it yet) gives none: its former tenant is not charged (third re-check finding 1). Entries
+    /// stay until a sweep's list makes the map again, so a list that fails does not make every
+    /// address unknown.
+    fn peer_tenant(&self, peer: IpAddr, pod_uid: &str) -> Option<TenantId> {
         self.peer_tenants
             .lock()
             .expect("peer tenants lock")
             .get(&peer)
-            .filter(|(_, at)| at.elapsed() < PEER_TENANT_TTL)
-            .map(|(t, _)| *t)
+            .filter(|(_, uid, _)| uid == pod_uid)
+            .map(|(t, _, _)| *t)
     }
 
-    fn note_peer_tenant(&self, peer: IpAddr, tenant: TenantId) {
+    fn note_peer_tenant(&self, peer: IpAddr, tenant: TenantId, pod_uid: &str) {
         let mut m = self.peer_tenants.lock().expect("peer tenants lock");
         if m.len() > 65_536 {
-            m.retain(|_, (_, at)| at.elapsed() < PEER_TENANT_TTL);
+            // Bounded: the oldest half goes (the next sweep lists the live pods again).
+            let mut ats: Vec<Instant> = m.values().map(|e| e.2).collect();
+            ats.sort();
+            let cut = ats[ats.len() / 2];
+            m.retain(|_, e| e.2 >= cut);
         }
-        m.insert(peer, (tenant, Instant::now()));
+        m.insert(peer, (tenant, pod_uid.to_owned(), Instant::now()));
+    }
+
+    /// Whether `peer` is in its quarantine after a failed pre-check.
+    fn quarantined(&self, peer: IpAddr) -> bool {
+        self.refused_peers
+            .lock()
+            .expect("refused peers lock")
+            .get(&peer)
+            .is_some_and(|at| at.elapsed() < PEER_QUARANTINE)
+    }
+
+    fn quarantine(&self, peer: IpAddr) {
+        let mut m = self.refused_peers.lock().expect("refused peers lock");
+        if m.len() > 65_536 {
+            m.retain(|_, at| at.elapsed() < PEER_QUARANTINE);
+        }
+        m.insert(peer, Instant::now());
     }
 
     /// The pod (name, uid) of a projected token, by a `TokenReview` (kept a short time), with
@@ -2053,9 +2094,19 @@ impl Inner {
         ) else {
             return Err(refuse("not a projected token of a sandbox pod"));
         };
-        // The pod read below is a request too: of the tenant of the pod last found at this
-        // address (a sandbox that forges tokens pays from its own tenant's share), and of all.
-        let known = self.peer_tenant(peer);
+        // An address whose pre-check failed waits, at no cost (third re-check finding 1).
+        if self.quarantined(peer) {
+            return Err(LaunchRefusal::TooMany);
+        }
+        // A pre-check that fails puts the address in its quarantine.
+        let refuse_peer = |why: &str| {
+            self.quarantine(peer);
+            refuse(why)
+        };
+        // The pod read below is a request too: of the tenant of the pod known at this address
+        // when it is the claimed pod (a sandbox that forges tokens of its own pod pays from its
+        // own tenant's share), else of the unknown addresses' share.
+        let known = self.peer_tenant(peer, &claimed.1);
         self.request_budget(true, known)?;
         // The pod the token claims, at the peer's address, before the API server verifies it.
         let pod = self
@@ -2063,16 +2114,16 @@ impl Inner {
             .get(Kind::Pod, &claimed.0)
             .await
             .map_err(|_| LaunchRefusal::NotReady)?
-            .ok_or_else(|| refuse("the token's pod does not exist"))?;
+            .ok_or_else(|| refuse_peer("the token's pod does not exist"))?;
         if pod.pointer("/metadata/uid").and_then(Value::as_str) != Some(claimed.1.as_str()) {
-            return Err(refuse("the token's pod has another uid"));
+            return Err(refuse_peer("the token's pod has another uid"));
         }
         let ips = pod_ips(&pod);
         if ips.is_empty() {
             return Err(LaunchRefusal::NotReady);
         }
         if !ips.iter().any(|ip| canonical(*ip) == peer) {
-            return Err(refuse("the token's pod is not at the peer's address"));
+            return Err(refuse_peer("the token's pod is not at the peer's address"));
         }
         // The driver wrote the pod's labels (an app cannot write its pod).
         let tenant = pod
@@ -2083,10 +2134,12 @@ impl Inner {
             .and_then(Value::as_str)
             .and_then(|t| uuid::Uuid::parse_str(t).ok())
             .map(TenantId)
-            .ok_or_else(|| refuse("the token's pod names no tenant"))?;
-        self.note_peer_tenant(peer, tenant);
-        if known != Some(tenant) {
-            self.request_budget(false, Some(tenant))?;
+            .ok_or_else(|| refuse_peer("the token's pod names no tenant"))?;
+        self.note_peer_tenant(peer, tenant, &claimed.1);
+        // The rest of the request (the review, the pod and record reads, the ledger) is the
+        // tenant's, now known: its share and the bound of all.
+        if known.is_none() {
+            self.request_budget(true, Some(tenant))?;
         }
         self.review_budget(peer, tenant)?;
         let status = self
