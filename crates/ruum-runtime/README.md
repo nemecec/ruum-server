@@ -269,7 +269,9 @@ counts from the record's start time, and also from the pod's `creationTimestamp`
 deadline, so a writer of ConfigMaps who keeps the start time fresh cannot keep a run starting for
 ever. A remembered seal check holds only for the record (uid and fixed fields) it was made on. A
 registration key in a record is unregistered only when it is the pod name of one of the
-instance's own runs; another key is left alone and the run's own pod key goes instead. A service past its
+instance's own runs; another key is left alone, and the run's own pod key always goes too. The
+sweep deletes the pod of another run than the record's (after unregistering it by its name) even
+when the record names it as registered. A service past its
 idle timeout (the newest touch of the record and of this process; `touch` writes the record at
 most every quarter of the idle timeout) scales to zero: the pod goes, the record (with its seal)
 stays, and `wake` makes the next run from the record and seals its new pod's `uid`. Health: healthy when the container is ready;

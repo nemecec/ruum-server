@@ -3224,6 +3224,58 @@ async fn a_record_cannot_unregister_another_tenants_pod() {
     );
 }
 
+/// Kimi re-check of the I620-R fixes: a record that names an earlier run of its own instance as
+/// its registration still gets its current run's pod unregistered at the end of the run; and a
+/// record moved by a writer of ConfigMaps to a run without a pod, with `registered` naming the
+/// real pod and a start time kept fresh, does not keep that pod: the sweep unregisters and
+/// deletes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_key_of_another_run_does_not_keep_a_registration_or_a_pod() {
+    let w = world(false).await;
+    let d = w.quiet_driver();
+    let (w, d) = (&w, &d);
+    let running = |id: WorkloadIdentity| async move {
+        let s = d.start(w.service(id, None)).await.unwrap();
+        wait_state(d.as_ref(), id.tenant, s.id, |x| {
+            *x == InstanceState::Running
+        })
+        .await;
+        let pod = ruum_runtime::kube::pod_name(s.id, 1);
+        assert_eq!(wait_launched(w, &pod).await, 200);
+        (s.id, pod)
+    };
+    // A key of another run of the same instance, then the run ends (its pod gone).
+    let id = identity();
+    let (inst, pod) = running(id).await;
+    w.change_record(inst, |r| {
+        r["registered"] = serde_json::json!(ruum_runtime::kube::pod_name(inst, 7));
+    })
+    .await;
+    w.fake.remove_pod(NS, &pod);
+    match d.status(id.tenant, inst).await.unwrap().state {
+        InstanceState::Exited(e) => assert_eq!(e.reason, ExitReason::Killed),
+        other => panic!("the state is {}", other.name()),
+    }
+    assert_unregistered(w, &pod);
+    // A record moved to a run without a pod, still naming the real pod.
+    let id = identity();
+    let (inst, pod) = running(id).await;
+    w.change_record(inst, |r| {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() * 1000;
+        r["run"] = serde_json::json!(5);
+        r["state"] = serde_json::json!({ "state": "starting" });
+        r["run_started_ms"] = serde_json::json!(now + 30_000);
+    })
+    .await;
+    assert_eq!(
+        d.status(id.tenant, inst).await.unwrap().state,
+        InstanceState::Starting
+    );
+    d.sweep().await;
+    assert!(w.fake.pod(NS, &pod).is_none(), "the real pod stayed");
+    assert_unregistered(w, &pod);
+}
+
 /// Backlog I620-14: values that do not fit one ConfigMap once escaped and sealed are refused at
 /// the start with a clear error, before anything is made; values of the same length that fit
 /// start.
