@@ -337,7 +337,11 @@ pub async fn invert(s: &Services, ctx: &Context, e: &JournalEntry) -> Result<Opt
                 .change
         }
         // A confirmation of classes is by a person only (card K-1), never an agent's change.
-        NodePurged | ShareLinkRevoked | DatabaseColumnsConfirmed | AppTelemetryFieldsConfirmed => {
+        NodePurged
+        | ShareLinkRevoked
+        | DatabaseColumnsConfirmed
+        | AppTelemetryFieldsConfirmed
+        | AppApprovalDecided => {
             return Ok(None);
         }
         VersionCreated | VersionRestored => match opt_uuid(d, "previous_version_id") {

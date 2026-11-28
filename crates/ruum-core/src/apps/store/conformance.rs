@@ -1310,6 +1310,323 @@ pub(crate) async fn app_hosts_are_known_only_for_real_apps(h: &dyn Harness) {
 }
 
 /// Runs every case.
+/// An agent acting for `user` (the requester of publish requests).
+fn agent_of(user: UserId) -> Actor {
+    Actor {
+        actor: crate::actor::PrincipalRef {
+            kind: crate::actor::PrincipalKind::Agent,
+            id: Uuid::now_v7().into(),
+        },
+        on_behalf_of: Some(user),
+    }
+}
+
+fn new_approval(app: NodeId, deployment: Uuid) -> NewApproval {
+    NewApproval {
+        id: Uuid::now_v7(),
+        app_node_id: app,
+        deployment_id: deployment,
+        changes: serde_json::json!({ "roles_added": ["member"] }),
+        bound_archive_hash: [7; 32],
+        bound_manifest_hash: [8; 32],
+        bound_bindings: serde_json::json!([]),
+        expires_at: crate::now() + time::Duration::hours(24),
+    }
+}
+
+fn decision(approve: bool) -> ApprovalDecision {
+    ApprovalDecision {
+        approve,
+        comment: Some("fine".into()),
+        telemetry_fields: serde_json::json!([]),
+        classes: serde_json::json!([{ "database_id": Uuid::nil(), "schema": "main",
+            "table": "plants", "column": "owner_email", "class": "secret" }]),
+        event: serde_json::json!({ "decision": if approve { "approve" } else { "deny" } }),
+    }
+}
+
+/// The publish requests of agents (card W-3b): the repeat and the limit of a request, the list
+/// with its filters and cursor, a decision once, and a take once within the use window by the
+/// agent that asked, for its deployment.
+pub(crate) async fn approvals_follow_their_rules(h: &dyn Harness) {
+    let s = h.store();
+    let (a, ua) = h.tenant().await;
+    let n = h.app_node(a, ua).await;
+    let c = ctx(a, ua);
+    s.insert_app(&c, app(n, &unique("approver")))
+        .await
+        .unwrap()
+        .unwrap();
+    let p = s
+        .insert_deployment(
+            &c,
+            deployment(n, Environment::Preview, DeploymentState::Ready),
+        )
+        .await
+        .unwrap();
+    let agent = Context {
+        actor: agent_of(ua),
+        ..c.clone()
+    };
+    let now = crate::now();
+    // A request, and the same again: one row.
+    let (r1, made) = s
+        .request_app_approval(&agent, new_approval(n, p.id), 3, now)
+        .await
+        .unwrap();
+    assert!(made);
+    assert_eq!(r1.requested_by, agent.actor);
+    let (again, made) = s
+        .request_app_approval(&agent, new_approval(n, p.id), 3, now)
+        .await
+        .unwrap();
+    assert!(!made);
+    assert_eq!(again.id, r1.id);
+    // Other changes make a new row, up to the limit.
+    let mut other = new_approval(n, p.id);
+    other.changes = serde_json::json!({ "roles_added": [] });
+    let (r2, made) = s
+        .request_app_approval(&agent, other.clone(), 3, now)
+        .await
+        .unwrap();
+    assert!(made);
+    let other_agent = Context {
+        actor: agent_of(ua),
+        ..c.clone()
+    };
+    let (r3, _) = s
+        .request_app_approval(&other_agent, new_approval(n, p.id), 3, now)
+        .await
+        .unwrap();
+    let mut fourth = new_approval(n, p.id);
+    fourth.bound_archive_hash = [9; 32];
+    let e = s
+        .request_app_approval(&agent, fourth, 3, now)
+        .await
+        .unwrap_err();
+    assert_eq!(e.http_status(), 409);
+    // The list: newest first, the agent filter, the status filter, the cursor.
+    let list = |q: ApprovalQuery, page: PageRequest| async move {
+        s.list_approvals(a, n, q, page, crate::now()).await.unwrap()
+    };
+    let ids = |p: &Page<ApprovalRow>| p.items.iter().map(|r| r.id).collect::<Vec<_>>();
+    let all = list(ApprovalQuery::default(), PageRequest::default()).await;
+    assert_eq!(ids(&all), [r3.id, r2.id, r1.id]);
+    let mine = list(
+        ApprovalQuery {
+            requested_by: Some(agent.actor.actor.id),
+            status: None,
+        },
+        PageRequest::default(),
+    )
+    .await;
+    assert_eq!(ids(&mine), [r2.id, r1.id]);
+    let page = list(
+        ApprovalQuery::default(),
+        PageRequest {
+            cursor: None,
+            limit: Some(2),
+        },
+    )
+    .await;
+    assert_eq!(ids(&page), [r3.id, r2.id]);
+    let rest = list(
+        ApprovalQuery::default(),
+        PageRequest {
+            cursor: page.next_cursor.clone(),
+            limit: Some(2),
+        },
+    )
+    .await;
+    assert_eq!(ids(&rest), [r1.id]);
+    assert!(rest.next_cursor.is_none());
+    // A decision: once, with the journal entry, the classes and the use window.
+    let w = s
+        .decide_approval(&c, n, r1.id, decision(true), now)
+        .await
+        .unwrap();
+    assert_eq!(w.value.status, "approved");
+    assert_eq!(w.value.decided_by, Some(ua.0));
+    assert_eq!(w.value.comment.as_deref(), Some("fine"));
+    assert_eq!(w.value.classes, decision(true).classes);
+    let decided_at = w.value.decided_at.unwrap();
+    assert_eq!(w.value.expires_at, decided_at + time::Duration::minutes(15));
+    assert_eq!(w.change.actor, c.actor);
+    assert_eq!(s.get_approval(a, n, r1.id).await.unwrap().unwrap(), w.value);
+    let e = s
+        .decide_approval(&c, n, r1.id, decision(false), now)
+        .await
+        .unwrap_err();
+    assert_eq!(e.http_status(), 409);
+    assert_eq!(
+        s.decide_approval(&c, NodeId::new(), r2.id, decision(true), now)
+            .await
+            .unwrap_err()
+            .http_status(),
+        404
+    );
+    s.decide_approval(&c, n, r2.id, decision(false), now)
+        .await
+        .unwrap();
+    let denied = list(
+        ApprovalQuery {
+            requested_by: None,
+            status: Some("denied"),
+        },
+        PageRequest::default(),
+    )
+    .await;
+    assert_eq!(ids(&denied), [r2.id]);
+    let approved = list(
+        ApprovalQuery {
+            requested_by: None,
+            status: Some("approved"),
+        },
+        PageRequest::default(),
+    )
+    .await;
+    assert_eq!(ids(&approved), [r1.id]);
+    // A take: only by the agent that asked (and for its user), for its deployment and app.
+    let take = |who: &Context, app: NodeId, dep: Uuid, at| {
+        let who = who.clone();
+        async move { s.take_approval(&who, app, r1.id, dep, at).await.unwrap() }
+    };
+    assert!(take(&other_agent, n, p.id, now).await.is_none());
+    let elsewhere = Context {
+        actor: Actor {
+            on_behalf_of: Some(UserId::new()),
+            ..agent.actor
+        },
+        ..agent.clone()
+    };
+    assert!(take(&elsewhere, n, p.id, now).await.is_none());
+    assert!(take(&c, n, p.id, now).await.is_none());
+    assert!(take(&agent, n, Uuid::now_v7(), now).await.is_none());
+    assert!(take(&agent, NodeId::new(), p.id, now).await.is_none());
+    // Past the use window.
+    assert!(
+        take(&agent, n, p.id, decided_at + time::Duration::minutes(15))
+            .await
+            .is_none()
+    );
+    // A denied or pending request is never taken.
+    assert!(
+        s.take_approval(&agent, n, r2.id, p.id, now)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        s.take_approval(&other_agent, n, r3.id, p.id, now)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // The take: once.
+    let at = decided_at + time::Duration::minutes(1);
+    let used = take(&agent, n, p.id, at).await.unwrap();
+    assert_eq!(used.status, "used");
+    assert!(used.used_at.is_some());
+    assert!(take(&agent, n, p.id, at).await.is_none());
+    let row = s.get_approval(a, n, r1.id).await.unwrap().unwrap();
+    assert_eq!(row.status, "used");
+    // Expired: a pending request past its time reads as expired and is not decided.
+    let mut late = new_approval(n, p.id);
+    late.expires_at = crate::now() - time::Duration::seconds(1);
+    let late = s.insert_approval(&agent, late).await.unwrap();
+    let expired = list(
+        ApprovalQuery {
+            requested_by: None,
+            status: Some("expired"),
+        },
+        PageRequest::default(),
+    )
+    .await;
+    assert_eq!(ids(&expired), [late.id]);
+    assert_eq!(
+        s.decide_approval(&c, n, late.id, decision(true), crate::now())
+            .await
+            .unwrap_err()
+            .http_status(),
+        409
+    );
+}
+
+/// The approval methods of card W-3b read and write only their tenant's rows: tenant B with
+/// tenant A's IDs (also with the same agent pair) finds, lists, decides and takes nothing.
+pub(crate) async fn approvals_stay_in_their_tenant(h: &dyn Harness) {
+    let s = h.store();
+    let (a, ua) = h.tenant().await;
+    let (b, ub) = h.tenant().await;
+    let n = h.app_node(a, ua).await;
+    let ca = ctx(a, ua);
+    s.insert_app(&ca, app(n, &unique("isolated")))
+        .await
+        .unwrap()
+        .unwrap();
+    let p = s
+        .insert_deployment(
+            &ca,
+            deployment(n, Environment::Preview, DeploymentState::Ready),
+        )
+        .await
+        .unwrap();
+    let actor = agent_of(ua);
+    let agent_a = Context {
+        actor,
+        ..ca.clone()
+    };
+    let now = crate::now();
+    let (r, _) = s
+        .request_app_approval(&agent_a, new_approval(n, p.id), 50, now)
+        .await
+        .unwrap();
+    s.decide_approval(&ca, n, r.id, decision(true), now)
+        .await
+        .unwrap();
+    // B, with A's IDs and A's agent pair.
+    let agent_b = Context {
+        tenant: b,
+        actor,
+        scope: None,
+        idempotency_key: None,
+    };
+    assert!(s.get_approval(b, n, r.id).await.unwrap().is_none());
+    assert!(
+        s.list_approvals(b, n, ApprovalQuery::default(), PageRequest::default(), now)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    assert!(
+        s.decide_approval(&ctx(b, ub), n, r.id, decision(false), now)
+            .await
+            .is_err()
+    );
+    assert!(
+        s.take_approval(&agent_b, n, r.id, p.id, crate::now())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // B's request under A's app and deployment is refused (the deployment is not B's).
+    assert!(
+        s.request_app_approval(&agent_b, new_approval(n, p.id), 50, now)
+            .await
+            .is_err()
+    );
+    // A's row is as A left it.
+    let row = s.get_approval(a, n, r.id).await.unwrap().unwrap();
+    assert_eq!(row.status, "approved");
+    assert!(
+        s.take_approval(&agent_a, n, r.id, p.id, crate::now())
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
 pub(crate) async fn run_all(h: &dyn Harness) {
     tenant_slugs_span_tenants(h).await;
     apps_stay_in_their_tenant(h).await;
@@ -1323,6 +1640,8 @@ pub(crate) async fn run_all(h: &dyn Harness) {
     bindings_stay_in_their_tenant(h).await;
     draft_branch_bindings_stay_in_their_tenant(h).await;
     app_hosts_are_known_only_for_real_apps(h).await;
+    approvals_follow_their_rules(h).await;
+    approvals_stay_in_their_tenant(h).await;
 }
 
 #[cfg(test)]
@@ -2035,5 +2354,6 @@ pub(crate) mod tests {
         purge_pages_stay_in_their_app(&h).await;
         bindings_stay_in_their_tenant(&h).await;
         draft_branch_bindings_stay_in_their_tenant(&h).await;
+        approvals_stay_in_their_tenant(&h).await;
     }
 }

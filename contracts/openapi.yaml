@@ -5347,7 +5347,6 @@ paths:
       tags: [apps]
       operationId: listAppApprovals
       x-ruum-area: apps
-      x-ruum-status: planned
       summary: Publishes of agents that wait for a person
       description: Needs `edit` (the requests show pending binding changes and migration names); an agent sees only its own requests.
       parameters:
@@ -5378,7 +5377,6 @@ paths:
       tags: [apps]
       operationId: getAppApproval
       x-ruum-area: apps
-      x-ruum-status: planned
       summary: One publish request
       description: Needs `edit`; an agent sees only its own requests. With `wait`, the call holds up to that many seconds until the status changes (an agent waits for the person's decision without a poll loop).
       parameters:
@@ -5404,7 +5402,6 @@ paths:
       tags: [apps]
       operationId: decideAppApproval
       x-ruum-area: apps
-      x-ruum-status: planned
       x-ruum-user-only: true
       summary: Approve or deny an agent's publish
       description: |

@@ -42,7 +42,7 @@
 //! Step 3 (docs/STEP3.md, section "Fixtures"): card W-1 seeds the web app W (made by `member`
 //! through `createApp`), its live deployment (through the store) and both approvals of the
 //! tenant; card B-2 seeds W's active roles and its `approver` grant to `guest_view` (through the
-//! role store). The IDs of W's domain, API key, approval and trace, the issue I with its
+//! role store). The IDs of W's domain, API key and trace, the issue I with its
 //! receipt token, the template K and its setup are placeholders until the cards that build
 //! their operations seed them (they keep the field names). The seeded W has one live
 //! deployment whose manifest declares the roles `member` (default) and `approver`, the entered
@@ -50,8 +50,8 @@
 //! scopes `orders.read` and `orders.write`, and a binding `docs` with role `view` on `Projects`
 //! (D is a SQLite database, which an app cannot bind: card B-1d, backlog D5-2). Both tenants
 //! have the platform admin's approval of public apps and custom domains. The pending publish
-//! request of W is a request of `agent` (seeded through the store; its `view` scope cannot
-//! publish through the API). I is a `report` issue of W in `Projects` (the reporter is not a
+//! request of W is a request of `agent` for a ready preview of W (card W-3b; seeded through the
+//! store; its `view` scope cannot publish through the API). I is a `report` issue of W in `Projects` (the reporter is not a
 //! member, so it has a receipt token); K is a project template whose setup makes a database and
 //! an app; the setup made the project `<prefix>-from-kit` in `Projects`.
 //!
@@ -1689,6 +1689,109 @@ mod seed {
         {
             t.database_approval = a.id;
         } else {
+            agents_ok = false;
+        }
+
+        // The pending publish request of `agent` on W (card W-3b): a ready preview of W
+        // (through the store) and the request of the agent's publish of it, bound to its
+        // archive and manifest, so `listAppApprovals`, `getAppApproval` and
+        // `decideAppApproval` have a real row. Through the store: the `view` scope of `agent`
+        // cannot publish through the API.
+        let (s2, c, app, plan, v1, approval, agent, member) = (
+            s.clone(),
+            member_ctx.clone(),
+            t.app,
+            t.plan,
+            t.v1,
+            t.app_approval,
+            t.agent_id(Who::Agent),
+            t.user_id(Who::Member),
+        );
+        if step("app approval", async move {
+            use ruum_core::apps::store::{
+                Archive, DeploymentSource, DeploymentState, Environment, NewApproval, NewDeployment,
+            };
+            let manifest = serde_json::json!({ "runtime": "static" });
+            let archive = format!("{approval} preview archive");
+            let archive = Archive {
+                content_hash: *blake3::hash(archive.as_bytes()).as_bytes(),
+                size: archive.len() as i64,
+                chunks: Vec::new(),
+            };
+            let preview = s2
+                .apps
+                .store()
+                .insert_deployment(
+                    &c,
+                    NewDeployment {
+                        id: uuid::Uuid::now_v7(),
+                        app_node_id: app,
+                        environment: Environment::Preview,
+                        state: DeploymentState::Ready,
+                        short_id: ruum_core::apps::slugs::short_id(),
+                        label: Some("sortable plant list".into()),
+                        draft: None,
+                        source: DeploymentSource {
+                            kind: "file".into(),
+                            node_id: Some(plan),
+                            version_id: Some(v1),
+                            files: None,
+                        },
+                        archive: archive.clone(),
+                        manifest: Some(manifest.clone()),
+                        stages: serde_json::json!([]),
+                        published_from: None,
+                        new_chunks: Vec::new(),
+                        expires_at: Some(
+                            ruum_core::now() + std::time::Duration::from_secs(7 * 86_400),
+                        ),
+                    },
+                )
+                .await?;
+            let scope = s2.agents.authenticate(tid, agent).await?.scope.as_scope();
+            let c = Context {
+                tenant: tid,
+                actor: Actor {
+                    actor: ruum_core::actor::PrincipalRef {
+                        kind: ruum_core::actor::PrincipalKind::Agent,
+                        id: agent.0.into(),
+                    },
+                    on_behalf_of: Some(member),
+                },
+                scope: Some(scope),
+                idempotency_key: None,
+            };
+            s2.apps
+                .store()
+                .insert_approval(
+                    &c,
+                    NewApproval {
+                        id: approval,
+                        app_node_id: app,
+                        deployment_id: preview.id,
+                        changes: serde_json::json!({
+                            "bindings_added": [], "bindings_removed": ["docs"],
+                            "roles_added": [], "roles_removed": ["approver", "member"],
+                            "secrets_missing": [], "migrations": [], "planned_columns": [],
+                            "unconfirmed_telemetry_fields": 0, "unconfirmed_columns": 0,
+                        }),
+                        bound_archive_hash: archive.content_hash,
+                        bound_manifest_hash: *blake3::hash(
+                            &ruum_core::apps::deployments::canonical(&manifest),
+                        )
+                        .as_bytes(),
+                        bound_bindings: serde_json::json!([]),
+                        expires_at: ruum_core::now()
+                            + std::time::Duration::from_secs(
+                                ruum_core::apps::deployments::APPROVAL_HOURS as u64 * 3600,
+                            ),
+                    },
+                )
+                .await
+        })
+        .await
+        .is_none()
+        {
             agents_ok = false;
         }
 

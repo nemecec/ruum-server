@@ -325,7 +325,8 @@ fn version_row(tenant: TenantId, node: NodeId, r: &PgRow) -> Result<Version> {
 
 const APPROVAL_COLUMNS: &str = "tenant_id, id, app_node_id, deployment_id, status::text as status, \
     changes, bound_archive_hash, bound_manifest_hash, bound_bindings, requested_kind, \
-    requested_by, requested_obo, decided_by, decided_at, comment, expires_at, created_at";
+    requested_by, requested_obo, decided_by, decided_at, comment, expires_at, used_at, \
+    telemetry_fields, classes, created_at";
 
 fn approval_row(r: &PgRow) -> Result<ApprovalRow> {
     let h32 = |v: Vec<u8>| -> Result<[u8; 32]> {
@@ -355,6 +356,9 @@ fn approval_row(r: &PgRow) -> Result<ApprovalRow> {
         decided_at: r.try_get("decided_at")?,
         comment: r.try_get("comment")?,
         expires_at: r.try_get("expires_at")?,
+        used_at: r.try_get("used_at")?,
+        telemetry_fields: r.try_get("telemetry_fields")?,
+        classes: r.try_get("classes")?,
         created_at: r.try_get("created_at")?,
     })
 }
@@ -1061,7 +1065,19 @@ impl AppStore for PgAppStore {
         let now = crate::now();
         let (version, bytes) = release_version(ctx, &d, r.restored_from, now);
         insert_version(&mut tx, &version, &bytes).await?;
-        let row = insert_row(&mut tx, ctx, &d, Some(version.id), now).await?;
+        let mut row = insert_row(&mut tx, ctx, &d, Some(version.id), now).await?;
+        // The approval an agent's publish used (card W-3b).
+        if let Some(approval) = r.approval_id {
+            sqlx::query(
+                "update app_deployments set approval_id = $3 where tenant_id = $1 and id = $2",
+            )
+            .bind(tenant)
+            .bind(d.id)
+            .bind(approval)
+            .execute(&mut *tx)
+            .await?;
+            row.approval_id = Some(approval);
+        }
         switch_live(&mut tx, tenant, d.app_node_id, d.id, live, now).await?;
         let entries = release_entries(&d, &version, previous, &r);
         let change = append_all(&mut tx, ctx, d.app_node_id, entries, now).await?;
@@ -1139,6 +1155,242 @@ impl AppStore for PgAppStore {
         .await?;
         tx.commit().await?;
         approval_row(&row)
+    }
+
+    async fn request_app_approval(
+        &self,
+        ctx: &Context,
+        a: NewApproval,
+        max_pending: usize,
+        at: OffsetDateTime,
+    ) -> Result<(ApprovalRow, bool)> {
+        let tenant = ctx.tenant;
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        // Requests of one app take turns until the end of the transaction (a hash clash of two
+        // apps only serializes more).
+        sqlx::query("select pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("app_approvals {tenant} {}", a.app_node_id))
+            .execute(&mut *tx)
+            .await?;
+        let same = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "select {APPROVAL_COLUMNS} from app_approvals where tenant_id = $1 \
+             and app_node_id = $2 and deployment_id = $3 and status = 'pending' \
+             and expires_at > $4 and requested_kind = $5 and requested_by = $6 \
+             and requested_obo is not distinct from $7 and bound_archive_hash = $8 \
+             and bound_manifest_hash = $9 and bound_bindings = $10 and changes = $11 \
+             order by id desc limit 1"
+        )))
+        .bind(tenant)
+        .bind(a.app_node_id)
+        .bind(a.deployment_id)
+        .bind(at)
+        .bind(ctx.actor.actor.kind)
+        .bind(ctx.actor.actor.id.0)
+        .bind(ctx.actor.on_behalf_of.map(|u| u.0))
+        .bind(a.bound_archive_hash.to_vec())
+        .bind(a.bound_manifest_hash.to_vec())
+        .bind(&a.bound_bindings)
+        .bind(&a.changes)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(row) = same {
+            tx.commit().await?;
+            return Ok((approval_row(&row)?, false));
+        }
+        let pending: i64 = sqlx::query_scalar(
+            "select count(*) from app_approvals where tenant_id = $1 and app_node_id = $2 \
+             and status = 'pending' and expires_at > $3",
+        )
+        .bind(tenant)
+        .bind(a.app_node_id)
+        .bind(at)
+        .fetch_one(&mut *tx)
+        .await?;
+        if pending >= max_pending as i64 {
+            return Err(crate::apps::approvals::too_many_pending());
+        }
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "insert into app_approvals (tenant_id, id, app_node_id, deployment_id, changes, \
+             bound_archive_hash, bound_manifest_hash, bound_bindings, requested_kind, \
+             requested_by, requested_obo, expires_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+             returning {APPROVAL_COLUMNS}"
+        )))
+        .bind(tenant)
+        .bind(a.id)
+        .bind(a.app_node_id)
+        .bind(a.deployment_id)
+        .bind(&a.changes)
+        .bind(a.bound_archive_hash.to_vec())
+        .bind(a.bound_manifest_hash.to_vec())
+        .bind(&a.bound_bindings)
+        .bind(ctx.actor.actor.kind)
+        .bind(ctx.actor.actor.id.0)
+        .bind(ctx.actor.on_behalf_of.map(|u| u.0))
+        .bind(a.expires_at)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok((approval_row(&row)?, true))
+    }
+
+    async fn get_approval(
+        &self,
+        tenant: TenantId,
+        app: NodeId,
+        id: Uuid,
+    ) -> Result<Option<ApprovalRow>> {
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "select {APPROVAL_COLUMNS} from app_approvals \
+             where tenant_id = $1 and app_node_id = $2 and id = $3"
+        )))
+        .bind(tenant)
+        .bind(app)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.as_ref().map(approval_row).transpose()
+    }
+
+    async fn list_approvals(
+        &self,
+        tenant: TenantId,
+        app: NodeId,
+        q: ApprovalQuery,
+        page: PageRequest,
+        at: OffsetDateTime,
+    ) -> Result<Page<ApprovalRow>> {
+        let after = crate::apps::approvals::parse_cursor(&page)?;
+        let limit = page.limit() as usize;
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        // The status at `at`, as `approvals::status_at` reads it.
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "select {APPROVAL_COLUMNS} from app_approvals where tenant_id = $1 \
+             and app_node_id = $2 \
+             and ($3::uuid is null or (requested_kind = 'agent' and requested_by = $3)) \
+             and ($4::uuid is null or id < $4) \
+             and ($5::text is null \
+                  or ($5 in ('pending', 'approved') and status::text = $5 and expires_at > $6) \
+                  or ($5 = 'expired' and (status = 'expired' \
+                      or (status in ('pending', 'approved') and expires_at <= $6))) \
+                  or ($5 in ('denied', 'used') and status::text = $5)) \
+             order by id desc limit $7"
+        )))
+        .bind(tenant)
+        .bind(app)
+        .bind(q.requested_by.map(|p| p.0))
+        .bind(after)
+        .bind(q.status)
+        .bind(at)
+        .bind((limit + 1) as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let items = rows.iter().map(approval_row).collect::<Result<Vec<_>>>()?;
+        Ok(crate::apps::approvals::page_of(items, limit))
+    }
+
+    async fn decide_approval(
+        &self,
+        ctx: &Context,
+        app: NodeId,
+        id: Uuid,
+        d: ApprovalDecision,
+        at: OffsetDateTime,
+    ) -> Result<crate::journal::Written<ApprovalRow>> {
+        let user = ctx
+            .actor
+            .effective_user()
+            .ok_or_else(Error::user_required)?;
+        let tenant = ctx.tenant;
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "select {APPROVAL_COLUMNS} from app_approvals where tenant_id = $1 \
+             and app_node_id = $2 and id = $3 for update"
+        )))
+        .bind(tenant)
+        .bind(app)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(crate::apps::approvals::approval_not_found)?;
+        let a = approval_row(&row)?;
+        if crate::apps::approvals::status_at(&a, at) != "pending" {
+            return Err(crate::apps::approvals::not_pending());
+        }
+        let a = crate::apps::approvals::decided(a, user, &d, at);
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "update app_approvals set status = $3::text::approval_status, decided_by = $4, \
+             decided_at = $5, comment = $6, telemetry_fields = $7, classes = $8, \
+             expires_at = $9 where tenant_id = $1 and id = $2 returning {APPROVAL_COLUMNS}"
+        )))
+        .bind(tenant)
+        .bind(id)
+        .bind(a.status.as_str())
+        .bind(user.0)
+        .bind(a.decided_at)
+        .bind(a.comment.as_deref())
+        .bind(&a.telemetry_fields)
+        .bind(&a.classes)
+        .bind(a.expires_at)
+        .fetch_one(&mut *tx)
+        .await?;
+        let a = approval_row(&row)?;
+        let e = append(
+            &mut tx,
+            ctx,
+            NewEntry {
+                node_id: Some(app),
+                revision: None,
+                event: EventType::AppApprovalDecided,
+                data: d.event,
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(crate::journal::Written {
+            value: a,
+            change: ChangeInfo {
+                seq: Some(e.seq),
+                actor: e.actor,
+                at: e.at,
+            },
+        })
+    }
+
+    async fn take_approval(
+        &self,
+        ctx: &Context,
+        app: NodeId,
+        id: Uuid,
+        deployment: Uuid,
+        at: OffsetDateTime,
+    ) -> Result<Option<ApprovalRow>> {
+        let mut tx = begin_tenant(&self.pool, ctx.tenant).await?;
+        // One statement: a second take of the same row waits for the first, then reads the row
+        // again (`status` is `used` by then) and changes nothing.
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "update app_approvals set status = 'used', used_at = $5 \
+             where tenant_id = $1 and app_node_id = $2 and id = $3 and deployment_id = $4 \
+             and status = 'approved' and used_at is null and expires_at > $5 \
+             and requested_kind = $6 and requested_by = $7 \
+             and requested_obo is not distinct from $8 \
+             returning {APPROVAL_COLUMNS}"
+        )))
+        .bind(ctx.tenant)
+        .bind(app)
+        .bind(id)
+        .bind(deployment)
+        .bind(at)
+        .bind(ctx.actor.actor.kind)
+        .bind(ctx.actor.actor.id.0)
+        .bind(ctx.actor.on_behalf_of.map(|u| u.0))
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.as_ref().map(approval_row).transpose()
     }
 
     async fn list_versions(
