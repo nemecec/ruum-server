@@ -590,6 +590,31 @@ fn bound_of(new_side: &BTreeMap<String, Value>, old_side: &BTreeMap<String, Valu
     json!({ "plan": new_side, "live_rows": old_side })
 }
 
+/// A test seam: a publish with the approval of `.0` stops after the take, before the release,
+/// signals `.1` and waits for `.2`.
+#[cfg(test)]
+type UsePause = (
+    Uuid,
+    std::sync::Arc<tokio::sync::Notify>,
+    std::sync::Arc<tokio::sync::Notify>,
+);
+
+#[cfg(test)]
+pub(crate) static USE_PAUSE: std::sync::Mutex<Option<UsePause>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+async fn use_pause(id: Uuid) {
+    let pause = USE_PAUSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .filter(|p| p.0 == id);
+    if let Some((_, entered, release)) = pause {
+        entered.notify_one();
+        release.notified().await;
+    }
+}
+
 /// The approval a release uses ([`AppService::go_live`]): its ID, recorded on the release, and
 /// the bindings it is bound to, compared with the plan the release grants under the live switch.
 #[derive(Clone, Copy, Debug)]
@@ -773,6 +798,8 @@ impl AppService {
             .await?
             .ok_or_else(unusable)?;
         self.notify_changed();
+        #[cfg(test)]
+        use_pause(id).await;
         let restored_from = match kind {
             ReleaseKind::Rollback => dep.version_id,
             ReleaseKind::Publish => None,
