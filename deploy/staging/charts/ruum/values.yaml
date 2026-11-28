@@ -130,6 +130,10 @@ runtime:
   builder: false
   # The cluster registry as ruum-server pushes to it (charts/platform registry.yaml).
   registryPushUrl: http://ruum-registry.ruum-registry.svc.cluster.local:5000
+  # The builder's caps (RUUM_BUILD_OUTPUT_MAX, RUUM_BUILD_MAX_PARALLEL): a build's output and its
+  # layer are in the server's memory (limit server.resources) until the push.
+  buildOutputMax: 67108864
+  buildMaxParallel: 1
   # RUUM_KUBE_SPLIT_LOG_STREAMS: read stdout and stderr apart (the API server's feature gate
   # PodLogsQuerySplitStreams). Off: one stream, reported as stdout.
   splitLogStreams: false

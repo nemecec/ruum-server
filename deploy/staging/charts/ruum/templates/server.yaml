@@ -200,6 +200,11 @@ spec:
             - { name: RUUM_BUILD_CHANNEL_SERVICE, value: "ruum-build-channel.ruum.svc.cluster.local:8092" }
             - { name: RUUM_BUILD_CHANNEL_LISTEN, value: "0.0.0.0:8092" }
             - { name: RUUM_BUILD_NAMESPACE, value: ruum-builds }
+            # The output of a build is in the server's memory until it is pushed (with its
+            # layer): one build at a time and 64 MiB at most fit the server's memory limit.
+            - { name: RUUM_BUILD_OUTPUT_MAX, value: {{ .Values.runtime.buildOutputMax | int64 | quote }} }
+            - { name: RUUM_BUILD_MAX_PARALLEL, value: {{ .Values.runtime.buildMaxParallel | int | quote }} }
+            - { name: RUUM_BUILD_TENANT_MAX, value: "1" }
             {{- end }}
             {{- end }}
           ports:
