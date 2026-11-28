@@ -13,6 +13,7 @@ also use the agent's own Postgres, data cluster and SpiceDB.
 | `cloud-init.yaml` | The first boot: Docker, build tools, Node.js 22, Rust for the user `ruum`. |
 | `setup.sh` | Run once after a create, and again at any time: Node.js, base copy `~/ruum-server` from GitHub, dev stack, `sqlx-cli`, the PostgreSQL 17 client (`pg_dump` for the engine's export), Playwright's Chromium with its OS packages, status. |
 | `run.sh` | Runs a command for one agent on the server. |
+| `check.sh` | The full check of a tree (run through `run.sh`): see "The full check". |
 
 ## Cost
 
@@ -108,9 +109,31 @@ scripts/buildbox/run.sh feat-x ../ruum-server-wt/feat-x -- scripts/e2e_browser.s
 - `scripts/e2e_browser.sh` keeps its work folder (the HTML report, traces of failed tests and
   logs) in `/tmp/ruum-e2e-browser.*` on the server. Copy it to the laptop with
   `rsync -a -e 'ssh -i ~/.config/ruum/buildbox_ed25519' ruum@<ip>:/tmp/ruum-e2e-browser.XXXXXX ./`.
-- After a rebase, touch the sources before cargo runs (`run.sh` keeps the file times, so cargo
-  can reuse a stale binary): `run.sh <name> <worktree> -- bash -c 'find crates contracts
-  migrations -type f -exec touch {} + && scripts/e2e_browser.sh'`.
+- `run.sh` compares files by content (rsync `--checksum`) and gives each file it writes the time
+  of the sync; it does not copy the laptop's file times. So cargo sees every changed file as
+  newer than its last build on that key, also after a rebase or when one key checks the tips of
+  several worktrees (backlog B-41, B-62). No touch is needed before cargo runs.
+- Call `run.sh` bare, with your tool's own timeout: macOS has no GNU `timeout` (B-59).
+- After `docker restart pgdata-<name>` (B-48) the data cluster has a new port: rerun in a new
+  `run.sh` call (B-60).
+
+## The full check
+
+`scripts/buildbox/check.sh` is the full check of a tree: fmt, clippy, the workspace, the crates
+with data cluster tests apart with 4 test threads, the test kit on memory and on Postgres, and
+the e2e scripts. Integrators and cards run it instead of a copy of their own, one full check at
+a time per agent:
+
+```sh
+scripts/buildbox/run.sh <name> <worktree> -- scripts/buildbox/check.sh > check.log 2>&1
+echo "exit $?"
+grep '=== RESULT [1-9]' check.log
+```
+
+`E2E=smoke|both|none`, `ONLY_E2E=1`, `ONLY_DATA=1` and `CARGO_BUILD_JOBS` are in its header.
+`ruum-core` and `ruum-dbengine` run apart because at the default thread count their data
+cluster tests OOM-kill the agent's data cluster (768 MB): "the database system is in recovery
+mode", "expected to read 5 bytes" (B-29, B-35, B-63).
 
 ## The agent's data cluster
 

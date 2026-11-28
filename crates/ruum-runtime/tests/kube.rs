@@ -344,6 +344,22 @@ async fn wait_state(
     }
 }
 
+/// Waits until a service runs, touching it before every look: on a busy machine its pod can take
+/// longer than the idle timeout to run, and the driver then scales it to zero before the test
+/// ever sees it running (backlog T-104).
+async fn wait_running(d: &KubeDriver, tenant: TenantId, id: ruum_core::runtime::InstanceId) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let _ = d.touch(tenant, id).await;
+        let s = d.status(tenant, id).await.unwrap().state;
+        if s == InstanceState::Running {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the state stayed {}", s.name());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 struct Fixture {
     world: World,
     driver: Arc<dyn RuntimeDriver>,
@@ -698,11 +714,32 @@ async fn a_vanished_pod_ends_the_instance() {
             other => panic!("the state is {}", other.name()),
         }
     }
-    let runs = usage
-        .records()
-        .iter()
-        .filter(|r| matches!(r, RuntimeUsage::Instance { instance, .. } if *instance == s.id))
-        .count();
+    let charged = || {
+        usage
+            .records()
+            .iter()
+            .filter(|r| matches!(r, RuntimeUsage::Instance { instance, .. } if *instance == s.id))
+            .count()
+    };
+    // The process whose write ends the run charges it, right after the API server answers that
+    // write. It can be a sweep of either driver (every 100 ms): its write lands before the two
+    // reads above and its charge after them, when the machine is busy (backlog T-104). So the
+    // test waits for the charge, then lets both processes look again before it counts.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while charged() == 0 {
+        assert!(Instant::now() < deadline, "the run was never charged");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    a.sweep().await;
+    b.sweep().await;
+    for d in [&a, &b] {
+        assert!(matches!(
+            d.status(id.tenant, s.id).await.unwrap().state,
+            InstanceState::Exited(_)
+        ));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let runs = charged();
     assert_eq!(runs, 1, "the run was charged {runs} times");
 }
 
@@ -838,21 +875,20 @@ async fn a_stop_during_a_reregistration_leaves_no_registration() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_gateway_never_gets_an_earlier_runs_address() {
     let w = world(false).await;
-    let a = w.driver(Arc::new(MemoryUsage::new()));
+    // No sweeps: only the test's looks change the state, so a slow start on a busy machine is
+    // not scaled to zero before the test touches it (backlog T-104).
+    let a = w.quiet_driver();
     let b = w.quiet_driver();
     let id = identity();
     let s = a
         .start(w.service(id, Some(Duration::from_secs(1))))
         .await
         .unwrap();
-    wait_state(b.as_ref(), id.tenant, s.id, |x| {
-        *x == InstanceState::Running
-    })
-    .await;
+    wait_running(&b, id.tenant, s.id).await;
     let first = b.upstream(s.id).expect("the first run's address");
     wait_state(&a, id.tenant, s.id, |x| *x == InstanceState::ScaledToZero).await;
     a.wake(id.tenant, s.id).await.unwrap();
-    wait_state(&a, id.tenant, s.id, |x| *x == InstanceState::Running).await;
+    wait_running(&a, id.tenant, s.id).await;
     let second = a.upstream(s.id).expect("the second run's address");
     assert_ne!(first, second, "the fake gives each pod its own address");
     let st = b.wake(id.tenant, s.id).await.unwrap();
@@ -912,13 +948,15 @@ async fn the_logs_go_when_another_process_ended_the_instance() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_wake_waits_for_the_previous_unregistration() {
     let w = world(false).await;
-    let a = w.driver(Arc::new(MemoryUsage::new()));
+    // No sweep: only the test's looks change the state, so a slow start or wake on a busy
+    // machine is not scaled to zero before the test touches it (backlog T-104).
+    let a = w.quiet_driver();
     let id = identity();
     let s = a
         .start(w.service(id, Some(Duration::from_secs(1))))
         .await
         .unwrap();
-    wait_state(&a, id.tenant, s.id, |x| *x == InstanceState::Running).await;
+    wait_running(&a, id.tenant, s.id).await;
     let first = ruum_runtime::kube::pod_name(s.id, 1);
     w.egress.refuse.store(true, Ordering::SeqCst);
     wait_state(&a, id.tenant, s.id, |x| *x == InstanceState::ScaledToZero).await;
@@ -927,7 +965,7 @@ async fn a_wake_waits_for_the_previous_unregistration() {
     assert!(w.fake.pod(NS, &first).is_some(), "the registered pod went");
     w.egress.refuse.store(false, Ordering::SeqCst);
     a.wake(id.tenant, s.id).await.unwrap();
-    wait_state(&a, id.tenant, s.id, |x| *x == InstanceState::Running).await;
+    wait_running(&a, id.tenant, s.id).await;
     let second = ruum_runtime::kube::pod_name(s.id, 2);
     let events = w.egress.events.lock().unwrap().clone();
     let un = events
@@ -1474,10 +1512,11 @@ async fn a_woken_pod_redacts_the_earlier_tokens() {
     let spec = w.service(id, Some(Duration::from_secs(3)));
     let first = spec.workload_token.expose().to_owned();
     let s = d.start(spec).await.unwrap();
-    wait_state(&d, id.tenant, s.id, |x| *x == InstanceState::Running).await;
+    wait_running(&d, id.tenant, s.id).await;
     let second = format!("tok-second-{}", uuid::Uuid::now_v7().simple());
     let third = format!("tok-third-{}", uuid::Uuid::now_v7().simple());
     for t in [&second, &third] {
+        d.touch(id.tenant, s.id).await.unwrap();
         d.rotate_token(id.tenant, s.id, SecretValue::new(t.clone()))
             .await
             .unwrap();
@@ -1738,7 +1777,10 @@ async fn one_tenant_cannot_take_every_slot() {
     let mut w = world(false).await;
     w.cfg.max_instances = 4;
     w.cfg.max_tenant_instances = 2;
-    let d = w.driver(Arc::new(MemoryUsage::new()));
+    // No sweep of its own: on a busy machine a sweep scaled an instance (idle after 200 ms) to
+    // zero while its start was still writing the seal, and the start failed (backlog T-104).
+    // The test's own looks scale them to zero.
+    let d = w.quiet_driver();
     let a = identity();
     let mut ids = Vec::new();
     for _ in 0..2 {

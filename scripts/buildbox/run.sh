@@ -4,9 +4,16 @@
 #   scripts/buildbox/run.sh <name> <worktree> -- <command...>
 #   scripts/buildbox/run.sh <name> --stop
 #
+# Call it bare, with the calling tool's own timeout: macOS has no GNU `timeout`, and `timeout
+# run.sh ...` prints this usage text instead of running (backlog B-59).
+#
 # The first form copies the worktree (tracked and untracked files, with uncommitted changes; not
 # ignored files, target*/, node_modules/ or .git) to ~/w/<name> on the server with rsync, deletes
-# files there that are gone here, and runs the command in that folder. The command gets:
+# files there that are gone here, and runs the command in that folder. rsync compares contents
+# (checksums), not times, and a file it writes gets the time of the sync: so cargo always sees a
+# changed file as newer than its last build on that key, also after a rebase or a switch to
+# another worktree gave the file an older time (backlog B-41, B-62). Unchanged files keep their
+# time on the server. The command gets:
 #   - the settings of the dev stack (`scripts/dev.sh env` of the base copy ~/ruum-server);
 #   - CARGO_TARGET_DIR=~/targets/<name> and CARGO_INCREMENTAL=0, so agents never wait for one
 #     another's cargo lock;
@@ -18,7 +25,9 @@
 #     deploy/dev/postgres-data (image ruum-buildbox-pgdata:<name>), started or reused, in
 #     RUUM_DBHOST_URL and DBHOST_CHECK_CONTAINER, with RUUM_DBENGINE_REQUIRE_POSTGRES=1. A change
 #     of that folder builds the image again and starts a new, empty cluster. A tree without the
-#     folder keeps the stack's shared data cluster;
+#     folder keeps the stack's shared data cluster. `docker restart pgdata-<name>` (B-48) gives
+#     the cluster a new port: rerun the tests in a new run.sh call, which reads the port again
+#     (backlog B-60);
 #   - a dev root of its own, ~/w/.<name>.dev, in RUUM_DEV_ROOT (scripts/e2e_browser.sh) and its
 #     scripts/dev.sh in RUUM_DEV_SH (scripts/e2e_smoke.sh): a wrapper of the base copy's dev.sh
 #     whose `env` prints the agent's Postgres, SpiceDB and data cluster instead of the stack's, next to a link to
@@ -262,7 +271,8 @@ git -C "$SRC" ls-files -z -co --exclude-standard | while IFS= read -r -d '' f; d
 done >"$LIST"
 
 remote prune "$NAME" <"$LIST"
-rsync -a -0 --files-from="$LIST" -e "${SSH[*]}" "$SRC/" "$DEST:w/$NAME/" ||
+# -a without -t (times), with --checksum: see the header (B-62).
+rsync -rlpgoD --checksum -0 --files-from="$LIST" -e "${SSH[*]}" "$SRC/" "$DEST:w/$NAME/" ||
   die "rsync failed"
 say "$NAME: synced $(tr -cd '\0' <"$LIST" | wc -c | tr -d ' ') files from $SRC in $((SECONDS - start))s"
 

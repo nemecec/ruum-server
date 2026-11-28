@@ -174,8 +174,8 @@ pub struct Fake {
     pub runtime_class_overhead: Mutex<BTreeMap<String, String>>,
     /// A held read of one ConfigMap (T-85): set by [`Fake::hold_config_map_get`].
     hold_get: Mutex<Option<HoldGet>>,
-    /// The next ConfigMap update answers this status and writes nothing (review of I620-G,
-    /// required change 2).
+    /// The next ConfigMap update that changes the record's sealed part (a launch write) answers
+    /// this status and writes nothing (review of I620-G, required change 2; backlog T-103).
     pub fail_config_map_put_once: Mutex<Option<u16>>,
     /// Told when the held read has its answer (from before any later write).
     pub get_held: Notify,
@@ -1066,16 +1066,31 @@ async fn object_put(
             "the fake updates ConfigMaps only",
         );
     }
-    if let Some(code) = f.fail_config_map_put_once.lock().unwrap().take() {
+    let Ok(mut obj) = serde_json::from_slice::<Value>(&body) else {
+        return status(StatusCode::BAD_REQUEST, "not JSON");
+    };
+    let key = (ns.clone(), name);
+    // Only a write that changes the record's sealed part (a launch) takes the armed fault, so a
+    // background write of the record (a sweep, a state change) cannot use it up (backlog T-103).
+    let sealed = |v: &Value| {
+        v.pointer("/data/record")
+            .and_then(Value::as_str)
+            .and_then(|t| serde_json::from_str::<Value>(t).ok())
+            .and_then(|r| r.get("sealed").cloned())
+    };
+    let reseals = f
+        .objs
+        .lock()
+        .unwrap()
+        .cms
+        .get(&key)
+        .is_some_and(|cur| sealed(cur) != sealed(&obj));
+    if reseals && let Some(code) = f.fail_config_map_put_once.lock().unwrap().take() {
         return status(
             StatusCode::from_u16(code).unwrap(),
             "the fake refused this update",
         );
     }
-    let Ok(mut obj) = serde_json::from_slice::<Value>(&body) else {
-        return status(StatusCode::BAD_REQUEST, "not JSON");
-    };
-    let key = (ns.clone(), name);
     let mut o = f.objs.lock().unwrap();
     let Some(cur) = o.cms.get(&key) else {
         return status(StatusCode::NOT_FOUND, "NotFound");
