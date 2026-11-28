@@ -396,6 +396,11 @@ impl DockerDriver {
     }
 
     /// The memory of the log rings of every kept instance (for tests and operations).
+    /// The bytes of the live log budget in use, for one tenant or all (backlog S-91, I620-11).
+    pub fn live_log_bytes(&self, tenant: Option<TenantId>) -> usize {
+        self.inner.live.used(tenant)
+    }
+
     pub fn kept_log_bytes(&self) -> usize {
         let all: Vec<Arc<Instance>> = self
             .inner
@@ -1275,8 +1280,6 @@ impl Inner {
                 reason: "no container".to_owned(),
             })?;
         let secrets = inst.secrets();
-        // A wake: the logs of the instance count to the live budget again (backlog I620-11).
-        inst.lock().unpark();
         let opts = AttachContainerOptionsBuilder::new()
             .stream(true)
             .stdin(inst.launch.is_some())
@@ -2203,6 +2206,9 @@ impl RuntimeDriver for DockerDriver {
             });
         }
         inner.begin_run(&inst).await?;
+        // The run started: its logs count to the live budget again (backlog I620-11). A failed
+        // wake leaves the ring parked (Kimi review of I620-R, finding 2).
+        inst.lock().unpark();
         // Hold until the service answers its health check (or runs, without one).
         let deadline = Instant::now() + inner.cfg.start_period + Duration::from_secs(5);
         loop {
@@ -2653,7 +2659,20 @@ mod tests {
             "the quiet tenant's ended instance keeps its logs"
         );
         assert!(d.kept_log_bytes() <= 96 * 1024, "{}", d.kept_log_bytes());
-        // A wake: its new lines count to the live budget again.
+        // A wake that fails (this instance has no container) keeps the ring parked: out of the
+        // live budget, in the ended byte cap.
+        fill(&d, p, 4);
+        assert!(
+            d.wake(noisy, p).await.is_err(),
+            "a wake without a container"
+        );
+        assert_eq!(
+            live.used(Some(noisy)),
+            0,
+            "a failed wake left the ring live"
+        );
+        assert!(d.inner.get(p).expect("kept").lock().parked.is_some());
+        // A wake that starts the run: its lines count to the live budget again.
         d.inner.get(p).expect("kept").lock().unpark();
         fill(&d, p, 4);
         assert!(live.used(Some(noisy)) >= 4 * 1024);
