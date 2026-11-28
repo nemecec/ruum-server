@@ -151,3 +151,11 @@ RUUM_BUILD_OUTPUT_MAX optional
 RUUM_BUILD_MAX_PARALLEL optional
 RUUM_BUILD_TENANT_MAX optional
 RUUM_BUILD_SCRIPT_E2E test
+# Names in the build pod's environment (card I6-13, crates/ruum-runtime src/builder/kube.rs),
+# never ruum-server's own settings, and a binding name of a core test.
+RUUM_BUILD_CA test
+RUUM_BUILD_CHANNEL test
+RUUM_BUILD_COMMAND test
+RUUM_BUILD_PIN test
+RUUM_BUILD_TOKEN test
+RUUM_BINDING_DB test
