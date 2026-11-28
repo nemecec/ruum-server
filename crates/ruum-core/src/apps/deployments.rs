@@ -1180,7 +1180,7 @@ impl AppService {
         dep: &DeploymentRow,
         public_url: &str,
     ) -> Result<Value> {
-        let r = self.requested(ctx.tenant, app, dep).await?;
+        let r = self.requested(ctx, app, dep).await?;
         let now = crate::now();
         let (row, _) = self
             .deps

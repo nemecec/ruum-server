@@ -12,6 +12,7 @@ use crate::apps::deployments::{
 use crate::apps::store::NewApproval;
 use crate::databases::CreateDatabase;
 use crate::identity::VerifiedLogin;
+use crate::ids::TenantId;
 use crate::journal::EventType;
 use crate::nodes::{NewNode, NodeKind, OnConflict};
 use crate::providers::ProviderState;
@@ -814,7 +815,7 @@ async fn an_approval_for_another_archive_manifest_or_bindings_is_refused() {
             .await
             .unwrap()
             .unwrap();
-    let now = w.s.apps.requested(w.team.id, &app_row, &row).await.unwrap();
+    let now = w.s.apps.requested(&agent, &app_row, &row).await.unwrap();
     let store = w.s.apps.store();
     let seeded = |archive: [u8; 32], manifest: [u8; 32], bindings: Value| {
         let now = now.clone();
@@ -992,6 +993,91 @@ async fn a_path_binding_that_resolves_elsewhere_is_shown_and_binds_the_approval(
     let e = w.publish(&agent, app, dep, Some(id)).await.unwrap_err();
     assert_eq!(hint(&e).as_deref(), Some("approval_stale"));
     assert_eq!(w.live(app).await, Some(live.id));
+}
+
+/// A rollback to an older release with the same manifest text shows the older release's
+/// targets, and a live binding without a row (as after a restore of the app) counts as a
+/// change too (Kimi W-3b re-check 2).
+#[tokio::test]
+async fn a_rollback_and_a_missing_live_row_show_their_binding_changes() {
+    let w = world().await;
+    let app = w.app("Rolled").await;
+    let a = w.node(w.folder, "Shared", NodeKind::Folder).await;
+    let path = w.s.nodes.path_of(&w.o(), a).await.unwrap();
+    let manifest =
+        format!("runtime: static\nbindings:\n  docs:\n    node: \"{path}\"\n    role: view\n");
+    let site = w
+        .site(
+            "by path",
+            &[("app.yaml", manifest.as_bytes()), ("index.html", INDEX)],
+        )
+        .await;
+    // L1 binds A; then B takes the name and L2 binds B.
+    let p1 = w.preview(&w.o(), app, site).await;
+    let Published::Live(l1) = w.publish(&w.o(), app, p1, None).await.unwrap() else {
+        panic!("live");
+    };
+    w.s.nodes
+        .rename(&w.o(), a, "Shared A".into(), OnConflict::Fail, None)
+        .await
+        .unwrap();
+    let b = w.node(w.folder, "Shared", NodeKind::Folder).await;
+    let p2 = w.preview(&w.o(), app, site).await;
+    let Published::Live(_) = w.publish(&w.o(), app, p2, None).await.unwrap() else {
+        panic!("live");
+    };
+    // The agent asks to roll back to L1: A is added, docs (B) removed.
+    let agent = w.agent(w.editor).await;
+    let id = w.ask(&agent, app, l1.id).await;
+    let changes = w.row(app, id).await.changes;
+    assert_eq!(changes["bindings_removed"], json!(["docs"]), "{changes}");
+    assert!(
+        changes["bindings_added"]
+            .to_string()
+            .contains(&a.to_string()),
+        "{changes}"
+    );
+    // The live principal loses its row (as a trash of the app does; a restore does not give it
+    // back): the next request shows docs as removed and added, against no live grant.
+    let store = w.s.apps.store();
+    let live_rows = store
+        .list_bindings(
+            w.team.id,
+            &crate::apps::store::BindingQuery {
+                principal: Some(app.0),
+                active_only: true,
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(live_rows.len(), 1);
+    store
+        .revoke_bindings(
+            &w.o(),
+            &*w.s.authz,
+            &[live_rows[0].id],
+            crate::apps::store::RevokeReason::AppTrashed,
+        )
+        .await
+        .unwrap();
+    let p3 = w.preview(&agent, app, site).await;
+    let id3 = w.ask(&agent, app, p3).await;
+    let changes = w.row(app, id3).await.changes;
+    assert_eq!(changes["bindings_removed"], json!(["docs"]), "{changes}");
+    assert!(
+        changes["bindings_added"]
+            .to_string()
+            .contains(&b.to_string()),
+        "{changes}"
+    );
+    // The rollback's approval was made against the live row of B; it is stale now.
+    w.decide(&w.o(), app, id, json!({ "decision": "approve" }))
+        .await
+        .unwrap();
+    let e = w.publish(&agent, app, l1.id, Some(id)).await.unwrap_err();
+    assert_eq!(hint(&e).as_deref(), Some("approval_stale"));
 }
 
 #[tokio::test]

@@ -87,7 +87,7 @@ use crate::actor::{Actor, Context};
 use crate::authz::{self, Role};
 use crate::databases::access::approvals::DecidedClass;
 use crate::error::{ApiError, Error, ErrorCode, Result};
-use crate::ids::{NodeId, TenantId, UserId};
+use crate::ids::{NodeId, UserId};
 use crate::journal::Written;
 use crate::paging::{Cursor, Page, PageRequest};
 use ruum_dbengine::DataClass;
@@ -543,10 +543,11 @@ impl AppService {
     /// request stores it; the use compares it again ([`check_bound`]).
     pub(crate) async fn requested(
         &self,
-        tenant: TenantId,
+        ctx: &Context,
         app: &super::store::AppRow,
         dep: &DeploymentRow,
     ) -> Result<Requested> {
+        let tenant = ctx.tenant;
         let manifest = dep.manifest.clone().unwrap_or(Value::Null);
         let live_manifest = match app.live_deployment_id {
             Some(live) => self
@@ -564,18 +565,15 @@ impl AppService {
                 .unwrap_or_default()
         };
         let (new_roles, old_roles) = (roles(Some(&manifest)), roles(live_manifest.as_ref()));
-        let rows = self.preview_rows(tenant, dep.id).await?;
-        let (mut bindings_added, mut bindings_removed, bound_bindings) =
-            super::bindings::approval_bindings(&manifest, live_manifest.as_ref(), &rows);
-        // A binding whose name stays but whose spec or resolved target, role, API or scopes
-        // change (Kimi W-3b, 1 and its re-check): it is removed and added again, so the person
-        // sees it. The live side is the live principal's active rows (what the live app holds
-        // now); a preview's database row names a branch and compares as its source.
-        let spec = |m: Option<&Value>, name: &str| {
-            m.and_then(|m| m.get("bindings"))
-                .and_then(|b| b.get(name))
-                .cloned()
-        };
+        // The bindings (Kimi W-3b, 1 and its re-checks): the new side is the plan the release
+        // will grant (`check_publish_bindings` with the publisher, on the targets the deployment
+        // recorded: a preview's rows, or an older release's rows for a rollback; a database
+        // branch as its source); the old side is what the live principal holds now (its active
+        // rows). A binding is removed and added again when its manifest spec or its resolved
+        // grant differs, also when one side has no grant (a restored app has no live rows).
+        let planned = self
+            .check_publish_bindings(ctx, app.node_id, dep.id, &manifest)
+            .await?;
         let live_rows = match app.live_deployment_id {
             Some(_) => {
                 self.deps
@@ -593,48 +591,86 @@ impl AppService {
             }
             None => Vec::new(),
         };
-        let sources = self.branch_sources(tenant, &rows).await?;
-        let resolved = |b: &super::store::BindingRow, target: NodeId| {
+        let grant = |target: NodeId,
+                     role: Option<Role>,
+                     api: &Option<String>,
+                     scopes: &[String],
+                     obo: bool| {
             json!({
-                "name": b.name,
                 "target_node_id": target,
-                "role": b.role,
-                "api": b.api,
-                "scopes": b.scopes,
-                "on_behalf_of_user": b.on_behalf_of_user,
+                "role": role,
+                "api": api,
+                "scopes": scopes,
+                "on_behalf_of_user": obo,
             })
         };
-        let mut live_resolved: Vec<Value> = live_rows
+        let new_side: BTreeMap<String, Value> = planned
             .iter()
-            .map(|b| resolved(b, b.target_node_id))
+            .map(|r| {
+                (
+                    r.name.clone(),
+                    grant(r.target, r.role, &r.api, &r.scopes, r.on_behalf_of_user),
+                )
+            })
             .collect();
-        live_resolved.sort_by_key(|v| v.to_string());
-        let names: Vec<String> = manifest
-            .get("bindings")
-            .and_then(Value::as_object)
-            .map(|o| o.keys().cloned().collect())
-            .unwrap_or_default();
-        for name in names {
-            let old = spec(live_manifest.as_ref(), &name);
-            if old.is_none() {
-                continue;
-            }
-            let row = rows.iter().find(|r| r.name == name);
-            let new_target =
-                row.map(|r| resolved(r, sources.get(&name).copied().unwrap_or(r.target_node_id)));
-            let old_target = live_rows
-                .iter()
-                .find(|r| r.name == name)
-                .map(|r| resolved(r, r.target_node_id));
-            let target_changed =
-                new_target.is_some() && old_target.is_some() && new_target != old_target;
-            if old != spec(Some(&manifest), &name) || target_changed {
-                bindings_removed.push(name.clone());
-                if let Some(row) = row {
-                    bindings_added.push(super::bindings::app_binding_json(row));
-                }
-            }
-        }
+        let old_side: BTreeMap<String, Value> = live_rows
+            .iter()
+            .map(|b| {
+                (
+                    b.name.clone(),
+                    grant(
+                        b.target_node_id,
+                        b.role,
+                        &b.api,
+                        &b.scopes,
+                        b.on_behalf_of_user,
+                    ),
+                )
+            })
+            .collect();
+        let spec = |m: Option<&Value>, name: &str| {
+            m.and_then(|m| m.get("bindings"))
+                .and_then(|b| b.get(name))
+                .cloned()
+        };
+        let names = |m: Option<&Value>| -> Vec<String> {
+            m.and_then(|m| m.get("bindings"))
+                .and_then(Value::as_object)
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        let (new_names, old_names) = (names(Some(&manifest)), names(live_manifest.as_ref()));
+        let differs = |name: &str| {
+            spec(live_manifest.as_ref(), name) != spec(Some(&manifest), name)
+                || old_side.get(name) != new_side.get(name)
+        };
+        let mut bindings_removed: Vec<String> = old_names
+            .iter()
+            .chain(old_side.keys())
+            .filter(|n| differs(n))
+            .cloned()
+            .collect();
+        bindings_removed.sort();
+        bindings_removed.dedup();
+        let bindings_added: Vec<Value> = planned
+            .iter()
+            .filter(|r| new_names.contains(&r.name) && differs(&r.name))
+            .map(|r| {
+                json!({
+                    "name": r.name,
+                    "kind": match r.kind {
+                        super::bindings::ResolvedKind::Api => "api",
+                        _ => "node",
+                    },
+                    "target_node_id": r.target,
+                    "role": r.role,
+                    "api": r.api,
+                    "scopes": r.scopes,
+                    "granted_by": ctx.actor,
+                })
+            })
+            .collect();
+        let bound_bindings = json!({ "plan": new_side, "live_rows": old_side });
         // `secrets_missing` waits for card W-4, `migrations` and `planned_columns` for W-3a-m;
         // `unconfirmed_telemetry_fields` stays 0 until the request can read the app's field
         // list in one store call (backlog W3B-1).
@@ -648,19 +684,6 @@ impl AppService {
             "planned_columns": [],
             "unconfirmed_telemetry_fields": 0,
             "unconfirmed_columns": 0,
-        });
-        // The approval is bound to the preview's resolved rows and to the live bindings the
-        // changes were computed against, as the manifest names them and as the live rows
-        // resolve them (Kimi W-3b, 1: a live binding that changes its target after the decision
-        // makes the approval stale, also when the names and the manifest text stay).
-        let bound_bindings = json!({
-            "preview": bound_bindings,
-            "live": live_manifest
-                .as_ref()
-                .and_then(|m| m.get("bindings"))
-                .cloned()
-                .unwrap_or_else(|| json!({})),
-            "live_rows": live_resolved,
         });
         Ok(Requested {
             changes,
@@ -686,7 +709,7 @@ impl AppService {
             .await?
             .ok_or_else(unusable)?;
         check_use(&a, &ctx.actor, dep.id, crate::now())?;
-        let now = self.requested(ctx.tenant, app, dep).await?;
+        let now = self.requested(ctx, app, dep).await?;
         check_bound(&a, &dep.archive.content_hash, &now)?;
         let taken = self
             .deps

@@ -253,8 +253,10 @@ async fn initialize_and_list_every_tool_of_the_contract() {
     // W-2s (deploy_app_preview, publish_app_deployment), the four app role tools of card B-2
     // and the five telemetry read tools of card O-2 (confirmAppTelemetryFields and
     // computeAppPseudonym are users only: no tool), the three template tools of card L-1
-    // (list_templates, get_template, create_template) and the two migration tools of card D-2.
-    assert_eq!(names.len(), 87);
+    // (list_templates, get_template, create_template), the two migration tools of card D-2 and
+    // the two approval tools of card W-3b (list_app_approvals, get_app_approval;
+    // decideAppApproval is users only: no tool).
+    assert_eq!(names.len(), 89);
     for t in [
         "create_database",
         "get_database",
@@ -275,6 +277,8 @@ async fn initialize_and_list_every_tool_of_the_contract() {
         "update_app_settings",
         "list_app_deployments",
         "get_app_deployment",
+        "list_app_approvals",
+        "get_app_approval",
     ] {
         assert!(names.contains(&t), "{t} is offered");
     }
