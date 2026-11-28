@@ -94,7 +94,7 @@ const DEPLOYMENT_COLUMNS: &str = "tenant_id, id, app_node_id, environment::text 
     state::text as state, short_id, version_id, label, draft, source_kind, source_node_id, \
     source_version_id, source_files, archive_hash, archive_size, archive_chunks, manifest, stages, \
     check_result, published_from, approval_id, created_kind, created_by, created_obo, created_at, \
-    published_at, expires_at";
+    published_at, expires_at, image_digest";
 
 fn deployment_row(r: &PgRow) -> Result<DeploymentRow> {
     let env: String = r.try_get("environment")?;
@@ -146,6 +146,7 @@ fn deployment_row(r: &PgRow) -> Result<DeploymentRow> {
         created_at: r.try_get("created_at")?,
         published_at: r.try_get("published_at")?,
         expires_at: r.try_get("expires_at")?,
+        image_digest: r.try_get("image_digest")?,
     })
 }
 
@@ -194,9 +195,9 @@ async fn insert_row(
          short_id, version_id, label, draft, source_kind, source_node_id, source_version_id, \
          source_files, archive_hash, archive_size, archive_chunks, manifest, stages, \
          published_from, created_kind, created_by, created_obo, created_at, published_at, \
-         expires_at) values ($1, $2, $3, $4::text::app_environment, \
+         expires_at, image_digest) values ($1, $2, $3, $4::text::app_environment, \
          $5::text::app_deployment_state, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-         $17, $18, $19, $20, $21, $22, $23, $24, $25) returning {DEPLOYMENT_COLUMNS}"
+         $17, $18, $19, $20, $21, $22, $23, $24, $25, $26) returning {DEPLOYMENT_COLUMNS}"
     )))
     .bind(ctx.tenant)
     .bind(d.id)
@@ -223,6 +224,7 @@ async fn insert_row(
     .bind(now)
     .bind(release.then_some(now))
     .bind(d.expires_at)
+    .bind(d.image_digest.as_deref())
     .fetch_one(&mut *conn)
     .await;
     match row {
@@ -899,6 +901,22 @@ impl AppStore for PgAppStore {
         .bind(tenant)
         .bind(id)
         .bind(stages)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    async fn set_image_digest(&self, tenant: TenantId, id: Uuid, digest: &str) -> Result<bool> {
+        super::check_image_digest(digest)?;
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        let done = sqlx::query(
+            "update app_deployments set image_digest = $3 where tenant_id = $1 and id = $2 \
+             and state in ('pending', 'running') and image_digest is null",
+        )
+        .bind(tenant)
+        .bind(id)
+        .bind(digest)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

@@ -973,6 +973,7 @@ mod tests {
     ) -> ruum_core::apps::store::NewDeployment {
         use ruum_core::apps::store::{Archive, DeploymentSource, NewDeployment};
         NewDeployment {
+            image_digest: None,
             id: uuid::Uuid::now_v7(),
             app_node_id: app,
             environment,
@@ -1305,6 +1306,7 @@ mod tests {
                 .insert_deployment(
                     &ctx,
                     NewDeployment {
+                        image_digest: None,
                         id,
                         app_node_id: app.node.id,
                         environment: Environment::Preview,

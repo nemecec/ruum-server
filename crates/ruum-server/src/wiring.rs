@@ -920,6 +920,7 @@ mod tests {
             .insert_deployment(
                 &alice_ctx,
                 NewDeployment {
+                    image_digest: None,
                     id: ruum_core::ids::NodeId::new().0, // a UUIDv7
                     app_node_id: app,
                     environment: Environment::Live,

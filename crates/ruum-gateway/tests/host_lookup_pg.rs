@@ -118,6 +118,7 @@ async fn app_node(pool: &PgPool, t: TenantId, u: UserId) -> NodeId {
 fn deployment(app: NodeId, env: Environment, state: DeploymentState) -> NewDeployment {
     let archive = Uuid::now_v7().to_string();
     NewDeployment {
+        image_digest: None,
         id: Uuid::now_v7(),
         app_node_id: app,
         environment: env,

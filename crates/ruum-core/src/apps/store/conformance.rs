@@ -34,6 +34,7 @@ pub(crate) fn app(node: NodeId, slug: &str) -> NewApp {
 
 pub(crate) fn deployment(app: NodeId, env: Environment, state: DeploymentState) -> NewDeployment {
     NewDeployment {
+        image_digest: None,
         id: Uuid::now_v7(),
         app_node_id: app,
         environment: env,

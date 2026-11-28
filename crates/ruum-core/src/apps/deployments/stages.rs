@@ -44,11 +44,17 @@ fn stage(name: &str, state: &str, at: Option<OffsetDateTime>) -> Value {
 /// The stages of a new preview: the cheap ones ran before the answer. The stage `bindings`
 /// writes the grants after the answer (card B-1); without bindings it has nothing to do (P-62:
 /// `skipped`).
-pub fn initial(now: OffsetDateTime, bindings: bool) -> Value {
+///
+/// A node22 app (`server`, card I6-13) runs the stage `build` too.
+pub fn initial(now: OffsetDateTime, bindings: bool, server: bool) -> Value {
     Value::Array(vec![
         stage("unpack", "done", Some(now)),
         stage("validate", "done", Some(now)),
-        stage("build", "skipped", None),
+        if server {
+            stage("build", "pending", None)
+        } else {
+            stage("build", "skipped", None)
+        },
         stage("test", "skipped", None),
         if bindings {
             stage("bindings", "pending", None)
@@ -63,11 +69,16 @@ pub fn initial(now: OffsetDateTime, bindings: bool) -> Value {
 
 /// The stages of a release (a publish or a rollback): every stage ran before the switch (the
 /// bindings of the live principal are checked before it and granted with it, card B-1).
-pub fn release(now: OffsetDateTime, bindings: bool) -> Value {
+/// A node22 release (`server`) reuses the image its preview built: `build` is `done`.
+pub fn release(now: OffsetDateTime, bindings: bool, server: bool) -> Value {
     Value::Array(vec![
         stage("unpack", "done", Some(now)),
         stage("validate", "done", Some(now)),
-        stage("build", "skipped", None),
+        if server {
+            stage("build", "done", Some(now))
+        } else {
+            stage("build", "skipped", None)
+        },
         stage("test", "skipped", None),
         if bindings {
             stage("bindings", "done", Some(now))
@@ -125,7 +136,11 @@ pub struct StageError {
 }
 
 impl StageError {
-    fn new(stage: &'static str, reason: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        stage: &'static str,
+        reason: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             stage,
             reason,
@@ -149,6 +164,9 @@ pub(crate) struct Run {
     pub slot: Option<super::DeploySlot>,
     /// The manifest has bindings: the stage `bindings` runs (card B-1).
     pub bindings: bool,
+    /// A node22 app (card I6-13): the archive as uploaded, for the stage `build`; `None` for a
+    /// static app. Held (with the slot) until the build has read it.
+    pub archive: Option<bytes::Bytes>,
 }
 
 impl StageError {
@@ -381,6 +399,9 @@ impl AppService {
                 .map_err(|e| Box::new((StageError::of_bindings(&e), None)))?;
             set(&mut run.stages, "bindings", "done", None);
         }
+        if let Some(archive) = run.archive.take() {
+            return self.server_stages(ctx, run, archive).await;
+        }
         // image
         set(&mut run.stages, "image", "running", None);
         self.progress(ctx, run).await;
@@ -495,5 +516,76 @@ impl AppService {
         }
         set(&mut run.stages, "check", "done", None);
         Ok(check.result)
+    }
+
+    /// `build`, `image`, `start` and `check` of a node22 preview (card I6-13,
+    /// [`super::node22`]).
+    async fn server_stages(
+        &self,
+        ctx: &Context,
+        run: &mut Run,
+        archive: bytes::Bytes,
+    ) -> Result<Value, Box<(StageError, Option<Value>)>> {
+        let tenant = ctx.tenant;
+        let identity = WorkloadIdentity {
+            tenant,
+            app: run.app,
+            deployment: run.id,
+            environment: runtime::Environment::Preview,
+        };
+        // build: the archive as uploaded, no secret and no binding (the builder's input has
+        // no field for them).
+        set(&mut run.stages, "build", "running", None);
+        self.progress(ctx, run).await;
+        let built = self.node22_build(identity, archive).await;
+        // The build has read the archive: free the slot that bounds the memory.
+        run.slot = None;
+        let digest = built.map_err(|e| Box::new((e, None)))?;
+        set(&mut run.stages, "build", "done", None);
+        // image: the digest, once, on the deployment.
+        set(&mut run.stages, "image", "running", None);
+        self.progress(ctx, run).await;
+        match self
+            .deps
+            .store
+            .set_image_digest(tenant, run.id, digest.as_str())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(Box::new((
+                    StageError::new(
+                        "image",
+                        "image_failed",
+                        "the deployment ended before its image was recorded",
+                    ),
+                    None,
+                )));
+            }
+            Err(e) => {
+                tracing::warn!(%tenant, deployment = %run.id, error = %e, "the image digest could not be stored");
+                return Err(Box::new((
+                    StageError::new("image", "image_failed", "the image could not be recorded"),
+                    None,
+                )));
+            }
+        }
+        set(&mut run.stages, "image", "done", None);
+        // start: running and healthy in time, then stopped (scale to zero).
+        set(&mut run.stages, "start", "running", None);
+        self.progress(ctx, run).await;
+        let spec = self
+            .node22_check_spec(tenant, identity, &run.manifest, digest.as_str(), true)
+            .await
+            .map_err(|e| Box::new((e, None)))?;
+        let check = self
+            .node22_start_check(spec, &run.manifest)
+            .await
+            .map_err(|e| Box::new((e, None)))?;
+        set(&mut run.stages, "start", "done", None);
+        // check: the result of the start (the browser check is card O-4).
+        set(&mut run.stages, "check", "running", None);
+        set(&mut run.stages, "check", "done", None);
+        Ok(check)
     }
 }

@@ -164,6 +164,7 @@ impl World {
             .insert_deployment(
                 &self.c(self.member),
                 NewDeployment {
+                    image_digest: None,
                     id: Uuid::now_v7(),
                     app_node_id: self.app,
                     environment: Environment::Live,
@@ -1328,6 +1329,7 @@ impl crate::apps::deployments::LiveReleaseHook for Winner {
             .insert_deployment(
                 &self.ctx,
                 NewDeployment {
+                    image_digest: None,
                     id: Uuid::now_v7(),
                     app_node_id: app,
                     environment: Environment::Live,

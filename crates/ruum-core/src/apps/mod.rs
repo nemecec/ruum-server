@@ -484,6 +484,9 @@ pub struct AppService {
     /// The database bindings (card B-1d), once [`install_database_bindings`] ran; shared with
     /// the binding hooks.
     db_bindings: bindings::database::DbSlot,
+    /// The builder and the settings of node22 deployments (card I6-13), once
+    /// [`AppService::set_node22`] ran; without them a node22 manifest is `runtime_not_ready`.
+    node22: std::sync::RwLock<Option<Arc<deployments::node22::Node22>>>,
     /// A storage limit for every tenant instead of the plan's (the tests of the static quota).
     #[cfg(test)]
     storage_limit_override: std::sync::Mutex<Option<i64>>,
@@ -582,6 +585,7 @@ impl AppService {
             live_locks: deployments::LiveLocks::default(),
             site_locks: static_gc::SiteLocks::default(),
             db_bindings: Default::default(),
+            node22: std::sync::RwLock::new(None),
             #[cfg(test)]
             storage_limit_override: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -598,6 +602,21 @@ impl AppService {
     /// Turns on the database bindings (card B-1d; [`install_database_bindings`]).
     pub fn set_database_bindings(&self, db: Arc<bindings::database::DatabaseBindings>) {
         *self.db_bindings.write().unwrap_or_else(|e| e.into_inner()) = Some(db);
+    }
+
+    /// Turns on node22 deployments (card I6-13): the builder that makes their images and the
+    /// settings of their builds and instances. The runtime driver of the area must run the
+    /// images this builder pushes (the server wires both from the same registry).
+    pub fn set_node22(&self, node22: deployments::node22::Node22) {
+        *self.node22.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(node22));
+    }
+
+    /// The node22 builder and settings, when node22 deployments are on.
+    pub(crate) fn node22(&self) -> Option<Arc<deployments::node22::Node22>> {
+        self.node22
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The database bindings, when they are on.

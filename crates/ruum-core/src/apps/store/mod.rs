@@ -218,6 +218,10 @@ pub struct DeploymentRow {
     pub created_at: OffsetDateTime,
     pub published_at: Option<OffsetDateTime>,
     pub expires_at: Option<OffsetDateTime>,
+    /// The image of a server runtime (`node22`): the digest of the manifest the builder pushed
+    /// to the app's repository (`sha256:<64 hex>`, card I6-13). `None` for a static app and
+    /// until the stage `image` is done. A release copies it from the deployment it publishes.
+    pub image_digest: Option<String>,
 }
 
 /// A new deployment. A `live` one with state `live` is a release: the store writes a version of
@@ -238,11 +242,29 @@ pub struct NewDeployment {
     pub stages: Value,
     pub published_from: Option<Uuid>,
     pub expires_at: Option<OffsetDateTime>,
+    /// The image of a server runtime (see [`DeploymentRow::image_digest`]): set by a release
+    /// of a `node22` deployment, `None` for a new preview (its stage `image` sets it).
+    pub image_digest: Option<String>,
     /// The archive chunks this deployment stored in the blob store. The Postgres store records
     /// them in `chunks` in the deployment's transaction, so the chunk garbage collection frees
     /// them once no release or live preview names them (review W-2s, 3). The in-memory store
     /// keeps no chunk rows (its blob store's collection does not read deployments).
     pub new_chunks: Vec<crate::blobs::ChunkRef>,
+}
+
+/// The check of an image digest before a store writes it: `sha256:` and 64 lower-case hex
+/// characters (the column has the same check).
+pub fn check_image_digest(digest: &str) -> Result<()> {
+    let ok = digest.strip_prefix("sha256:").is_some_and(|h| {
+        h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    });
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Internal(
+            "an image digest must be sha256:<64 hex>".into(),
+        ))
+    }
 }
 
 impl NewDeployment {
@@ -799,6 +821,11 @@ pub trait AppStore: Send + Sync {
     /// Stores the stages of a deployment whose stages run (`pending` or `running`), and sets
     /// it `running`. False when it does not exist in the tenant or does not run any more.
     async fn update_stages(&self, tenant: TenantId, id: Uuid, stages: &Value) -> Result<bool>;
+
+    /// Records the image of a running preview (its stage `image`, card I6-13): `digest` is
+    /// `sha256:<64 hex>`. Only a deployment that runs (`pending` or `running`) and has no image
+    /// yet takes it; false otherwise (also when it does not exist in the tenant).
+    async fn set_image_digest(&self, tenant: TenantId, id: Uuid, digest: &str) -> Result<bool>;
 
     /// A preview whose stages passed: state `ready` with its stages and check result, and
     /// `app.deployed` (kind `preview`), in one unit. With a `draft` label, the older ready
