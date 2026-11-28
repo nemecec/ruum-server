@@ -1128,3 +1128,7 @@ impl Builder for KubeBuilder {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "kube_tests.rs"]
+mod tests;
