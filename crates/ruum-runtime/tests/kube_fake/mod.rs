@@ -517,6 +517,11 @@ impl Fake {
         });
     }
 
+    /// Changes a stored pod as a writer of pods or the API server would (its metadata too).
+    pub fn edit_pod(&self, ns: &str, name: &str, f: impl FnOnce(&mut Value)) {
+        self.set_pod(&(ns.to_owned(), name.to_owned()), f);
+    }
+
     /// Changes a stored pod's status as the kubelet would (a late or partial status write).
     pub fn edit_pod_status(&self, ns: &str, name: &str, f: impl FnOnce(&mut Value)) {
         self.set_pod(&(ns.to_owned(), name.to_owned()), |p| f(&mut p["status"]));

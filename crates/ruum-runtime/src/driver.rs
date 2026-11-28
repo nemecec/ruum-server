@@ -395,12 +395,12 @@ impl DockerDriver {
             .len()
     }
 
-    /// The memory of the log rings of every kept instance (for tests and operations).
     /// The bytes of the live log budget in use, for one tenant or all (backlog S-91, I620-11).
     pub fn live_log_bytes(&self, tenant: Option<TenantId>) -> usize {
         self.inner.live.used(tenant)
     }
 
+    /// The memory of the log rings of every kept instance (for tests and operations).
     pub fn kept_log_bytes(&self) -> usize {
         let all: Vec<Arc<Instance>> = self
             .inner

@@ -125,6 +125,15 @@ fn record_too_large(bytes: usize) -> RuntimeError {
     )
 }
 
+/// Whether `reg` is the pod name of one of the runs of `id` (the only egress registration keys
+/// this driver makes for that instance).
+fn own_registration(id: InstanceId, reg: &str) -> bool {
+    reg.strip_prefix(object_name(id).as_str())
+        .and_then(|r| r.strip_prefix('-'))
+        .and_then(|r| r.parse::<u32>().ok())
+        .is_some_and(|run| pod_name(id, run) == reg)
+}
+
 /// A shared service of a route (the egress proxy, the internal gateway, the pooler), as the
 /// platform deploys it. The spec cannot name one.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -614,9 +623,21 @@ struct Inner {
     peer_tenants: Mutex<HashMap<IpAddr, PeerPod>>,
     /// The addresses whose pre-check failed, and since when ([`PEER_QUARANTINE`]).
     refused_peers: Mutex<HashMap<IpAddr, Instant>>,
-    /// The run and the pod uid whose seal this process found naming that pod, per live
-    /// instance (backlog I620-8): the seal is opened once per run, not at every observation.
-    sealed_runs: Mutex<HashMap<InstanceId, (u32, String)>>,
+    /// The seal checks this process found true, per live instance (backlog I620-8): the seal
+    /// is opened once per run, not at every observation.
+    sealed_runs: Mutex<HashMap<InstanceId, SealedRun>>,
+}
+
+/// A seal check found true (backlog I620-8): the record (its uid and the digest of its fixed
+/// fields) whose seal names the pod of `uid` for `run`. A hit needs all four to match the record
+/// read now, so a record changed or made again after the check is opened again (independent Kimi
+/// review of I620-R, finding 1).
+#[derive(PartialEq, Eq)]
+struct SealedRun {
+    run: u32,
+    pod_uid: String,
+    record_uid: String,
+    digest: String,
 }
 
 /// The pod at a peer address: its tenant, its uid and when it was noted.
@@ -1125,6 +1146,20 @@ impl Inner {
         false
     }
 
+    /// The unregistration of `reg`, a registration key read from the record of `id` at its run
+    /// `run`. A record can be written by a writer of ConfigMaps, and the egress proxy deletes a
+    /// key without a tenant check, so only a key that is the pod name of one of this instance's
+    /// runs is unregistered. Another key is left alone, and the key of the run's own pod goes
+    /// instead (the record may have named it before the change; an unregistration is
+    /// idempotent). Independent Kimi review of I620-R, finding 4.
+    async fn unregister_recorded(&self, id: InstanceId, run: u32, reg: &str) -> bool {
+        if own_registration(id, reg) {
+            return self.unregister(reg).await;
+        }
+        tracing::warn!(target: "ruum::runtime", instance = %id.0, "an instance record names an egress registration of another pod; that one is not unregistered");
+        self.unregister(&pod_name(id, run)).await
+    }
+
     fn record_usage(&self, rec: &Record) {
         let ran = (pod::now_ms() - rec.run_started_ms).max(1) as u64;
         self.usage.record(RuntimeUsage::Instance {
@@ -1161,8 +1196,14 @@ impl Inner {
         // An exited pod holds no address and no resources; it stays until the logs are read
         // (the sweep removes it after `EXITED_POD_KEEP`).
         let delete_pod = !matches!(to, InstanceState::Exited(_));
-        self.finish_cleanup(rec.clone(), registered, delete_pod.then_some(pod.as_str()))
-            .await;
+        // The record returned names no registration once the unregistration is done (or there
+        // was none), so the caller may delete the pod.
+        if self
+            .finish_cleanup(rec.clone(), registered, delete_pod.then_some(pod.as_str()))
+            .await
+        {
+            rec.registered = None;
+        }
         if let Some(l) = self.local(rec.instance) {
             let mut st = l.st.lock().expect("local lock");
             match to {
@@ -1350,11 +1391,17 @@ impl Inner {
 
     /// The unregistration, then the pod. With a failed unregistration the pod stays (so its
     /// address is not reused while the proxy still names this app for it) and the record keeps
-    /// `registered`, for the sweep.
-    async fn finish_cleanup(&self, rec: Record, registered: Option<String>, pod: Option<&str>) {
+    /// `registered`, for the sweep. `true` when no registration is left (none, done, or a key
+    /// that is not this instance's).
+    async fn finish_cleanup(
+        &self,
+        rec: Record,
+        registered: Option<String>,
+        pod: Option<&str>,
+    ) -> bool {
         if let Some(reg) = registered {
-            if !self.unregister(&reg).await {
-                return;
+            if !self.unregister_recorded(rec.instance, rec.run, &reg).await {
+                return false;
             }
             // Clear `registered` (best effort: a lost race leaves it for the sweep, and an
             // unregistration is idempotent).
@@ -1365,11 +1412,12 @@ impl Inner {
                 let _ = self.put(&now, &rv).await;
             }
         }
-        let Some(pod) = pod else { return };
+        let Some(pod) = pod else { return true };
         let grace = self.cfg.stop_timeout.as_secs();
         if let Err(e) = self.api.delete(Kind::Pod, pod, Some(grace)).await {
             tracing::warn!(target: "ruum::runtime", code = e.code(), "deleting a sandbox pod failed; the sweep tries again");
         }
+        true
     }
 
     /// Keeps the gateway's address of an instance only when it belongs to `run` (`None`: forgets
@@ -1387,27 +1435,33 @@ impl Inner {
         let Some(pod_uid) = pod.pointer("/metadata/uid").and_then(Value::as_str) else {
             return false;
         };
+        let record_uid = cm
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let now = SealedRun {
+            run: rec.run,
+            pod_uid: pod_uid.to_owned(),
+            record_uid: record_uid.to_owned(),
+            digest: pod::fixed_digest(rec),
+        };
         if self
             .sealed_runs
             .lock()
             .expect("sealed runs lock")
             .get(&rec.instance)
-            .is_some_and(|(run, uid)| *run == rec.run && uid == pod_uid)
+            == Some(&now)
         {
             return true;
         }
-        let record_uid = cm
-            .pointer("/metadata/uid")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
         let sealed = self
             .unsealed(rec, record_uid)
             .is_some_and(|s| s.run == rec.run && s.pod_uid.as_deref() == Some(pod_uid));
+        let mut runs = self.sealed_runs.lock().expect("sealed runs lock");
         if sealed {
-            self.sealed_runs
-                .lock()
-                .expect("sealed runs lock")
-                .insert(rec.instance, (rec.run, pod_uid.to_owned()));
+            runs.insert(rec.instance, now);
+        } else {
+            runs.remove(&rec.instance);
         }
         sealed
     }
@@ -1439,25 +1493,30 @@ impl Inner {
                 self.keep_addr(id, None);
             }
             let now = pod::now_ms();
+            // The age of the run by its record. A record start time in the future (beyond a
+            // minute of clock skew) was set by a writer of ConfigMaps: the run counts as old.
+            let rec_age = if rec.run_started_ms > now.saturating_add(ms(START_GRACE)) {
+                i64::MAX
+            } else {
+                now.saturating_sub(rec.run_started_ms)
+            };
             // A pod that is not ended, past the start grace, whose run the seal does not name
             // with this pod's uid: a crash between its create and its seal, or a pod made again
             // by hand (backlog I620-8). No launch ever comes for it. And a run that stays
             // starting past the start deadline (backlog I6-21). Both end as killed, the pod goes.
+            // A pod being deleted counts too: a writer of pods can delete a copy with a long
+            // grace time (independent Kimi review of I620-R, finding 2); the driver's own delete
+            // shortens it to `stop_timeout`.
             if let Some(p) = &pod
                 && matches!(
                     view,
-                    Some(PodView::Pending { broken: false }) | Some(PodView::Running { .. })
+                    Some(PodView::Pending { broken: false })
+                        | Some(PodView::Running { .. })
+                        | Some(PodView::Terminating)
                 )
             {
-                // The age of the run: the older of the record's start time and the pod's
-                // `creationTimestamp`, which the API server sets and no writer of ConfigMaps or
-                // pods can choose (Kimi re-checks of I620-R). A record start time in the future
-                // (beyond a minute of clock skew) was set by such a writer: the run counts as old.
-                let rec_age = if rec.run_started_ms > now.saturating_add(ms(START_GRACE)) {
-                    i64::MAX
-                } else {
-                    now.saturating_sub(rec.run_started_ms)
-                };
+                // The age of the pod: its `creationTimestamp`, which the API server sets and no
+                // writer of ConfigMaps or pods can choose (Kimi re-checks of I620-R).
                 let pod_age = p
                     .pointer("/metadata/creationTimestamp")
                     .and_then(Value::as_str)
@@ -1469,16 +1528,22 @@ impl Inner {
                         now.saturating_sub((t.unix_timestamp_nanos() / 1_000_000) as i64)
                     });
                 // The seal check takes the larger age (a pod the seal does not name gets no
-                // launch, so ending it early harms nothing); the start deadline, which ends
+                // launch, so ending it early harms nothing). The start deadline, which ends
                 // sealed runs too, takes the record's own age, so a lagging API server clock
-                // cannot end a legitimate start early (Kimi re-check 3 of I620-R).
+                // cannot end a legitimate start early (Kimi re-check 3 of I620-R); and the pod's
+                // age against twice the deadline, so a writer of ConfigMaps who keeps the
+                // record's start time fresh holds a starting run at most that long (independent
+                // Kimi review of I620-R, finding 3). A pod is made after its run's start, so an
+                // honest pod reaches that bound first only with an API server clock behind by
+                // more than the deadline.
                 let age = rec_age.max(pod_age);
                 let why = if age > ms(START_GRACE) && !self.run_sealed(&cm, &rec, p) {
                     Some(
                         "a sandbox pod that its run's seal does not name (a crash between its create and its seal, or a pod made again) is ended (backlog I620-8)",
                     )
                 } else if rec.state == InstanceState::Starting
-                    && rec_age > ms(self.cfg.start_deadline)
+                    && (rec_age > ms(self.cfg.start_deadline)
+                        || pod_age > ms(self.cfg.start_deadline).saturating_mul(2))
                 {
                     Some(
                         "a run that stayed starting past the start deadline is ended (backlog I6-21)",
@@ -1491,12 +1556,12 @@ impl Inner {
                     let killed = InstanceState::Exited(ExitStatus::of(ExitReason::Killed));
                     // With an egress registration the pod stays until the unregistration is
                     // done (its address must not be reused while the proxy names this app for
-                    // it): the sweep unregisters, then deletes it.
-                    let registered = rec.registered.is_some();
+                    // it): `end_run` returns a record without `registered` once it is done;
+                    // otherwise the sweep unregisters, then deletes the pod.
                     match self.end_run(rec, &rv, killed).await? {
                         Some(rec) => {
                             let grace = self.cfg.stop_timeout.as_secs();
-                            if !registered
+                            if rec.registered.is_none()
                                 && let Err(e) =
                                     self.api.delete(Kind::Pod, &pod_n, Some(grace)).await
                             {
@@ -1514,9 +1579,10 @@ impl Inner {
             let changed = match view {
                 // A run that is still being made (the record is written before its pod, by this
                 // or another process).
-                None if rec.state == InstanceState::Starting
-                    && now - rec.run_started_ms < ms(START_GRACE) =>
-                {
+                // A start time far in the future counts as old (`rec_age`), so a writer of
+                // ConfigMaps cannot keep a run without a pod here (independent Kimi review of
+                // I620-R, finding 3).
+                None if rec.state == InstanceState::Starting && rec_age < ms(START_GRACE) => {
                     return Ok(self.status_of(&rec, Health::Unknown));
                 }
                 None => {
@@ -1572,7 +1638,7 @@ impl Inner {
                             // meanwhile always unregisters it (an unregistration is idempotent).
                             if rec.registered.as_deref() != Some(pod_n.as_str()) {
                                 if let Some(old) = rec.registered.clone()
-                                    && !self.unregister(&old).await
+                                    && !self.unregister_recorded(id, rec.run, &old).await
                                 {
                                     return Ok(self.status_of(&rec, Health::Unknown));
                                 }
@@ -2941,6 +3007,12 @@ impl Inner {
         let Some(pod) = rec.registered.clone() else {
             return;
         };
+        // Only this run's own pod is registered again: a record can name another key (a writer
+        // of ConfigMaps), and its identity must never be registered for another pod's address
+        // (independent Kimi review of I620-R, finding 4).
+        if pod != pod_name(rec.instance, rec.run) {
+            return;
+        }
         let due = self
             .last_register
             .lock()
@@ -3396,7 +3468,7 @@ impl RuntimeDriver for KubeDriver {
             // The previous run's registration goes first: a new run would forget it, and its
             // pod would be deleted while the proxy still names this app for its address.
             if let Some(reg) = rec.registered.clone() {
-                if !inner.unregister(&reg).await {
+                if !inner.unregister_recorded(rec.instance, rec.run, &reg).await {
                     return Err(RuntimeError::Unavailable {
                         reason: "the previous run's egress registration is not removed yet"
                             .to_owned(),
@@ -3754,6 +3826,29 @@ fn static_status(id: InstanceId, s: &StaticInst) -> InstanceStatus {
 mod tests {
     use super::*;
     use ruum_core::runtime::redact::MAX_SECRET_VALUES;
+
+    /// Independent Kimi review of I620-R, finding 4: only the pod names of an instance's own runs
+    /// are its registration keys.
+    #[test]
+    fn only_the_pods_of_its_runs_are_an_instances_registrations() {
+        let id = InstanceId::new();
+        assert!(own_registration(id, &pod_name(id, 1)));
+        assert!(own_registration(id, &pod_name(id, u32::MAX)));
+        let other = InstanceId::new();
+        for reg in [
+            pod_name(other, 1),
+            object_name(id),
+            format!("{}-", object_name(id)),
+            format!("{}-01", object_name(id)),
+            format!("{}-+1", object_name(id)),
+            format!("{}-1-1", object_name(id)),
+            format!("{}-4294967296", object_name(id)),
+            format!("x{}", pod_name(id, 1)),
+            String::new(),
+        ] {
+            assert!(!own_registration(id, &reg), "{reg}");
+        }
+    }
 
     /// Kimi re-check of I620-R: a record at the cap of the seal writes still takes every plain
     /// write that follows (ended, a registration's pod name, touched) within the ConfigMap's

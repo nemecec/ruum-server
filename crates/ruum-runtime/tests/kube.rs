@@ -34,6 +34,8 @@ const NS: &str = "ruum-apps";
 #[derive(Default)]
 struct Recording {
     events: Mutex<Vec<String>>,
+    /// The tenant of every registration, by network (key).
+    tenants: Mutex<Vec<(String, TenantId)>>,
     refuse: AtomicBool,
     hold: AtomicBool,
     held: tokio::sync::Notify,
@@ -64,6 +66,10 @@ impl EgressRegistry for Recording {
             .lock()
             .unwrap()
             .push(format!("register {} {}", n.network, n.subnet));
+        self.tenants
+            .lock()
+            .unwrap()
+            .push((n.network.clone(), n.identity.tenant));
         Ok(())
     }
     async fn unregister(&self, network: &str) -> Result<(), RuntimeError> {
@@ -2753,10 +2759,6 @@ fn the_launch_channel_is_tls_with_the_pin_or_refused() {
     });
 }
 
-/// The driver's settings on staging (`charts/ruum` `templates/server.yaml` and
-/// `crates/ruum-server` `wiring.rs`): the namespace, the runtime class and its overhead, the
-/// egress proxy, the supervisor listener with TLS. The image digest is a placeholder (a dry run pulls
-/// nothing).
 /// Backlog I620-16: a writer of ConfigMaps changes a new record between its create and its first
 /// seal (here its limits, or the record made again under another uid). The first seal binds the
 /// record as the server made it, so the start fails, the pod goes and nothing is sealed; the
@@ -2920,9 +2922,11 @@ async fn a_run_that_stays_starting_ends_at_the_start_deadline() {
             r["run_started_ms"] = serde_json::json!(now - secs * 1000);
         }
     };
-    // A pod whose creationTimestamp reads old (an API server clock behind the server's) does not
-    // move the deadline: it counts from the record's start (Kimi re-check 3 of I620-R).
-    w.fake.backdate_pod(NS, &pod_n, 3600);
+    // A pod whose creationTimestamp reads old (an API server clock behind the server's by more
+    // than the deadline) does not move the deadline: it counts from the record's start (Kimi
+    // re-check 3 of I620-R). The pod's age ends the run only past twice the deadline (independent
+    // Kimi review, finding 3; `a_fresh_record_start_does_not_keep_a_run_starting`).
+    w.fake.backdate_pod(NS, &pod_n, 1100);
     w.change_record(s.id, back(300)).await;
     assert_eq!(
         d.status(id.tenant, s.id).await.unwrap().state,
@@ -2939,6 +2943,242 @@ async fn a_run_that_stays_starting_ends_at_the_start_deadline() {
             .pod(NS, &pod_n)
             .is_none_or(|p| p["metadata"]["deletionTimestamp"].is_string()),
         "the pod stayed"
+    );
+}
+
+/// Independent Kimi review of I620-R, finding 1: a seal check remembered for a run holds only for
+/// the record it was made on. A writer of ConfigMaps who changes the fixed fields after the check
+/// (here the limits), or deletes the record and makes it again with the same data (another uid),
+/// gets the run ended as killed at the next observation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_remembered_seal_check_binds_the_record() {
+    let w = world(false).await;
+    let d = w.quiet_driver();
+    let age = |r: &mut serde_json::Value| {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() * 1000;
+        r["run_started_ms"] = serde_json::json!(now - 120_000);
+    };
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let id = identity();
+        let s = d.start(w.service(id, None)).await.unwrap();
+        let pod = ruum_runtime::kube::pod_name(s.id, 1);
+        assert_eq!(wait_launched(&w, &pod).await, 200);
+        wait_pod_ip(&w, &pod).await;
+        w.change_record(s.id, age).await;
+        let st = d.status(id.tenant, s.id).await.unwrap().state;
+        assert!(
+            matches!(st, InstanceState::Running | InstanceState::Starting),
+            "before the change: {}",
+            st.name()
+        );
+        runs.push((id, s.id, pod));
+    }
+    assert_eq!(d.remembered_seal_checks(), 2);
+    // Forged limits on the first record.
+    w.change_record(runs[0].1, |r| {
+        r["limits"]["memory_bytes"] = serde_json::json!(8u64 << 30);
+    })
+    .await;
+    // The second record deleted and made again with the same data.
+    let mut cm = w.record(runs[1].1);
+    let base = format!("{}/api/v1/namespaces/{NS}/configmaps", w.cfg.api_url);
+    let http = reqwest::Client::new();
+    let r = http
+        .delete(format!(
+            "{base}/{}",
+            ruum_runtime::kube::object_name(runs[1].1)
+        ))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{}", r.status());
+    for k in ["uid", "resourceVersion", "creationTimestamp"] {
+        if let Some(m) = cm["metadata"].as_object_mut() {
+            m.remove(k);
+        }
+    }
+    let r = http
+        .post(&base)
+        .bearer_auth(TOKEN)
+        .json(&cm)
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{}", r.status());
+    for (id, inst, pod) in &runs {
+        match d.status(id.tenant, *inst).await.unwrap().state {
+            InstanceState::Exited(e) => assert_eq!(e.reason, ExitReason::Killed, "{pod}"),
+            other => panic!("{pod}: the state is {}", other.name()),
+        }
+        assert!(
+            w.fake
+                .pod(NS, pod)
+                .is_none_or(|p| p["metadata"]["deletionTimestamp"].is_string()),
+            "{pod} stayed"
+        );
+    }
+}
+
+/// Independent Kimi review of I620-R, finding 2: a pod made again and then deleted with a long
+/// grace time (so it reads as being deleted) is still checked against its run's seal: the run
+/// ends as killed and the driver deletes the pod. An honest pod being deleted keeps its run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pod_being_deleted_is_checked_against_the_seal() {
+    let w = world(false).await;
+    let d = w.quiet_driver();
+    let terminating = |p: &mut serde_json::Value| {
+        p["metadata"]["deletionTimestamp"] = serde_json::json!("2026-11-27T12:00:00Z");
+        p["metadata"]["deletionGracePeriodSeconds"] = serde_json::json!(86_400);
+    };
+    // The honest control: a sealed run whose pod is being deleted.
+    let honest_id = identity();
+    let honest = d.start(w.service(honest_id, None)).await.unwrap();
+    let honest_pod = ruum_runtime::kube::pod_name(honest.id, 1);
+    assert_eq!(wait_launched(&w, &honest_pod).await, 200);
+    wait_pod_ip(&w, &honest_pod).await;
+    w.fake.backdate_pod(NS, &honest_pod, 120);
+    w.fake.edit_pod(NS, &honest_pod, terminating);
+    // A copy of a run's pod, made again by a holder of the runtime token, then deleted with a
+    // day of grace.
+    let id = identity();
+    let s = d.start(w.service(id, None)).await.unwrap();
+    let pod = ruum_runtime::kube::pod_name(s.id, 1);
+    assert_eq!(wait_launched(&w, &pod).await, 200);
+    let copy = w.fake.pod(NS, &pod).unwrap();
+    w.fake.remove_pod(NS, &pod);
+    w.fake.skip_launch_once.store(true, Ordering::SeqCst);
+    assert_eq!(w.create_pod(&copy).await, 201);
+    wait_pod_ip(&w, &pod).await;
+    w.fake.backdate_pod(NS, &pod, 120);
+    w.fake.edit_pod(NS, &pod, terminating);
+    match d.status(id.tenant, s.id).await.unwrap().state {
+        InstanceState::Exited(e) => assert_eq!(e.reason, ExitReason::Killed),
+        other => panic!("the state is {}", other.name()),
+    }
+    assert!(w.fake.pod(NS, &pod).is_none(), "the copy stayed");
+    let st = d.status(honest_id.tenant, honest.id).await.unwrap().state;
+    assert!(
+        matches!(st, InstanceState::Running | InstanceState::Starting),
+        "the honest run: {}",
+        st.name()
+    );
+    assert!(w.fake.pod(NS, &honest_pod).is_some());
+}
+
+/// Independent Kimi review of I620-R, finding 3: a writer of ConfigMaps who keeps the record's
+/// start time just ahead of the clock holds a starting run at most twice the start deadline (by
+/// the pod's creationTimestamp); and a start time far in the future does not keep a run without
+/// a pod starting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_record_start_does_not_keep_a_run_starting() {
+    let w = world(false).await;
+    let d = w.quiet_driver();
+    let ahead = |secs: i64| {
+        move |r: &mut serde_json::Value| {
+            let now = time::OffsetDateTime::now_utc().unix_timestamp() * 1000;
+            r["run_started_ms"] = serde_json::json!(now + secs * 1000);
+        }
+    };
+    // A sealed run whose image does not pull, made 21 minutes ago (twice the deadline is 20).
+    let id = identity();
+    let s = d.start(w.service(id, None)).await.unwrap();
+    let pod = ruum_runtime::kube::pod_name(s.id, 1);
+    assert_eq!(wait_launched(&w, &pod).await, 200);
+    wait_pod_ip(&w, &pod).await;
+    w.fake.edit_pod_status(NS, &pod, |st| {
+        *st = serde_json::json!({
+            "phase": "Pending",
+            "containerStatuses": [{ "name": "app", "ready": false,
+                "state": { "waiting": { "reason": "ImagePullBackOff" } } }],
+        });
+    });
+    w.fake.backdate_pod(NS, &pod, 1260);
+    w.change_record(s.id, ahead(30)).await;
+    match d.status(id.tenant, s.id).await.unwrap().state {
+        InstanceState::Exited(e) => assert_eq!(e.reason, ExitReason::Killed),
+        other => panic!("the state is {}", other.name()),
+    }
+    assert!(
+        w.fake
+            .pod(NS, &pod)
+            .is_none_or(|p| p["metadata"]["deletionTimestamp"].is_string()),
+        "the pod stayed"
+    );
+    // A run whose pod is gone, with a start time a day ahead.
+    let id = identity();
+    let s = d.start(w.service(id, None)).await.unwrap();
+    let pod = ruum_runtime::kube::pod_name(s.id, 1);
+    assert_eq!(wait_launched(&w, &pod).await, 200);
+    w.fake.remove_pod(NS, &pod);
+    w.change_record(s.id, ahead(86_400)).await;
+    match d.status(id.tenant, s.id).await.unwrap().state {
+        InstanceState::Exited(e) => assert_eq!(e.reason, ExitReason::Killed),
+        other => panic!("the state is {}", other.name()),
+    }
+}
+
+/// Independent Kimi review of I620-R, finding 4: a record that names another tenant's pod as its
+/// egress registration never gets that registration removed or registered under its identity,
+/// not by the observation, the sweep's registration again, or the end of its run. Its own pod's
+/// registration goes instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_cannot_unregister_another_tenants_pod() {
+    let w = world(false).await;
+    let d = w.quiet_driver();
+    let victim_id = identity();
+    let victim = d.start(w.service(victim_id, None)).await.unwrap();
+    wait_state(d.as_ref(), victim_id.tenant, victim.id, |x| {
+        *x == InstanceState::Running
+    })
+    .await;
+    let victim_pod = ruum_runtime::kube::pod_name(victim.id, 1);
+    assert_eq!(wait_launched(&w, &victim_pod).await, 200);
+    let id = identity();
+    let s = d.start(w.service(id, None)).await.unwrap();
+    wait_state(d.as_ref(), id.tenant, s.id, |x| {
+        *x == InstanceState::Running
+    })
+    .await;
+    let pod = ruum_runtime::kube::pod_name(s.id, 1);
+    assert_eq!(wait_launched(&w, &pod).await, 200);
+    let name_victim = |r: &mut serde_json::Value| {
+        r["registered"] = serde_json::json!(ruum_runtime::kube::pod_name(victim.id, 1));
+    };
+    // The observation and the sweep (past `reregister_every`).
+    w.change_record(s.id, name_victim).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    d.sweep().await;
+    d.status(id.tenant, s.id).await.unwrap();
+    // The end of the run (its pod gone).
+    w.change_record(s.id, name_victim).await;
+    w.fake.remove_pod(NS, &pod);
+    match d.status(id.tenant, s.id).await.unwrap().state {
+        InstanceState::Exited(e) => assert_eq!(e.reason, ExitReason::Killed),
+        other => panic!("the state is {}", other.name()),
+    }
+    assert!(
+        !w.egress
+            .of(&victim_pod)
+            .iter()
+            .any(|e| e.starts_with("unregister ")),
+        "the victim's registration was removed: {:?}",
+        w.egress.of(&victim_pod)
+    );
+    assert!(
+        w.egress
+            .tenants
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(n, t)| n != &victim_pod || *t == victim_id.tenant),
+        "the victim's pod was registered under another tenant"
+    );
+    assert_unregistered(&w, &pod);
+    assert_eq!(
+        d.status(victim_id.tenant, victim.id).await.unwrap().state,
+        InstanceState::Running
     );
 }
 
@@ -3022,6 +3262,10 @@ async fn a_rotation_past_the_config_map_is_refused_and_the_run_still_stops() {
     );
 }
 
+/// The driver's settings on staging (`charts/ruum` `templates/server.yaml` and
+/// `crates/ruum-server` `wiring.rs`): the namespace, the runtime class and its overhead, the
+/// egress proxy, the supervisor listener with TLS. The image digest is a placeholder (a dry run pulls
+/// nothing).
 fn staging_config() -> KubeConfig {
     let mut c = KubeConfig::new("https://kubernetes.default.svc", "ruum-apps", "gvisor");
     c.runtime_class_overhead = kube_fake::staging_runtime_class_overhead();

@@ -248,7 +248,10 @@ The record and its seal share one ConfigMap, whose data the API server holds to 
 I620-14). `start` seals the largest seal the run can reach (a pod uid, 16 launched pods, 15
 earlier tokens of the current token's length plus 256 bytes) before it makes anything and refuses
 a spec that does not fit with `invalid_spec` (escaping can make a value six times longer:
-control characters); every later write of the record checks its size too.
+control characters). After the start only the writes that grow the seal check the size, against
+1 MiB less 5 KiB: the first seal, a rotation, the new pod uid of a wake, and a launch. The plain
+writes (the state, `ended_ms`, a registration's pod name, a touch) are not checked: they fit in the
+4 KiB kept free, so a record at the cap can always be ended.
 
 ### States
 
@@ -259,9 +262,14 @@ a terminated container is `exited` (`OOMKilled` is out of memory, the pod reason
 (`CreateContainerConfigError`, an invalid image name) is `exited` as killed. Two more end a run
 as killed and delete its pod: a pod past the start grace (60 s) that the run's seal does not name
 by its uid (a crash between the pod's create and its seal, or a pod made again under the run's
-name; no launch ever comes for it; backlog I620-8), and a run that stays `starting` with its pod
-past `start_deadline` (10 minutes: an image that does not pull, a pod that is never scheduled, an
-egress registration that keeps failing; backlog I6-21). A service past its
+name, also while it is being deleted; no launch ever comes for it; backlog I620-8), and a run that
+stays `starting` with its pod past `start_deadline` (10 minutes: an image that does not pull, a pod
+that is never scheduled, an egress registration that keeps failing; backlog I6-21). The deadline
+counts from the record's start time, and also from the pod's `creationTimestamp` against twice the
+deadline, so a writer of ConfigMaps who keeps the start time fresh cannot keep a run starting for
+ever. A remembered seal check holds only for the record (uid and fixed fields) it was made on. A
+registration key in a record is unregistered only when it is the pod name of one of the
+instance's own runs; another key is left alone and the run's own pod key goes instead. A service past its
 idle timeout (the newest touch of the record and of this process; `touch` writes the record at
 most every quarter of the idle timeout) scales to zero: the pod goes, the record (with its seal)
 stays, and `wake` makes the next run from the record and seals its new pod's `uid`. Health: healthy when the container is ready;
