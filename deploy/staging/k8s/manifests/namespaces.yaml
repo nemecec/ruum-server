@@ -105,3 +105,24 @@ metadata:
     pod-security.kubernetes.io/enforce: restricted
     pod-security.kubernetes.io/enforce-version: latest
     pod-security.kubernetes.io/warn: restricted
+---
+# The build pods of the Kubernetes builder (card I6-13): gVisor, restricted, admission rules of
+# their own (manifests/builds-admission.yaml).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ruum-builds
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+---
+# The cluster registry of app images (card I6-13; charts/platform registry.yaml).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ruum-registry
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted

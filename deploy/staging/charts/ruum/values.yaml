@@ -121,8 +121,15 @@ runtime:
   # the README's check passed. Staging does not use it (tls).
   nodeNetworkEncrypted: false
   # The registry the nodes pull app images from (host:port, RUUM_REGISTRY). Empty: none yet, so
-  # every app image is image_not_found (fails closed). Staging has no registry and no builder yet.
+  # every app image is image_not_found (fails closed). With the cluster registry of charts/platform
+  # (card I6-13): registry.ruum.internal:5000, the name of the Talos containerd mirror.
   registry: ""
+  # node22 deployments (card I6-13): the Kubernetes builder in ruum-server (RUUM_BUILDER), its
+  # build channel on port 8092 and the push credential (Secret ruum-registry-push). Needs
+  # kubernetes and registry; off on staging until the README's "node22 apps" steps.
+  builder: false
+  # The cluster registry as ruum-server pushes to it (charts/platform registry.yaml).
+  registryPushUrl: http://ruum-registry.ruum-registry.svc.cluster.local:5000
   # RUUM_KUBE_SPLIT_LOG_STREAMS: read stdout and stderr apart (the API server's feature gate
   # PodLogsQuerySplitStreams). Off: one stream, reported as stdout.
   splitLogStreams: false

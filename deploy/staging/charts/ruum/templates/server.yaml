@@ -23,6 +23,17 @@
 {{- $askPerReplica := max 1 (div (int .Values.server.tlsAskNewHostsPerHour) (int .Values.server.replicas)) }}
 {{- /* The Kubernetes runtime driver (backlog I6-1): with the app runtime only. */}}
 {{- $kube := and (include "ruum.apps" .) .Values.runtime.kubernetes }}
+{{- /* The node22 builder (card I6-13): only with the driver and a registry. */}}
+{{- $builder := and $kube .Values.runtime.builder }}
+{{- if and .Values.runtime.builder (not $kube) }}
+{{- fail "runtime.builder needs runtime.kubernetes and the app runtime (the images it builds run there)" }}
+{{- end }}
+{{- if and $builder (not .Values.runtime.registry) }}
+{{- fail "runtime.builder needs runtime.registry (the name the nodes pull from: registry.ruum.internal:5000)" }}
+{{- end }}
+{{- if and $builder (not (regexMatch "^https?://[a-z0-9.-]+(:[0-9]{1,5})?$" .Values.runtime.registryPushUrl)) }}
+{{- fail "runtime.registryPushUrl must be http(s)://host[:port] without a path" }}
+{{- end }}
 {{- if and .Values.runtime.registry (not (regexMatch "^[a-z0-9.-]+(:[0-9]{1,5})?$" .Values.runtime.registry)) }}
 {{- fail "runtime.registry must be host or host:port" }}
 {{- end }}
@@ -178,6 +189,18 @@ spec:
             # TLS with the certificate derived from the record key, pinned by each supervisor
             # (backlog I620-2), or plain HTTP over encrypted node traffic.
             - { name: RUUM_KUBE_SUPERVISOR_NETWORK, value: {{ .Values.runtime.supervisorNetwork | quote }} }
+            {{- if $builder }}
+            # The node22 builder (card I6-13): build pods in ruum-builds, the build channel on
+            # its own port (TLS with the supervisor listener's pinned key), the push credential
+            # as a file (Secret ruum-registry-push, k8s/apply.sh).
+            - { name: RUUM_BUILDER, value: kubernetes }
+            - { name: RUUM_BUILD_REGISTRY_URL, value: {{ .Values.runtime.registryPushUrl | quote }} }
+            - { name: RUUM_BUILD_PUSH_USER, value: ruum-push }
+            - { name: RUUM_BUILD_PUSH_PASSWORD_FILE, value: /var/run/secrets/ruum-registry/push-password }
+            - { name: RUUM_BUILD_CHANNEL_SERVICE, value: "ruum-build-channel.ruum.svc.cluster.local:8092" }
+            - { name: RUUM_BUILD_CHANNEL_LISTEN, value: "0.0.0.0:8092" }
+            - { name: RUUM_BUILD_NAMESPACE, value: ruum-builds }
+            {{- end }}
             {{- end }}
           ports:
             - { name: platform, containerPort: 8491 }
@@ -185,6 +208,9 @@ spec:
             - { name: internal, containerPort: 8493 }
             {{- if $kube }}
             - { name: supervisor, containerPort: 8091 }
+            {{- end }}
+            {{- if $builder }}
+            - { name: build-channel, containerPort: 8092 }
             {{- end }}
           readinessProbe:
             httpGet: { path: /healthz, port: platform }
@@ -215,6 +241,9 @@ spec:
             - { name: kube-api, mountPath: /var/run/secrets/ruum-kube, readOnly: true }
             - { name: record-key, mountPath: /var/run/secrets/ruum-runtime, readOnly: true }
             {{- end }}
+            {{- if $builder }}
+            - { name: registry-push, mountPath: /var/run/secrets/ruum-registry, readOnly: true }
+            {{- end }}
       volumes:
         - name: pg-ca
           secret: { secretName: pg-ca, items: [{ key: ca.crt, path: ca.crt }] }
@@ -233,6 +262,11 @@ spec:
         # The record key (backlog S-89): only the server pods hold it; ruum-apps has no right in ruum.
         - name: record-key
           secret: { secretName: ruum-runtime-record-key, items: [{ key: record-key, path: record-key }], defaultMode: 0440 }
+        {{- end }}
+        {{- if $builder }}
+        # The builder's push password (card I6-13): only the server pods hold it; no build sees it.
+        - name: registry-push
+          secret: { secretName: ruum-registry-push, items: [{ key: push-password, path: push-password }], defaultMode: 0440 }
         {{- end }}
 ---
 # Voluntary disruptions (a node drain, a Kubernetes upgrade) leave at least one server.
@@ -269,6 +303,20 @@ spec:
   selector: { app: ruum-server }
   ports:
     - { name: supervisor, port: 8091, targetPort: supervisor }
+---
+{{- end }}
+{{- if $builder }}
+# The build channel (card I6-13): the build pods of ruum-builds fetch their source and send their
+# output here (charts/platform builder-rbac.yaml lets only them reach it). No public route.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ruum-build-channel
+  namespace: ruum
+spec:
+  selector: { app: ruum-server }
+  ports:
+    - { name: build-channel, port: 8092, targetPort: build-channel }
 ---
 {{- end }}
 # The internal listener: the edge's on-demand TLS `ask` (review 1 B-6). No public route.

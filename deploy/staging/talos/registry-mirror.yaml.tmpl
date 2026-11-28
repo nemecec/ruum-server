@@ -1,0 +1,24 @@
+# The containerd mirror of the cluster registry (card I6-13), for the Talos machine config of
+# every node. NOT applied yet: README "node22 apps on staging" step 3 wires it into
+# tofu/cluster/talos.tf (config_patches) with the pull password as a sensitive variable, in a
+# card of its own (the plan check, the secret lists and tests/talos-validate.sh change with it).
+#
+# containerd on the nodes has no cluster DNS: the image name registry.ruum.internal:5000 (the
+# chart's runtime.registry, the builder's node registry) goes to the registry Service's fixed
+# address (charts/platform values registry.clusterIP). The user ruum-pull may only read
+# (charts/platform registry.yaml); its password is STG_REGISTRY_PULL_PASSWORD. Plain HTTP on the
+# node network: the password and the images cross it unencrypted (backlog I613-5).
+#
+# __PULL_PASSWORD__ is replaced by the password when the config is made; never commit the value.
+apiVersion: v1alpha1
+kind: RegistryMirrorConfig
+name: registry.ruum.internal:5000
+endpoints:
+  - url: http://10.96.0.50:5000
+skipFallback: true
+---
+apiVersion: v1alpha1
+kind: RegistryAuthConfig
+name: 10.96.0.50:5000
+username: ruum-pull
+password: __PULL_PASSWORD__

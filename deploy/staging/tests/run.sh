@@ -965,6 +965,25 @@ if has helm; then
   awk 'BEGIN{RS="---"} /kind: RoleBinding\n/' "$TMP/runtime-rbac.yaml" | grep -qE '^    name: ruum-server$' &&
     ok "the Role is bound to ruum/ruum-server only" || bad "the runtime driver's RoleBinding has another subject"
   grep -qxF 'automountServiceAccountToken: false' "$TMP/runtime-rbac.yaml" && ok "the ServiceAccount mounts no token by default" || bad "the ServiceAccount ruum-server mounts a token in every pod"
+  # The Kubernetes builder (card I6-13, builder-rbac.yaml): pods and their logs in ruum-builds only.
+  awk '/^# Source: [a-z-]*\/templates\/builder-rbac.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/platform.yaml" >"$TMP/builder-rbac.yaml"
+  [[ "$(grep -E '^  - \{ apiGroups' "$TMP/builder-rbac.yaml")" == '  - { apiGroups: [""], resources: [pods], verbs: [create, get, list, delete] }
+  - { apiGroups: [""], resources: [pods/log], verbs: [get] }' ]] &&
+    ok "the builder may make, read and delete build pods and read their logs, nothing else" || bad "the builder's rules differ: $(grep -E 'apiGroups' "$TMP/builder-rbac.yaml" | tr '\n' ' ')"
+  ! grep -qE 'kind: ClusterRole' "$TMP/builder-rbac.yaml" && ok "the builder has no cluster-wide right" || bad "builder-rbac.yaml has a cluster-wide right"
+  awk 'BEGIN{RS="---"} /name: ruum-build\n/' "$TMP/builder-rbac.yaml" | grep -qxF 'automountServiceAccountToken: false' &&
+    ok "the build pods' account mounts no token" || bad "the account ruum-build mounts a token"
+  awk 'BEGIN{RS="---"} /name: builds-only-to-egress-and-channel\n/' "$TMP/builder-rbac.yaml" | grep -cE 'port: (3128|8092) \}' | grep -qx 2 &&
+    ok "build pods reach only the egress proxy and the build channel" || bad "the build pods' egress policy differs"
+  ! grep -q 'kind: Deployment' <(awk '/^# Source: [a-z-]*\/templates\/registry.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/platform.yaml") &&
+    ok "the cluster registry is off by default (card I6-13)" || bad "the cluster registry renders by default"
+  expect 0 "render charts/platform with the cluster registry (I6-13)" helm template platform "$STG/charts/platform" --set generation=202611111200 --set "deployController.image=$PCI" --set-string "deployController.commit=$PCC" --set registry.enabled=true
+  awk '/^# Source: [a-z-]*\/templates\/registry.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/out" >"$TMP/registry.yaml"
+  grep -qF 'clusterIP: 10.96.0.50' "$TMP/registry.yaml" && grep -qF '"anonymousPolicy": []' "$TMP/registry.yaml" &&
+    grep -qF '{ "users": ["ruum-pull"], "actions": ["read"] }' "$TMP/registry.yaml" && grep -qF '{ "users": ["ruum-push"], "actions": ["read", "create"] }' "$TMP/registry.yaml" &&
+    ok "the registry: a fixed address, no anonymous access, pull reads, push reads and creates" || bad "the registry's address or access rules differ"
+  grep -qE 'image: [a-z0-9./:-]+@sha256:[0-9a-f]{64}$' "$TMP/registry.yaml" && grep -qF 'readOnlyRootFilesystem: true' "$TMP/registry.yaml" &&
+    ok "the registry runs its image by digest with a read-only root" || bad "the registry image is not by digest or its root is writable"
   awk '/^  name: pg-clients$/ {on=1} on && /^---/ {exit} on' "$TMP/platform.yaml" | grep -qF "matchLabels: { app: ruum-migrate }" &&
     ok "the network policy lets the migration Job reach Postgres" || bad "the migration Job cannot reach Postgres (pg-clients)"
   # Backlog O-34: the deploy controller runs the migration Job, the deployer does not.
@@ -1188,6 +1207,20 @@ YAML
   expect 0 "render charts/ruum with a registry" helm template ruum "$STG/charts/ruum" "${A[@]}" "${KD[@]}" --set runtime.registry=registry.ruum-apps.svc:5000
   grep -qF '{ name: RUUM_REGISTRY, value: "registry.ruum-apps.svc:5000" }' "$TMP/out" && ok "the registry reaches the server" || bad "runtime.registry is not RUUM_REGISTRY"
   expect 1 "charts/ruum refuses a registry that is not host:port" helm template ruum "$STG/charts/ruum" "${A[@]}" "${KD[@]}" --set 'runtime.registry=http://x/y'
+  # The node22 builder (card I6-13): only with the driver and a registry, its own port and
+  # Service, the push password as a file.
+  expect 1 "charts/ruum refuses the builder without the driver (I6-13)" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.builder=true
+  expect 1 "charts/ruum refuses the builder without a registry (I6-13)" helm template ruum "$STG/charts/ruum" "${A[@]}" "${KD[@]}" --set runtime.builder=true
+  expect 1 "charts/ruum refuses a push URL with a path (P-84)" helm template ruum "$STG/charts/ruum" "${A[@]}" "${KD[@]}" --set runtime.builder=true --set runtime.registry=registry.ruum.internal:5000 --set runtime.registryPushUrl=http://r:5000/x
+  expect 0 "render charts/ruum with the builder on (I6-13)" helm template ruum "$STG/charts/ruum" "${A[@]}" "${KD[@]}" --set runtime.builder=true --set runtime.registry=registry.ruum.internal:5000
+  cp "$TMP/out" "$TMP/ruum-builder.yaml"
+  doc_of "$TMP/ruum-builder.yaml" Service ruum-build-channel | grep -qF 'port: 8092' && ok "the build channel has its Service (8092)" || bad "no Service ruum-build-channel"
+  doc_of "$TMP/ruum-builder.yaml" Deployment ruum-server >"$TMP/srv-builder.yaml"
+  grep -qF '{ name: RUUM_BUILDER, value: kubernetes }' "$TMP/srv-builder.yaml" && grep -qF 'secretName: ruum-registry-push' "$TMP/srv-builder.yaml" &&
+    grep -qF '{ name: RUUM_BUILD_CHANNEL_LISTEN, value: "0.0.0.0:8092" }' "$TMP/srv-builder.yaml" &&
+    ok "with the builder the server gets RUUM_BUILDER, the channel and the push password file" || bad "the builder settings do not reach the server"
+  grep -qF 'RUUM_BUILDER' "$TMP/srv-apps.yaml" && bad "the builder renders without runtime.builder" || ok "the builder is off unless runtime.builder is set"
+  expect 0 "the server env with the builder is what the server reads" bash "$HERE/server-env.sh" "$TMP/ruum-builder.yaml"
   expect 0 "render charts/ruum with the driver off" helm template ruum "$STG/charts/ruum" "${A[@]}" --set runtime.kubernetes=false
   grep -qF 'RUUM_RUNTIME_DRIVER' "$TMP/out" && bad "runtime.kubernetes=false still renders the driver" || ok "runtime.kubernetes=false keeps the in-memory driver"
   doc_of "$TMP/out" Deployment ruum-server >"$TMP/srv-off.yaml"
@@ -1840,6 +1873,9 @@ for verb in create get list delete; do echo "$R ruum-apps $verb pods -" >>"$FA/a
 echo "$R ruum-apps get pods log" >>"$FA/allow"
 for verb in create get list update delete; do echo "$R ruum-apps $verb configmaps -" >>"$FA/allow"; done
 echo "$R * create tokenreviews.authentication.k8s.io -" >>"$FA/allow"
+# The Kubernetes builder's Role in ruum-builds (card I6-13, charts/platform builder-rbac.yaml).
+for verb in create get list delete; do echo "$R ruum-builds $verb pods -" >>"$FA/allow"; done
+echo "$R ruum-builds get pods log" >>"$FA/allow"
 O=system:serviceaccount:ruum:observer
 for ns in ruum edge ruum-deploy; do
   for resource in pods events events.events.k8s.io deployments.apps daemonsets.apps replicasets.apps jobs.batch; do
@@ -1896,6 +1932,14 @@ expect 0 "the live check passes when the deployer may only write release request
 cp "$FA/allow" "$FA/allow-runtime-secrets"
 echo "$R ruum-apps get secrets -" >>"$FA/allow-runtime-secrets"
 expect 1 "the live check fails when the runtime driver may read Secrets" livecheck "$FA/allow-runtime-secrets"
+cp "$FA/allow" "$FA/allow-builder-secrets"
+echo "$R ruum-builds get secrets -" >>"$FA/allow-builder-secrets"
+expect 1 "the live check fails when the builder may read Secrets in ruum-builds (card I6-13)" livecheck "$FA/allow-builder-secrets"
+cp "$FA/allow" "$FA/allow-builder-exec"
+echo "$R ruum-builds create pods exec" >>"$FA/allow-builder-exec"
+expect 1 "the live check fails when the builder may exec into a build pod (card I6-13)" livecheck "$FA/allow-builder-exec"
+grep -v "^$R ruum-builds get pods log$" "$FA/allow" >"$FA/allow-builder-nolog"
+expect 1 "the live check fails when the builder cannot read build logs (card I6-13)" livecheck "$FA/allow-builder-nolog"
 # Kimi run 15, I6-1 finding 1: a patch (or delete) right on Secrets is a read right; S-89: no
 # Secret verb at all, create included.
 for verb in patch delete create; do
@@ -2539,7 +2583,11 @@ sh_script="$(sed -n "/^read -r -d '' SUP_SCRIPT <<'SH' || true$/,/^SH$/p" "$gc" 
 bash -n "$STG/ops/gvisor-check.sh" && grep -qF 'the check proves nothing on this node' "$STG/ops/gvisor-check.sh" &&
   ok "gvisor-check.sh needs a control pod that sees the node's kernel (no pass on silence)" || bad "gvisor-check.sh"
 sa="$STG/ops/smoke-apps.sh"
-bash -n "$sa" && grep -qF 'BLOCKED' "$sa" && grep -qF 'runtime_not_ready' "$sa" && ok "smoke-apps.sh reports the node22 check as blocked until node22 apps can be deployed on staging" || bad "smoke-apps.sh"
+bash -n "$sa" && grep -qF 'BLOCKED' "$sa" && grep -qF 'decision 0008-5' "$sa" && ok "smoke-apps.sh reports the node22 check as blocked while the driver, builder and registry are off" || bad "smoke-apps.sh"
+# Card I6-13: a public node22 test app must answer 200 with the expected text (a gateway 502 or a
+# redirect to the sign-in fails); the check reads only public endpoints, so no live run here.
+grep -qF '[[ "$code" != 200 ]]' "$sa" && grep -qF 'STG_SMOKE_NODE22_BODY' "$sa" && grep -qF 'STG_SMOKE_NODE22_PUBLIC' "$sa" &&
+  ok "the node22 smoke check wants 200 and the expected text from a public test app" || bad "the node22 smoke check does not check a public app's answer"
 if [[ $have_docker == 1 ]]; then
   gg="$STG/k8s/sql/ruum-gateway-grants.sql"
   pgc="ruum-stg-gw-grants-$$"
