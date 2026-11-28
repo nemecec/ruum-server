@@ -2870,6 +2870,23 @@ async fn a_pod_that_its_seal_does_not_name_is_ended() {
         st.name()
     );
     assert!(!gone_or_going(&honest_pod));
+    // The remembered check goes with a record deleted while live (Kimi review of I620-R,
+    // finding 1): the sweep keeps only the records its list names.
+    assert!(d.remembered_seal_checks() >= 1);
+    let url = format!(
+        "{}/api/v1/namespaces/{NS}/configmaps/{}",
+        w.cfg.api_url,
+        ruum_runtime::kube::object_name(honest.id)
+    );
+    let r = reqwest::Client::new()
+        .delete(url)
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    d.sweep().await;
+    assert_eq!(d.remembered_seal_checks(), 0);
 }
 
 /// Backlog I6-21: a run whose pod stays pending (an image that does not pull) ends as killed past

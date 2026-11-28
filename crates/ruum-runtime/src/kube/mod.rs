@@ -752,6 +752,16 @@ impl KubeDriver {
         self.inner.live.used(tenant)
     }
 
+    /// How many runs' seal checks this process remembers (backlog I620-8), for the tests.
+    #[doc(hidden)]
+    pub fn remembered_seal_checks(&self) -> usize {
+        self.inner
+            .sealed_runs
+            .lock()
+            .expect("sealed runs lock")
+            .len()
+    }
+
     /// `POST /v1/launch` of the supervisor listener (backlog S-89; `docs/STEP3.md` "The sandbox
     /// supervisor" 4): the launch data, as JSON, for the pod whose projected token is `bearer`,
     /// from the connection's peer address `peer`, once per pod. Every refusal names no value.
@@ -1972,6 +1982,13 @@ impl Inner {
                 self.drop_local(l.id);
             }
         }
+        // The seal checks this process remembers, only for records the list still named (Kimi
+        // review of I620-R, finding 1): a record deleted while live, by a writer of ConfigMaps or
+        // another process, leaves no entry behind. A start since the list is checked again.
+        self.sealed_runs
+            .lock()
+            .expect("sealed runs lock")
+            .retain(|id, _| seen.contains(id));
         // Logs of ended instances after the retention, and within the caps.
         let _ = self.trim_locals(None);
         self.shed_live();
@@ -2653,6 +2670,13 @@ impl Inner {
                 return Err(LaunchRefusal::NotReady);
             };
             rec.sealed = Some(text);
+            // The size check of every record write (backlog I620-14; Kimi review of I620-R,
+            // finding 3): refused before the write, so the claim is released.
+            let bytes = serde_json::to_string(&rec).map_or(usize::MAX, |t| t.len());
+            if bytes > MAX_RECORD_BYTES {
+                tracing::warn!(target: "ruum::runtime", pod = %pod_n, bytes, "a launch would make the instance record larger than its ConfigMap holds; refused");
+                return Err(LaunchRefusal::Forbidden);
+            }
             let body = pod::record_body(&self.cfg, &rec, Some(rv.as_str()));
             match self
                 .api

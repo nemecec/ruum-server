@@ -41,7 +41,7 @@ async fn a_stopped_service_answers_within_three_seconds() {
             idle_timeout: Some(Duration::from_secs(1)),
         }),
         image,
-        command: program::command(&[Step::Serve]),
+        command: program::command(&[Step::Print("cold start".into()), Step::Serve]),
         env: Vec::new(),
         previous_secrets: Vec::new(),
         workload_token: SecretValue::new(format!("wt_{}", uuid::Uuid::now_v7().simple())),
@@ -69,6 +69,17 @@ async fn a_stopped_service_answers_within_three_seconds() {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        // Scaled to zero, its log ring leaves the live budget (backlog I620-11) and keeps its
+        // lines (within the ended byte cap).
+        assert_eq!(
+            driver.live_log_bytes(Some(tenant)),
+            0,
+            "wake {i}: a scaled-to-zero ring stayed in the live budget"
+        );
+        assert!(
+            driver.kept_log_bytes() > 0,
+            "wake {i}: the parked ring lost its lines"
+        );
         let t0 = Instant::now();
         let woke = driver.wake(tenant, s.id).await.expect("wake");
         let took = t0.elapsed();
