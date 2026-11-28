@@ -1,0 +1,8 @@
+# The node22 smoke app of staging (card I6-13; README "node22 apps on staging"). No dependency:
+# builds on staging have no internet yet (the egress proxy refuses every build until backlog
+# S-86 and I6-17 are closed), and `npm ci` of an empty lock file needs none.
+runtime: node22
+start: node server.js
+health:
+  path: /healthz
+access: public
