@@ -1691,3 +1691,79 @@ async fn the_decision_entry_reaches_only_readers_of_publish_requests() {
     let viewer = w.agent_with(w.editor, Role::View).await;
     assert!(!sees(viewer).await, "an agent with the scope view");
 }
+
+/// The release of an approved publish compares the plan it grants (under the live switch) with
+/// the approval's bindings: another plan than the approved one is refused before anything
+/// changes (Kimi W-3b re-check 3: a path that resolves elsewhere between the use's check and the
+/// release's own resolution).
+#[tokio::test]
+async fn the_release_grants_only_the_approved_binding_plan() {
+    let w = world().await;
+    let app = w.app("Release plan").await;
+    let a = w.node(w.folder, "Shared", NodeKind::Folder).await;
+    let path = w.s.nodes.path_of(&w.o(), a).await.unwrap();
+    let manifest =
+        format!("runtime: static\nbindings:\n  docs:\n    node: \"{path}\"\n    role: view\n");
+    let site = w
+        .site(
+            "plan",
+            &[("app.yaml", manifest.as_bytes()), ("index.html", INDEX)],
+        )
+        .await;
+    let agent = w.agent(w.editor).await;
+    let dep = w.preview(&agent, app, site).await;
+    let row =
+        w.s.apps
+            .store()
+            .get_deployment(w.team.id, app, dep)
+            .await
+            .unwrap()
+            .unwrap();
+    let app_row =
+        w.s.apps
+            .store()
+            .get_app(w.team.id, app)
+            .await
+            .unwrap()
+            .unwrap();
+    let approved = w.s.apps.requested(&agent, &app_row, &row).await.unwrap();
+    let planned =
+        w.s.apps
+            .check_publish_bindings(&agent, app, dep, row.manifest.as_ref().unwrap())
+            .await
+            .unwrap();
+    fn release(bound: &Value) -> ApprovedRelease<'_> {
+        ApprovedRelease {
+            id: Uuid::nil(),
+            bound_bindings: bound,
+        }
+    }
+    // The approved plan passes.
+    w.s.apps
+        .check_release_plan(
+            w.team.id,
+            &app_row,
+            &planned,
+            release(&approved.bound_bindings),
+        )
+        .await
+        .unwrap();
+    // A plan that names another target than the approved one is refused.
+    let mut other = approved.bound_bindings.clone();
+    other["plan"]["docs"]["target_node_id"] = json!(w.folder);
+    let e =
+        w.s.apps
+            .check_release_plan(w.team.id, &app_row, &planned, release(&other))
+            .await
+            .unwrap_err();
+    assert_eq!(hint(&e).as_deref(), Some("approval_stale"));
+    // So is a change of the live side.
+    let mut live = approved.bound_bindings.clone();
+    live["live_rows"]["docs"] = json!({ "target_node_id": a });
+    assert!(
+        w.s.apps
+            .check_release_plan(w.team.id, &app_row, &planned, release(&live))
+            .await
+            .is_err()
+    );
+}

@@ -535,9 +535,116 @@ fn telemetry_pointer(e: Error) -> Error {
     }
 }
 
+/// The grant of a binding as the approval compares it.
+fn grant_json(
+    target: NodeId,
+    role: Option<Role>,
+    api: &Option<String>,
+    scopes: &[String],
+    obo: bool,
+) -> Value {
+    json!({
+        "target_node_id": target,
+        "role": role,
+        "api": api,
+        "scopes": scopes,
+        "on_behalf_of_user": obo,
+    })
+}
+
+/// The two sides of the binding comparison by name: the plan a release grants and the live
+/// principal's active rows.
+fn binding_sides(
+    planned: &[super::bindings::Resolved],
+    live_rows: &[super::store::BindingRow],
+) -> (BTreeMap<String, Value>, BTreeMap<String, Value>) {
+    let new_side = planned
+        .iter()
+        .map(|r| {
+            (
+                r.name.clone(),
+                grant_json(r.target, r.role, &r.api, &r.scopes, r.on_behalf_of_user),
+            )
+        })
+        .collect();
+    let old_side = live_rows
+        .iter()
+        .map(|b| {
+            (
+                b.name.clone(),
+                grant_json(
+                    b.target_node_id,
+                    b.role,
+                    &b.api,
+                    &b.scopes,
+                    b.on_behalf_of_user,
+                ),
+            )
+        })
+        .collect();
+    (new_side, old_side)
+}
+
+/// What an approval binds about bindings (`app_approvals.bound_bindings`).
+fn bound_of(new_side: &BTreeMap<String, Value>, old_side: &BTreeMap<String, Value>) -> Value {
+    json!({ "plan": new_side, "live_rows": old_side })
+}
+
+/// The approval a release uses ([`AppService::go_live`]): its ID, recorded on the release, and
+/// the bindings it is bound to, compared with the plan the release grants under the live switch.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ApprovedRelease<'a> {
+    pub id: Uuid,
+    pub bound_bindings: &'a Value,
+}
+
 // ---------------------------------------------------------------------------- the service
 
 impl AppService {
+    /// The live principal's active binding rows (none before the first publish).
+    async fn live_binding_rows(
+        &self,
+        tenant: crate::ids::TenantId,
+        app: &super::store::AppRow,
+    ) -> Result<Vec<super::store::BindingRow>> {
+        if app.live_deployment_id.is_none() {
+            return Ok(Vec::new());
+        }
+        self.deps
+            .store
+            .list_bindings(
+                tenant,
+                &super::store::BindingQuery {
+                    principal: Some(app.node_id.0),
+                    active_only: true,
+                    limit: 500,
+                    ..Default::default()
+                },
+            )
+            .await
+    }
+
+    /// The check of a release with an approval, under the live switch (Kimi W-3b re-check 3):
+    /// the plan the release grants (`planned`, the one it revokes and grants by) and the live
+    /// rows now are exactly what the approval is bound to; else `approval_stale` and nothing of
+    /// the release happens (the approval stays used, provisional W3B-D3).
+    pub(crate) async fn check_release_plan(
+        &self,
+        tenant: crate::ids::TenantId,
+        app: &super::store::AppRow,
+        planned: &[super::bindings::Resolved],
+        approved: ApprovedRelease<'_>,
+    ) -> Result<()> {
+        let live_rows = self.live_binding_rows(tenant, app).await?;
+        let (new_side, old_side) = binding_sides(planned, &live_rows);
+        if bound_of(&new_side, &old_side) != *approved.bound_bindings {
+            return Err(stale(
+                "the bindings resolve to other targets than the person approved",
+            ));
+        }
+        Ok(())
+    }
+
     /// What an agent's publish request of `dep` computes now (module docs): `changes` against
     /// the live deployment of `app`, the preview's binding targets and the manifest hash. The
     /// request stores it; the use compares it again ([`check_bound`]).
@@ -574,60 +681,8 @@ impl AppService {
         let planned = self
             .check_publish_bindings(ctx, app.node_id, dep.id, &manifest)
             .await?;
-        let live_rows = match app.live_deployment_id {
-            Some(_) => {
-                self.deps
-                    .store
-                    .list_bindings(
-                        tenant,
-                        &super::store::BindingQuery {
-                            principal: Some(app.node_id.0),
-                            active_only: true,
-                            limit: 500,
-                            ..Default::default()
-                        },
-                    )
-                    .await?
-            }
-            None => Vec::new(),
-        };
-        let grant = |target: NodeId,
-                     role: Option<Role>,
-                     api: &Option<String>,
-                     scopes: &[String],
-                     obo: bool| {
-            json!({
-                "target_node_id": target,
-                "role": role,
-                "api": api,
-                "scopes": scopes,
-                "on_behalf_of_user": obo,
-            })
-        };
-        let new_side: BTreeMap<String, Value> = planned
-            .iter()
-            .map(|r| {
-                (
-                    r.name.clone(),
-                    grant(r.target, r.role, &r.api, &r.scopes, r.on_behalf_of_user),
-                )
-            })
-            .collect();
-        let old_side: BTreeMap<String, Value> = live_rows
-            .iter()
-            .map(|b| {
-                (
-                    b.name.clone(),
-                    grant(
-                        b.target_node_id,
-                        b.role,
-                        &b.api,
-                        &b.scopes,
-                        b.on_behalf_of_user,
-                    ),
-                )
-            })
-            .collect();
+        let live_rows = self.live_binding_rows(tenant, app).await?;
+        let (new_side, old_side) = binding_sides(&planned, &live_rows);
         let spec = |m: Option<&Value>, name: &str| {
             m.and_then(|m| m.get("bindings"))
                 .and_then(|b| b.get(name))
@@ -670,7 +725,7 @@ impl AppService {
                 })
             })
             .collect();
-        let bound_bindings = json!({ "plan": new_side, "live_rows": old_side });
+        let bound_bindings = bound_of(&new_side, &old_side);
         // `secrets_missing` waits for card W-4, `migrations` and `planned_columns` for W-3a-m;
         // `unconfirmed_telemetry_fields` stays 0 until the request can read the app's field
         // list in one store call (backlog W3B-1).
@@ -722,8 +777,18 @@ impl AppService {
             ReleaseKind::Rollback => dep.version_id,
             ReleaseKind::Publish => None,
         };
-        self.go_live(ctx, app, dep, kind, restored_from, Some(taken.id))
-            .await
+        self.go_live(
+            ctx,
+            app,
+            dep,
+            kind,
+            restored_from,
+            Some(ApprovedRelease {
+                id: taken.id,
+                bound_bindings: &taken.bound_bindings,
+            }),
+        )
+        .await
     }
 
     /// The app node for an approval operation: `view` (else `404`), then `edit` (else `403`).

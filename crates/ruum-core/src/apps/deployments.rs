@@ -1008,7 +1008,8 @@ impl AppService {
     }
 
     /// Makes `dep` (a ready preview or an older live deployment) live as a new deployment.
-    /// `approval` is the approval an agent's publish took (card W-3b), recorded on the release.
+    /// `approval` is the approval an agent's publish took (card W-3b): its bindings are compared
+    /// with this release's plan under the live switch, and its ID is recorded on the release.
     pub(super) async fn go_live(
         &self,
         ctx: &Context,
@@ -1016,7 +1017,7 @@ impl AppService {
         dep: &DeploymentRow,
         kind: ReleaseKind,
         restored_from: Option<VersionId>,
-        approval: Option<Uuid>,
+        approval: Option<super::approvals::ApprovedRelease<'_>>,
     ) -> Result<store::Released> {
         let manifest = dep
             .manifest
@@ -1041,6 +1042,11 @@ impl AppService {
             .ok_or_else(|| Error::not_found("app"))?;
         if current.live_deployment_id != app.live_deployment_id {
             return Err(store::live_changed());
+        }
+        // An approved agent publish grants exactly the plan the person approved (card W-3b).
+        if let Some(a) = approval {
+            self.check_release_plan(ctx.tenant, app, &planned, a)
+                .await?;
         }
         let before = match app.live_deployment_id {
             Some(live) => self
@@ -1134,7 +1140,7 @@ impl AppService {
                         expected_live: app.live_deployment_id,
                         restored_from,
                         rollback_of: (kind == ReleaseKind::Rollback).then_some(dep.id),
-                        approval_id: approval,
+                        approval_id: approval.map(|a| a.id),
                     },
                 )
                 .await
