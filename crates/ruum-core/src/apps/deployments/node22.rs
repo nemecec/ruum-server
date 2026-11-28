@@ -522,6 +522,10 @@ impl AppService {
     }
 }
 
+/// How long a start check waits for the stop of its instance before it lets the stop go on in
+/// the background (the start before a publish runs inside the request).
+const STOP_WAIT: Duration = Duration::from_secs(10);
+
 /// A start that runs in its own task. Dropped while the task still runs (a late start, or a
 /// dropped caller), it lets the start finish and stops the instance it made.
 struct PendingStart {
@@ -694,9 +698,21 @@ pub(crate) async fn start_and_check(
             _ => {}
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
-        st = match driver.status(tenant, id).await {
-            Ok(s) => s,
-            Err(e) => {
+        // Every status request ends at the deadline too (Kimi re-check 2 of the review of
+        // I6-13): a slow runtime API never holds the request past the cap.
+        st = match tokio::time::timeout_at(deadline, driver.status(tenant, id)).await {
+            Err(_) => {
+                break Err(StageError::new(
+                    "start",
+                    "not_ready",
+                    format!(
+                        "the runtime did not report the server healthy within {} s",
+                        wait.as_secs()
+                    ),
+                ));
+            }
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
                 break Err(runtime_stage_error(
                     "start",
                     "runtime_refused",
@@ -706,10 +722,18 @@ pub(crate) async fn start_and_check(
             }
         };
     };
-    if let Err(e) = guard.driver.stop(tenant, id).await {
-        tracing::warn!(target: "ruum::apps", %tenant, error = %e, "could not stop a node22 start check");
+    // The stop is bounded as well: after STOP_WAIT the guard stays armed and its drop sends the
+    // stop again in a task of its own.
+    match tokio::time::timeout(STOP_WAIT, guard.driver.stop(tenant, id)).await {
+        Ok(Ok(())) => guard.armed = false,
+        Ok(Err(e)) => {
+            tracing::warn!(target: "ruum::apps", %tenant, error = %e, "could not stop a node22 start check");
+            guard.armed = false;
+        }
+        Err(_) => {
+            tracing::warn!(target: "ruum::apps", %tenant, "the stop of a node22 start check is slow; it goes on in the background");
+        }
     }
-    guard.armed = false;
     outcome.map(|()| {
         json!({
             "passed": true,
