@@ -1487,7 +1487,6 @@
         "app.domain_removed",
         "app.api_key_created",
         "app.api_key_revoked",
-        "app.approval_decided",
         "issue.created",
         "issue.status_changed",
         "issue.reveal_requested",

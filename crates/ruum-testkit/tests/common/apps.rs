@@ -66,6 +66,7 @@ pub fn all_cases() -> Vec<Case> {
     v.extend(super::apps_roles::cases());
     v.extend(super::apps_bindings::cases());
     v.extend(super::apps_telemetry::cases());
+    v.extend(super::apps_approvals::cases());
     v
 }
 

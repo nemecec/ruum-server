@@ -184,6 +184,36 @@ fn switch_live(st: &mut Inner, tenant: TenantId, row: &DeploymentRow, now: Offse
     }
 }
 
+/// Inserts a pending approval row (card W-2s; W-3b).
+fn insert_approval_in(st: &mut Inner, ctx: &Context, a: NewApproval) -> Result<ApprovalRow> {
+    let tenant = ctx.tenant;
+    if !st.deployments.contains_key(&(tenant, a.deployment_id)) {
+        return Err(Error::not_found("deployment"));
+    }
+    let row = ApprovalRow {
+        tenant_id: tenant,
+        id: a.id,
+        app_node_id: a.app_node_id,
+        deployment_id: a.deployment_id,
+        status: "pending".into(),
+        changes: a.changes,
+        bound_archive_hash: a.bound_archive_hash,
+        bound_manifest_hash: a.bound_manifest_hash,
+        bound_bindings: a.bound_bindings,
+        requested_by: ctx.actor,
+        decided_by: None,
+        decided_at: None,
+        comment: None,
+        expires_at: a.expires_at,
+        used_at: None,
+        telemetry_fields: Value::Array(Vec::new()),
+        classes: Value::Array(Vec::new()),
+        created_at: crate::now(),
+    };
+    st.approvals.insert((tenant, row.id), row.clone());
+    Ok(row)
+}
+
 fn ensure(st: &mut Inner, tenant: TenantId, candidates: &[String]) -> Result<TenantAppSettings> {
     if let Some(t) = st.tenants.get(&tenant) {
         return Ok(t.clone());
@@ -593,7 +623,9 @@ impl AppStore for MemoryAppStore {
         });
         let now = crate::now();
         let (version, _) = release_version(ctx, &d, r.restored_from, now);
-        let row = insert_row(&mut st, ctx, &d, Some(version.id), now)?;
+        let mut row = insert_row(&mut st, ctx, &d, Some(version.id), now)?;
+        // The approval an agent's publish used (card W-3b).
+        row.approval_id = r.approval_id;
         let entries = release_entries(&d, &version, previous, &r);
         // The journal first: a failed append leaves nothing behind (as the Postgres rollback).
         let change = self.journal(ctx, d.app_node_id, entries, now)?;
@@ -621,30 +653,155 @@ impl AppStore for MemoryAppStore {
     }
 
     async fn insert_approval(&self, ctx: &Context, a: NewApproval) -> Result<ApprovalRow> {
-        let mut st = self.st();
+        insert_approval_in(&mut self.st(), ctx, a)
+    }
+
+    async fn request_app_approval(
+        &self,
+        ctx: &Context,
+        a: NewApproval,
+        max_pending: usize,
+        at: OffsetDateTime,
+    ) -> Result<(ApprovalRow, bool)> {
         let tenant = ctx.tenant;
-        if !st.deployments.contains_key(&(tenant, a.deployment_id)) {
-            return Err(Error::not_found("deployment"));
+        // One lock over the check and the insert: two requests at once make one row.
+        let mut st = self.st();
+        {
+            let pending = |r: &&ApprovalRow| {
+                r.tenant_id == tenant
+                    && r.app_node_id == a.app_node_id
+                    && r.status == "pending"
+                    && r.expires_at > at
+            };
+            if let Some(same) = st
+                .approvals
+                .values()
+                .filter(pending)
+                .filter(|r| {
+                    r.deployment_id == a.deployment_id
+                        && r.requested_by == ctx.actor
+                        && r.bound_archive_hash == a.bound_archive_hash
+                        && r.bound_manifest_hash == a.bound_manifest_hash
+                        && r.bound_bindings == a.bound_bindings
+                        && r.changes == a.changes
+                })
+                .max_by_key(|r| r.id)
+            {
+                return Ok((same.clone(), false));
+            }
+            if st.approvals.values().filter(pending).count() >= max_pending {
+                return Err(super::super::approvals::too_many_pending());
+            }
         }
-        let row = ApprovalRow {
-            tenant_id: tenant,
-            id: a.id,
-            app_node_id: a.app_node_id,
-            deployment_id: a.deployment_id,
-            status: "pending".into(),
-            changes: a.changes,
-            bound_archive_hash: a.bound_archive_hash,
-            bound_manifest_hash: a.bound_manifest_hash,
-            bound_bindings: a.bound_bindings,
-            requested_by: ctx.actor,
-            decided_by: None,
-            decided_at: None,
-            comment: None,
-            expires_at: a.expires_at,
-            created_at: crate::now(),
+        Ok((insert_approval_in(&mut st, ctx, a)?, true))
+    }
+
+    async fn get_approval(
+        &self,
+        tenant: TenantId,
+        app: NodeId,
+        id: Uuid,
+    ) -> Result<Option<ApprovalRow>> {
+        Ok(self
+            .st()
+            .approvals
+            .get(&(tenant, id))
+            .filter(|a| a.app_node_id == app)
+            .cloned())
+    }
+
+    async fn list_approvals(
+        &self,
+        tenant: TenantId,
+        app: NodeId,
+        q: ApprovalQuery,
+        page: PageRequest,
+        at: OffsetDateTime,
+    ) -> Result<Page<ApprovalRow>> {
+        let after = super::super::approvals::parse_cursor(&page)?;
+        let limit = page.limit() as usize;
+        let mut items: Vec<ApprovalRow> = self
+            .st()
+            .approvals
+            .values()
+            .filter(|a| a.tenant_id == tenant && a.app_node_id == app)
+            .filter(|a| {
+                q.requested_by
+                    .is_none_or(|g| a.requested_by.is_agent() && a.requested_by.actor.id == g)
+            })
+            .filter(|a| {
+                q.status
+                    .is_none_or(|s| super::super::approvals::status_at(a, at) == s)
+            })
+            .filter(|a| after.is_none_or(|c| a.id < c))
+            .cloned()
+            .collect();
+        items.sort_by_key(|a| std::cmp::Reverse(a.id));
+        Ok(super::super::approvals::page_of(items, limit))
+    }
+
+    async fn decide_approval(
+        &self,
+        ctx: &Context,
+        app: NodeId,
+        id: Uuid,
+        d: ApprovalDecision,
+        at: OffsetDateTime,
+    ) -> Result<crate::journal::Written<ApprovalRow>> {
+        let user = ctx
+            .actor
+            .effective_user()
+            .ok_or_else(Error::user_required)?;
+        let mut st = self.st();
+        let a = st
+            .approvals
+            .get(&(ctx.tenant, id))
+            .filter(|a| a.app_node_id == app)
+            .cloned()
+            .ok_or_else(super::super::approvals::approval_not_found)?;
+        if super::super::approvals::status_at(&a, at) != "pending" {
+            return Err(super::super::approvals::not_pending());
+        }
+        let decided = super::super::approvals::decided(a, user, &d, at);
+        // The journal first: a failed append leaves the row as it was (as the Postgres
+        // rollback).
+        let change = self.journal(
+            ctx,
+            app,
+            vec![(EventType::AppApprovalDecided, d.event.clone())],
+            at,
+        )?;
+        st.approvals.insert((ctx.tenant, id), decided.clone());
+        Ok(crate::journal::Written {
+            value: decided,
+            change,
+        })
+    }
+
+    async fn take_approval(
+        &self,
+        ctx: &Context,
+        app: NodeId,
+        id: Uuid,
+        deployment: Uuid,
+        at: OffsetDateTime,
+    ) -> Result<Option<ApprovalRow>> {
+        let mut st = self.st();
+        let Some(a) = st.approvals.get_mut(&(ctx.tenant, id)) else {
+            return Ok(None);
         };
-        st.approvals.insert((tenant, row.id), row.clone());
-        Ok(row)
+        let usable = a.app_node_id == app
+            && a.deployment_id == deployment
+            && a.status == "approved"
+            && a.used_at.is_none()
+            && a.expires_at > at
+            && a.requested_by == ctx.actor;
+        if !usable {
+            return Ok(None);
+        }
+        a.status = "used".into();
+        a.used_at = Some(at);
+        Ok(Some(a.clone()))
     }
 
     async fn list_versions(

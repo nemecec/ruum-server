@@ -89,6 +89,10 @@ pub enum EventType {
     /// per class only; it changes no person's or agent's view of any node, so it needs no feed
     /// rule of its own.
     AppTelemetryFieldsConfirmed,
+    /// A person decided an agent's publish request (card W-3b). On the app node, IDs, the
+    /// decision and a count only; it changes no person's or agent's view of any node, so it
+    /// needs no feed rule of its own.
+    AppApprovalDecided,
     /// A type written by a newer release; the name as written (interned, see
     /// [`EventType::from_wire`]).
     Unknown(&'static str),
@@ -131,6 +135,7 @@ impl EventType {
         EventType::AppRoleGranted,
         EventType::AppRoleRevoked,
         EventType::AppTelemetryFieldsConfirmed,
+        EventType::AppApprovalDecided,
     ];
 
     /// The wire name, for example `node.created` (column `journal.type`).
@@ -171,6 +176,7 @@ impl EventType {
             AppRoleGranted => "app.role_granted",
             AppRoleRevoked => "app.role_revoked",
             AppTelemetryFieldsConfirmed => "app.telemetry_fields_confirmed",
+            AppApprovalDecided => "app.approval_decided",
             Unknown(name) => name,
         }
     }
@@ -614,6 +620,9 @@ mod tests {
                     // Only a person confirms telemetry classes (`confirmAppTelemetryFields` is
                     // users only, card O-2), so `undoAgent` never meets this entry.
                     || *e == EventType::AppTelemetryFieldsConfirmed
+                    // Only a person decides a publish request (`decideAppApproval` is users
+                    // only, card W-3b), so `undoAgent` never meets this entry.
+                    || *e == EventType::AppApprovalDecided
                     // The entry names the new settings only (its schema), so there is nothing
                     // to set back; an agent can only lower settings anyway.
                     || *e == EventType::AppSettingsChanged

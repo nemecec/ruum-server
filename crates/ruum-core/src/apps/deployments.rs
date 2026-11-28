@@ -72,11 +72,13 @@
 //!
 //! An agent's publish answers `202` with a pending approval (`AppApprovalRequired`, decision
 //! 0006-4): the `app_approvals` row is bound to the archive hash, the hash of the parsed
-//! manifest and the preview's resolved bindings (card B-1); nothing goes live. A call with
-//! `approval_id` answers `409 conflict`, hint `approval_stale`, until card W-3b decides and uses
-//! approvals (fail closed). An agent's `restoreVersion` of an app version answers `403
-//! permission_denied`, hint `publishAppDeployment`, with the deployment in
-//! `error.details.deployment_id`.
+//! manifest, the preview's resolved bindings (card B-1) and the changes against the live
+//! deployment; nothing goes live. The same call of the agent with an approved `approval_id`
+//! goes live once, within 15 minutes of the decision, only for that deployment, archive,
+//! manifest and binding targets; else `409 conflict`, hint `approval_stale` (card W-3b,
+//! [`super::approvals`]). A person's publish ignores `approval_id`. An agent's
+//! `restoreVersion` of an app version answers `403 permission_denied`, hint
+//! `publishAppDeployment`, with the deployment in `error.details.deployment_id`.
 //!
 //! # Meters
 //!
@@ -810,15 +812,18 @@ impl AppService {
             .get_deployment(ctx.tenant, app, deployment)
             .await?
             .ok_or_else(|| Error::not_found("deployment"))?;
-        if req.approval_id.is_some() {
-            // Deciding and using approvals is card W-3b: until then no approval counts.
-            return Err(Error::Api(
-                ApiError::new(
-                    ErrorCode::Conflict,
-                    "approvals of app publishes cannot be used yet",
-                )
-                .with_hint("approval_stale"),
-            ));
+        // An agent's publish with an approval (card W-3b, [`super::approvals`]); a person's
+        // publish ignores `approval_id` and runs with the person's own checks.
+        if ctx.actor.is_agent()
+            && let Some(id) = req.approval_id
+        {
+            let released = self.publish_approved(ctx, &row, &dep, id).await?;
+            let urls = self.urls(ctx.tenant, &node).await?;
+            return Ok(Published::Live(Box::new(deployment_view(
+                &released.deployment,
+                &urls,
+                true,
+            ))));
         }
         let urls = self.urls(ctx.tenant, &node).await?;
         if row.live_deployment_id == Some(dep.id) {
@@ -888,7 +893,9 @@ impl AppService {
             ReleaseKind::Rollback => dep.version_id,
             ReleaseKind::Publish => None,
         };
-        let released = self.go_live(ctx, &row, &dep, kind, restored_from).await?;
+        let released = self
+            .go_live(ctx, &row, &dep, kind, restored_from, None)
+            .await?;
         Ok(Published::Live(Box::new(deployment_view(
             &released.deployment,
             &urls,
@@ -943,7 +950,7 @@ impl AppService {
             .await?
             .ok_or_else(|| Error::not_found("version"))?;
         let released = self
-            .go_live(ctx, &row, &dep, ReleaseKind::Rollback, Some(version))
+            .go_live(ctx, &row, &dep, ReleaseKind::Rollback, Some(version), None)
             .await?;
         Ok(Written {
             value: released.version,
@@ -1001,13 +1008,15 @@ impl AppService {
     }
 
     /// Makes `dep` (a ready preview or an older live deployment) live as a new deployment.
-    async fn go_live(
+    /// `approval` is the approval an agent's publish took (card W-3b), recorded on the release.
+    pub(super) async fn go_live(
         &self,
         ctx: &Context,
         app: &store::AppRow,
         dep: &DeploymentRow,
         kind: ReleaseKind,
         restored_from: Option<VersionId>,
+        approval: Option<Uuid>,
     ) -> Result<store::Released> {
         let manifest = dep
             .manifest
@@ -1125,7 +1134,7 @@ impl AppService {
                         expected_live: app.live_deployment_id,
                         restored_from,
                         rollback_of: (kind == ReleaseKind::Rollback).then_some(dep.id),
-                        approval_id: None,
+                        approval_id: approval,
                     },
                 )
                 .await
@@ -1162,7 +1171,8 @@ impl AppService {
         }
     }
 
-    /// The pending approval of an agent's publish (the JSON of `AppApproval`).
+    /// The pending approval of an agent's publish (the JSON of `AppApproval`): a new request,
+    /// or the agent's pending one for this deployment when it still matches (card W-3b).
     async fn request_approval(
         &self,
         ctx: &Context,
@@ -1170,52 +1180,25 @@ impl AppService {
         dep: &DeploymentRow,
         public_url: &str,
     ) -> Result<Value> {
-        let manifest = dep.manifest.clone().unwrap_or(Value::Null);
-        let live_manifest = match app.live_deployment_id {
-            Some(live) => self
-                .deps
-                .store
-                .get_deployment(ctx.tenant, app.node_id, live)
-                .await?
-                .and_then(|d| d.manifest),
-            None => None,
-        };
-        let roles = |m: Option<&Value>| -> Vec<String> {
-            m.and_then(|m| m.get("roles"))
-                .and_then(Value::as_object)
-                .map(|o| o.keys().cloned().collect())
-                .unwrap_or_default()
-        };
-        let (new_roles, old_roles) = (roles(Some(&manifest)), roles(live_manifest.as_ref()));
-        let rows = self.preview_rows(ctx.tenant, dep.id).await?;
-        let (bindings_added, bindings_removed, bound_bindings) =
-            super::bindings::approval_bindings(&manifest, live_manifest.as_ref(), &rows);
-        let changes = json!({
-            "bindings_added": bindings_added,
-            "bindings_removed": bindings_removed,
-            "roles_added": new_roles.iter().filter(|r| !old_roles.contains(r)).collect::<Vec<_>>(),
-            "roles_removed": old_roles.iter().filter(|r| !new_roles.contains(r)).collect::<Vec<_>>(),
-            "secrets_missing": [],
-            "migrations": [],
-            "planned_columns": [],
-            "unconfirmed_telemetry_fields": 0,
-            "unconfirmed_columns": 0,
-        });
-        let row = self
+        let r = self.requested(ctx.tenant, app, dep).await?;
+        let now = crate::now();
+        let (row, _) = self
             .deps
             .store
-            .insert_approval(
+            .request_app_approval(
                 ctx,
                 NewApproval {
                     id: Uuid::now_v7(),
                     app_node_id: app.node_id,
                     deployment_id: dep.id,
-                    changes,
+                    changes: r.changes,
                     bound_archive_hash: dep.archive.content_hash,
-                    bound_manifest_hash: *blake3::hash(&canonical(&manifest)).as_bytes(),
-                    bound_bindings,
-                    expires_at: crate::now() + time::Duration::hours(APPROVAL_HOURS),
+                    bound_manifest_hash: r.manifest_hash,
+                    bound_bindings: r.bound_bindings,
+                    expires_at: now + time::Duration::hours(APPROVAL_HOURS),
                 },
+                super::approvals::MAX_PENDING_PER_APP,
+                now,
             )
             .await?;
         Ok(approval_json(&row, public_url))
@@ -1280,32 +1263,9 @@ impl AppService {
     }
 }
 
-/// The JSON of `AppApproval`.
+/// The JSON of `AppApproval` now ([`super::approvals::view`]).
 pub fn approval_json(a: &store::ApprovalRow, public_url: &str) -> Value {
-    let fmt = |t: time::OffsetDateTime| {
-        t.format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_default()
-    };
-    json!({
-        "id": a.id,
-        "app_id": a.app_node_id,
-        "deployment_id": a.deployment_id,
-        "status": a.status,
-        "changes": a.changes,
-        "requested_by": a.requested_by,
-        "decided_by": a.decided_by,
-        "decided_at": a.decided_at.map(fmt),
-        "comment": a.comment,
-        "review_url": format!(
-            "{}/t/{}/apps/{}/approvals/{}",
-            public_url.trim_end_matches('/'),
-            a.tenant_id,
-            a.app_node_id,
-            a.id
-        ),
-        "expires_at": fmt(a.expires_at),
-        "created_at": fmt(a.created_at),
-    })
+    super::approvals::view(a, public_url, crate::now())
 }
 
 /// The source and the archive bytes of a deployment request.

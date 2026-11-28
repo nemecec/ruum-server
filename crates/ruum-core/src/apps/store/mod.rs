@@ -329,8 +329,41 @@ pub struct ApprovalRow {
     pub decided_by: Option<Uuid>,
     pub decided_at: Option<OffsetDateTime>,
     pub comment: Option<String>,
+    /// A pending request: 24 hours after it was made; an approved one: 15 minutes after the
+    /// decision (card W-3b). Past it the request reads as `expired`.
     pub expires_at: OffsetDateTime,
+    /// When a publish used the approval (status `used`).
+    pub used_at: Option<OffsetDateTime>,
+    /// The telemetry fields the decider confirmed with the decision (`TelemetryFieldClass`).
+    pub telemetry_fields: Value,
+    /// The column classes the decider confirmed (`DecideAppApprovalRequest.classes`), stored
+    /// for the migrations of the publish (card W-3a-m).
+    pub classes: Value,
     pub created_at: OffsetDateTime,
+}
+
+/// Which approvals [`AppStore::list_approvals`] returns (card W-3b).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ApprovalQuery {
+    /// Only the requests of this agent.
+    pub requested_by: Option<crate::ids::PrincipalId>,
+    /// Only approvals with this status at the time of the list (`pending`, `approved`,
+    /// `denied`, `expired`, `used`; a pending or approved row past `expires_at` is `expired`).
+    pub status: Option<&'static str>,
+}
+
+/// A decision of a person on an agent's publish request ([`AppStore::decide_approval`]). The
+/// permission checks are done.
+#[derive(Clone, Debug)]
+pub struct ApprovalDecision {
+    pub approve: bool,
+    pub comment: Option<String>,
+    /// Stored on the row (approve only).
+    pub telemetry_fields: Value,
+    /// Stored on the row (approve only).
+    pub classes: Value,
+    /// The `data` of `app.approval_decided`.
+    pub event: Value,
 }
 
 /// A preview that the sweeper ended.
@@ -812,6 +845,68 @@ pub trait AppStore: Send + Sync {
 
     /// Inserts the approval request of an agent's publish (status `pending`).
     async fn insert_approval(&self, ctx: &Context, a: NewApproval) -> Result<ApprovalRow>;
+
+    /// The publish request of the agent in `ctx` (card W-3b, provisional W3B-D4): a pending
+    /// request of the same agent (and `on_behalf_of`) for the same deployment that has not
+    /// expired at `at` and has the same bound hashes, bindings and `changes` is returned with
+    /// `false` and nothing is written; else, when the app has fewer than `max_pending` pending
+    /// requests at `at`, a new one is inserted (`true`); else `409 conflict`. Requests of one
+    /// app are serialized, so two at once make one row.
+    async fn request_app_approval(
+        &self,
+        ctx: &Context,
+        a: NewApproval,
+        max_pending: usize,
+        at: OffsetDateTime,
+    ) -> Result<(ApprovalRow, bool)>;
+
+    /// One approval of `app` in the tenant.
+    async fn get_approval(
+        &self,
+        tenant: TenantId,
+        app: NodeId,
+        id: Uuid,
+    ) -> Result<Option<ApprovalRow>>;
+
+    /// The approvals of `app`, newest first (by ID, a UUIDv7; the cursor is the ID of the last
+    /// item), with the status of each at `at`.
+    async fn list_approvals(
+        &self,
+        tenant: TenantId,
+        app: NodeId,
+        q: ApprovalQuery,
+        page: PageRequest,
+        at: OffsetDateTime,
+    ) -> Result<Page<ApprovalRow>>;
+
+    /// Decides a request that is pending at `at`, as the user of `ctx`, in ONE unit: the
+    /// status, `decided_by`, `decided_at`, `comment`, for approve the telemetry fields, the
+    /// classes and the use window (`expires_at` 15 minutes after the decision), and the entry
+    /// `app.approval_decided` with `d.event`. `404` when the approval is not of that app of the
+    /// tenant; `409 conflict` when it is not pending at `at` (also when another decision came
+    /// first).
+    async fn decide_approval(
+        &self,
+        ctx: &Context,
+        app: NodeId,
+        id: Uuid,
+        d: ApprovalDecision,
+        at: OffsetDateTime,
+    ) -> Result<crate::journal::Written<ApprovalRow>>;
+
+    /// Uses an approval once for a publish (card W-3b): marks it `used` with `used_at` = `at`
+    /// only when it is of `app` and `deployment` in the tenant, `approved`, not used, its
+    /// `expires_at` is after `at`, and it was requested by exactly the actor pair of `ctx` (the
+    /// agent and its user). `None` (nothing written) otherwise. Takes of one approval are
+    /// serialized: of two at once exactly one gets the row.
+    async fn take_approval(
+        &self,
+        ctx: &Context,
+        app: NodeId,
+        id: Uuid,
+        deployment: Uuid,
+        at: OffsetDateTime,
+    ) -> Result<Option<ApprovalRow>>;
 
     /// The release versions of an app node (encoding `app_release_v1`), newest first. No
     /// permission check.
