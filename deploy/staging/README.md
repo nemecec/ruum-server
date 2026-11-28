@@ -585,10 +585,10 @@ PSL entry of decision 0006 E-1 (`*.ruumapps.net`) is not enough for staging: it 
 `apps.staging.ruumapps.net` one site. Do not put anything on staging apps that needs the
 separation.
 
-**Not on staging yet** (backlog I6-2 to I6-6): node22 deploys (the deploy pipeline refuses
-`runtime: node22` with `runtime_not_ready`), so node22 apps answer the gateway's 502 after the
-sign-in and the node22 smoke check prints BLOCKED; a builder and a registry on staging (the
-Docker builder needs a Docker engine; Talos has none); the registration of sandboxes at the
+**Not on staging yet** (backlog I6-2 to I6-6): node22 deploys (built by card I6-13, off on
+staging: the server has no builder, so the pipeline refuses `runtime: node22` with
+`runtime_not_ready` and the node22 smoke check prints BLOCKED; "node22 apps on staging" below
+turns on the Kubernetes builder and the cluster registry); the registration of sandboxes at the
 egress proxy (its identity is a registered address, and its control socket is inside the
 proxy's pod: backlog I6-2, a panel question); the database pooler, the telemetry listeners, the
 key set of user tokens for apps (P-97).
@@ -647,7 +647,8 @@ refuses to render.
   that took their launch data live in the platform database (`runtime_seal_marks`,
   `runtime_launches`, migration 0018), shared by both server replicas; a seal put back into a
   ConfigMap opens no second launch on any replica.
-- **Not yet**: no registry (`runtime.registry` empty: every app image is `image_not_found`), no
+- **Not yet**: no registry on staging (`runtime.registry` empty: every app image is
+  `image_not_found`; the cluster registry of card I6-13 is off, "node22 apps on staging" below), no
   egress registration (I6-2: the proxy refuses every sandbox, fails closed), logs are read only
   by the replica that started the instance, and stdout and
   stderr come as one stream unless the API server has the feature gate
@@ -767,8 +768,8 @@ The orchestrator (the platform first, then the checks, then the switch):
      'RUUM_KUBE_SUPERVISOR_(NETWORK|IMAGE)'` shows `tls` and the supervisor's digest of step 8.1
      (the one step 8.3 checked). From now on every platform step runs the supervisor check with
      the live release's image (`--from-release`).
-   - `deploy/staging/status.sh --checks`: as before; the node22 line stays `BLOCKED` (no builder,
-     no registry).
+   - `deploy/staging/status.sh --checks`: as before; the node22 line stays `BLOCKED` until "node22
+     apps on staging" below.
 10. **The first sandbox** (once a registry and node22 deploys exist; only test values until the
     person says otherwise): start one app whose start command prints a known test value of a
     secret; then the admin checks, on the pod: `kubectl -n ruum-apps logs <pod>` shows `<hidden
@@ -788,15 +789,101 @@ Going back: `runtime.kubernetes: false` and a deploy. The ServiceAccounts, the R
 ClusterRole, the admission policy and the record key stay; they are harmless (nothing else
 makes pods in `ruum-apps`).
 
-**What the node22 smoke check still needs**, in order: node22 deployments in the deploy pipeline
-(the build, image and start stages, and the spec maker of the sandbox directory); a builder that
-runs on Kubernetes (build jobs as gVisor pods) and a registry the nodes pull from
-(`runtime.registry`, with the containerd mirror of the Talos machine config); the egress control
-path (I6-2) for apps that call out. Then the person deploys one node22 app and puts its host into
-`secrets.env` as `STG_SMOKE_NODE22_HOST`, and `RUUM_STAGING_SMOKE_NODE22_READY=1
-deploy/staging/status.sh --checks` must show for that host: its own certificate, no HSTS, no
-Server header, and the gateway's sign-in chain to `https://staging.ruum.space/v1/auth/login` (or
-200 for a public app). The page itself is the person's browser check.
+#### node22 apps on staging (card I6-13)
+
+The deploy pipeline builds node22 apps when ruum-server has a builder (`RUUM_BUILDER=kubernetes`,
+chart value `runtime.builder`): the stages `build` (a gVisor build pod in `ruum-builds`,
+`crates/ruum-runtime` `src/builder/kube.rs`), `image` (the digest on the deployment, migration
+0019), `start` (the instance must be healthy, then it scales to zero) and `check`; a publish
+copies the image digest. The sandbox directory starts an instance on the first request with the
+node22 spec maker. The pieces on staging, all **off** (decision 0008-5):
+
+- **The cluster registry** (`charts/platform` `registry.yaml`, value `registry.enabled`): zot by
+  digest in `ruum-registry`, a local-path volume, the fixed Service address `10.96.0.50:5000`.
+  Users from the Secret `ruum-registry/ruum-registry-auth` (`k8s/apply.sh`, bcrypt): `ruum-pull`
+  reads (the nodes), `ruum-push` reads and creates (the builder); no anonymous access. Garbage
+  collection removes blobs that no manifest names after a day; manifests stay (backlog I613-4).
+  Only ruum-server and the node subnet reach it.
+- **The containerd mirror** (`talos/registry-mirror.yaml.tmpl`, not wired yet): the image name
+  `registry.ruum.internal:5000` goes to `http://10.96.0.50:5000` with the pull user.
+- **The builder** in ruum-server (`runtime.builder`): build pods in `ruum-builds` (its Role:
+  pods and `pods/log` there, `charts/platform` `builder-rbac.yaml`; the account `ruum-build` has
+  no right and no token; `k8s/manifests/builds-admission.yaml` admits only the build pod's shape
+  and no Secret), the build channel on port 8092 (Service `ruum/ruum-build-channel`, TLS with
+  the supervisor listener's pinned key; only `ruum-builds` reaches it), the push password as a
+  file (Secret `ruum/ruum-registry-push`). At start it copies the node22 base image from Docker
+  Hub into the registry (`ruum-base/node22`, by digest).
+- **No internet for builds yet**: the egress proxy refuses every pod until the egress control is
+  allowed (backlog S-86, I6-17), so only apps whose `package-lock.json` has no dependency build
+  (`testapps/node22-smoke`).
+- **One instance per replica** (backlog I6-15) is still open: two server replicas can each start
+  an instance of the same deployment (a cost, not a leak between apps).
+
+The person, once: decide to turn on node22 apps on staging (a line in
+`docs/decisions/0008-person-decisions-2026-11-13.md` item 5, next to the driver's line of step 1
+above). Nothing in a console.
+
+The orchestrator, in this order (each step stops on the first error; the live release keeps
+serving). The driver's steps 4 to 9 above come first, or with step 5 below.
+
+1. **The release**: `deploy/staging/deploy.sh <sha>` of a main commit with card I6-13. Its
+   migration Job adds `app_deployments.image_digest` (0019, expand only).
+2. **The secrets**: `deploy/staging/secrets-init.sh` (adds `STG_REGISTRY_PULL_PASSWORD` and
+   `STG_REGISTRY_PUSH_PASSWORD`; prints names only). The tools image is built again on its next
+   use (it now has `htpasswd`).
+3. **The containerd mirror** (a card: it changes `tofu/cluster`): add
+   `talos/registry-mirror.yaml.tmpl` to `config_patches` of `tofu/cluster/talos.tf`, with the
+   pull password as a sensitive variable `registry_pull_password` (`TF_VAR_registry_pull_password`
+   from `STG_REGISTRY_PULL_PASSWORD` in `steps.sh` `tofu_env`, the name in `TOFU_NAMES`), the same
+   variable with a test value in `tests/talos-validate.sh`, and the plan checks
+   (`check-plan.sh`, `plan-scrub.jq`) for a sensitive variable. Then `deploy/staging/up.sh`
+   (read-only): only `talos_machine_configuration_apply.node["stg-1"]` to `["stg-3"]` change in
+   place; then `RUUM_STAGING_APPLY=yes deploy/staging/up.sh --apply --infra-only` through the
+   admin tunnel.
+4. **The registry** (a card: `charts/platform/values.yaml` `registry.enabled: true`), merged, then
+   from its checkout `RUUM_STAGING_APPLY=yes deploy/staging/secrets-push.sh platform`. It applies
+   the namespaces `ruum-builds` and `ruum-registry`, the builds admission rules, the registry,
+   the builder's Role and the network policies, and runs `ops/rbac-check.sh live` (now with the
+   builder's lines). Then the live checks:
+   - `deploy/staging/tool.sh bash deploy/staging/ops/build-check.sh`: every line `PASS` (the
+     build pod's shape passes, each broken variant and a Secret are refused).
+   - `deploy/staging/tool.sh kubectl -n ruum-registry rollout status deploy/ruum-registry`.
+   - No anonymous access: `deploy/staging/tool.sh --port 5000 kubectl -n ruum-registry
+     port-forward --address 0.0.0.0 svc/ruum-registry 5000`, and in another shell
+     `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:5000/v2/` answers `401`;
+     with `-u ruum-pull:<STG_REGISTRY_PULL_PASSWORD>` it answers `200`; with the pull user,
+     `curl -s -o /dev/null -w '%{http_code}\n' -X POST -u ruum-pull:<password>
+     http://127.0.0.1:5000/v2/ruum-check/blobs/uploads/` answers `403` (pull may not push).
+     Never paste the passwords into a log.
+5. **The builder** (a card: `charts/ruum/values.yaml` `runtime.builder: true` and
+   `runtime.registry: registry.ruum.internal:5000`, with `runtime.kubernetes: true` of the
+   driver's switch), merged; the platform step from its checkout (as step 8.2 above); then
+   `deploy/staging/deploy.sh <sha>`. Checks:
+   - `deploy/staging/tool.sh kubectl -n ruum logs deploy/ruum-server | grep -E 'node22|build channel|base image'`:
+     per pod `node22 deployments: the Kubernetes builder (card I6-13)` and `build channel (build
+     pods only) listening`, and once `the node22 base image is mirrored into the cluster
+     registry` (or nothing when it is there already; `trying again in a minute` while the
+     registry or Docker Hub is not reachable).
+   - The nodes pull from the registry: `deploy/staging/tool.sh talosctl -n 10.20.1.11 image pull
+     registry.ruum.internal:5000/ruum-base/node22@sha256:12f54cafa58d0e96554ae05871e29663ff7241836377dc9a7916449b8adb062c`
+     succeeds (and for `10.20.1.12`, `10.20.1.13`). If a node's pull is refused by the network
+     policy (its address after the Service hop is not in the node subnet), add that address
+     range to `registry-clients` in a card.
+6. **The smoke app**: sign in at `https://staging.ruum.space` with a test account, ask the platform
+   admin to approve public apps for the test tenant (decision 22), upload the folder
+   `deploy/staging/testapps/node22-smoke` and deploy it (web UI, MCP `createAppDeployment` with
+   `source.kind: folder`, or the CLI); wait for the preview's stages (`build`, `image`, `start`,
+   `check` done), then publish it. Put its host into `secrets.env`:
+   `STG_SMOKE_NODE22_HOST=<app>.<tenant slug>.apps.staging.ruumapps.net`,
+   `STG_SMOKE_NODE22_PUBLIC=1`, `STG_SMOKE_NODE22_BODY=ruum-node22-smoke`.
+7. **The smoke check**: `RUUM_STAGING_SMOKE_NODE22_READY=1 deploy/staging/status.sh --checks`:
+   for that host its own certificate, no HSTS, no Server header, `200` and the text
+   `ruum-node22-smoke` (from the instance in its gVisor pod). The page says `postinstall: yes`
+   (the build ran the install script). Then the first-sandbox checks of step 10 above.
+
+Going back: `runtime.builder: false` and a deploy (node22 manifests are `runtime_not_ready`
+again; running node22 apps keep their images); `registry.enabled: false` removes the registry
+but not its volume.
 
 ### The person, once
 

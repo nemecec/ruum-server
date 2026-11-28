@@ -641,3 +641,47 @@ T-53). It mirrors the base image of the engine's platform from Docker Hub into i
 - The job needs a `package-lock.json` (`npm ci`); without one the build fails with npm's
   message.
 - The `NODE_USE_ENV_PROXY=1` variable makes Node 22 print an "experimental" warning in the log.
+
+## Kubernetes builder (card I6-13)
+
+`builder::kube::KubeBuilder` builds node22 images on a cluster without a Docker engine (Talos):
+the recipe of the Docker builder above as a **gVisor pod** in `ruum-builds`, the same source tar,
+output reader, assembly and push (`builder::prepare`, `builder::assemble`). The module docs of
+`src/builder/kube.rs` list the steps; `deploy/staging/README.md` "node22 apps on staging" the
+staging side.
+
+- **The pod** (`pod_body`): runtime class `gvisor`, the account `ruum-build` (no rights,
+  `automountServiceAccountToken: false`), user 10001, read-only root, `drop: [ALL]`, no
+  privilege escalation, `RuntimeDefault` seccomp, CPU and memory limits (requests = limits),
+  `emptyDir` `/work` and `/tmp` of the build's disk limit, no DNS (`/etc/hosts` line for the
+  egress proxy), `restartPolicy: Never`, `activeDeadlineSeconds` of the build's timeout, the base
+  image `<node registry>/ruum-base/node22@<platform manifest>`. Its fixed program
+  (`BUILD_SCRIPT`, `node -e`) fetches the source and sends the output over the build channel.
+- **The build channel** (served by ruum-server on its own port, `crates/ruum-server/src/build_channel.rs`):
+  `GET /v1/builds/<build>/source` and `PUT /v1/builds/<build>/output`, TLS 1.3 with the
+  supervisor listener's certificate (pinned by the program with `RUUM_BUILD_PIN`), the build's
+  token (SHA-256 compared), the caller's address against the pod's `status.podIP`, the source
+  once, the output once under `output_max` (over it: `413` and the build fails).
+- **API calls** (the Role of `deploy/staging/charts/platform/templates/builder-rbac.yaml`):
+  `POST pods`, `GET pods/<name>` (the phase, the address, waiting reasons), `GET pods/<name>/log`
+  (`limitBytes` 256 KiB, `tailLines` 1000, read under the cap), `DELETE pods/<name>`
+  (`gracePeriodSeconds: 0`), `GET pods?labelSelector=ruum.managed=ruum-builder` (the sweep of
+  pods left by a stopped process, older than two hours).
+- **The ends of a build**: the pod `Succeeded` after its output arrived (assembly and push),
+  `Failed` (`build_failed` with the end of its log, or `build_timed_out` for
+  `DeadlineExceeded`), a waiting reason that never resolves (`ErrImagePull`, `ImagePullBackOff`,
+  `InvalidImageName`, `CreateContainerConfigError`, ...: `unavailable`), the pod gone, the output
+  over the cap or cut. Every end deletes the pod, removes its egress registration and forgets the
+  channel entry; a dropped build does the same in a spawned task.
+- **The base mirror** (`mirror_base`): the platform image of the embedded index from Docker Hub
+  into `ruum-base/node22` of the cluster registry, every blob and the manifest checked against
+  their digests; ruum-server runs it at start until it is there.
+- **Settings** (`KubeBuilderConfig`; ruum-server's `RUUM_BUILDER=kubernetes` and `RUUM_BUILD_*`,
+  `crates/ruum-server/src/config.rs` `BuildSettings`).
+- **Tests**: `src/builder/kube_tests.rs` (a fake API server: the pod's shape, the channel's rules,
+  every end, the cleanup and the sweep) in every `cargo test`; `crates/ruum-server`
+  `build_channel::e2e` with `RUUM_BUILD_SCRIPT_E2E=1` on a host with Docker and runsc: build pods
+  as runsc containers, a `registry:2`, the base mirror, a real build with an install script and a
+  build command, the push, and the built image serving in gVisor.
+- **Known limits**: backlog `docs/backlog/2026-11-28-i613.md` (no internet for builds until
+  S-86; the e2e test is not in CI; manifests are not deleted).
