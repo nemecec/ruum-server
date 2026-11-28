@@ -384,17 +384,25 @@ secret.
      Every request (a token renewal with a cached review too) is within the request bounds:
      per tenant 40 a second with a burst of 120, and all tenants together 400 a second with a
      burst of 800, else `503` (Kimi, run 17, re-check finding 1, backlog I620-17). The tenant is
-     the one of the token's cached review, or of the pod the pre-check last found at the peer's
-     address (kept 10 minutes), so a sandbox that forges tokens pays from its own tenant's share
-     before the pod read.
+     the one of the token's cached review, or of the address: the sweep lists the sandbox pods
+     every `sweep_every` and maps each pod's addresses to its tenant label (a pod being deleted
+     is left out; the map is made again each time, so an address another pod took over follows
+     it), and the pre-check adds the pod it found at the address. So a sandbox that forges
+     tokens, also for pods that do not exist, pays from its own tenant's share before the pod
+     read. A request from an address of no known tenant takes from the unknown addresses' share
+     (100 a second, a burst of 200, within the bound of all), never from the rest of the bound
+     of all (second re-check findings 1 and 2). The driver refuses bounds that cannot serve its
+     instance caps with half again as headroom: a review per sandbox per review lifetime (60 s)
+     and a request per token poll (30 s), per tenant (`max_tenant_instances`) and in all
+     (`max_instances`) (second re-check finding 3).
      First the cheap ones, which cost the API server no `TokenReview` (backlog I620-12): the
      bearer reads (unverified) as a projected token of `system:serviceaccount:ruum-apps:ruum-sandbox`
      for the audience `ruum-supervisor`, unexpired, naming one pod (`kubernetes.io.pod`) by a
      name in the driver's exact form (`ruum-i-<32 hex>-<run>`) and a uid in UUID form (nothing
      else reaches the API path), and that pod exists with that uid at the connection's peer
      address. Then within the review bounds (per peer address 6 a minute, else `429`; per tenant,
-     by the pod's tenant label, 4 a second with a burst of 8, and all peers together 20 a second
-     with a burst of 40, else `503`; a refused request spends none of them): a `TokenReview` with `spec.audiences: ["ruum-supervisor"]`, and its
+     by the pod's tenant label, 16 a second with a burst of 32, and all peers together 128 a
+     second with a burst of 256, else `503`; a refused request spends none of them): a `TokenReview` with `spec.audiences: ["ruum-supervisor"]`, and its
      answer names the same pod and has
      `authenticated: true`, no error, `ruum-supervisor` in `status.audiences`, the user exactly
      `system:serviceaccount:ruum-apps:ruum-sandbox`, and exactly one value in each of the extra
