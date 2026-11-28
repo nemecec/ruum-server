@@ -2185,22 +2185,54 @@ async fn forged_tokens_cost_no_review_and_reviews_are_bounded() {
             "name {name:?} uid {u:?} reached the API"
         );
     }
-    // Claims that name the pod at its address: reviewed (and refused), at most the peer's
-    // bound in a minute, then 429 without a review.
+    // The ghost claim above put `ip` in its quarantine on `d`: the claims of its own pod now get
+    // 429 at once, with no review (Kimi, run 17, third re-check finding 1).
+    assert_eq!(
+        d.supervisor_token(&kube_fake::unsigned_token(&good), ip)
+            .await
+            .unwrap_err(),
+        LaunchRefusal::TooMany
+    );
+    assert_eq!(
+        w.fake.token_reviews(),
+        base,
+        "a quarantined address cost a review"
+    );
+    // Claims that name the pod at its address: reviewed (and refused), exactly the peer's bound
+    // in a minute, then 429 without a review. A process with no quarantine yet (another
+    // replica), so the per-peer bound itself answers (Kimi, run 17, review k17i620g: on `d` the
+    // quarantine answered every claim and the check proved nothing).
+    let mut cfg = w.cfg.clone();
+    cfg.max_instances = 8;
+    cfg.max_tenant_instances = 4;
+    cfg.peer_reviews_per_minute = 3;
+    let p = w.driver_with(
+        cfg,
+        Arc::new(ruum_runtime::kube::ledger::MemoryLedger::new()),
+    );
     let mut answers = Vec::new();
     for _ in 0..6 {
         answers.push(
-            d.supervisor_token(&kube_fake::unsigned_token(&good), ip)
+            p.supervisor_token(&kube_fake::unsigned_token(&good), ip)
                 .await
                 .unwrap_err(),
         );
     }
-    assert!(
-        answers.contains(&LaunchRefusal::TooMany),
-        "no bound per peer: {answers:?}"
+    assert_eq!(
+        answers,
+        [
+            LaunchRefusal::Forbidden,
+            LaunchRefusal::Forbidden,
+            LaunchRefusal::Forbidden,
+            LaunchRefusal::TooMany,
+            LaunchRefusal::TooMany,
+            LaunchRefusal::TooMany,
+        ],
+        "no bound per peer"
     );
-    assert!(
-        w.fake.token_reviews() - base <= 3,
+    assert_eq!(
+        w.fake.token_reviews() - base,
+        3,
         "{} reviews for one peer in a minute",
         w.fake.token_reviews() - base
     );
