@@ -1598,6 +1598,22 @@ pub(crate) async fn approvals_follow_their_rules(h: &dyn Harness) {
         );
         assert!(t1.unwrap().is_some() ^ t2.unwrap().is_some());
     }
+    // A decision racing a take of the same pending request: the decision always lands; the
+    // take succeeds only when it runs after the decision, and then the row is used.
+    let mut raced = new_approval(n, p2.id);
+    raced.changes = serde_json::json!({ "raced": true });
+    let (r, _) = s
+        .request_app_approval(&agent, raced, 50, now)
+        .await
+        .unwrap();
+    let (d, t) = futures::join!(
+        s.decide_approval(&c, n, r.id, decision(true), now),
+        s.take_approval(&agent, n, r.id, p2.id, crate::now()),
+    );
+    d.unwrap();
+    let took = t.unwrap().is_some();
+    let row = s.get_approval(a, n, r.id).await.unwrap().unwrap();
+    assert_eq!(row.status, if took { "used" } else { "approved" });
 }
 
 /// The approval methods of card W-3b read and write only their tenant's rows: tenant B with

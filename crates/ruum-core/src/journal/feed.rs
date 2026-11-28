@@ -138,6 +138,12 @@ pub trait FeedAccess: Send + Sync {
     /// (`TenantStore::manager_since`, decision 0003-1). Only this counts for rule (b) of
     /// decision 0002-6: a member with a lower content role could never restore a node.
     async fn manager_since(&self) -> Result<Option<OffsetDateTime>>;
+    /// Whether the caller holds `edit` on the node now (after the scope). Only the entries of
+    /// publish requests ask it (`app.approval_decided`, card W-3b); the default answers no
+    /// (fail closed).
+    async fn can_edit(&self, _node: NodeId) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// [`FeedAccess`] from the core services: `NodeStore::get` for visibility (with the scope and the
@@ -160,6 +166,16 @@ fn is_hidden(e: &Error) -> bool {
 
 #[async_trait]
 impl FeedAccess for ServicesAccess<'_> {
+    async fn can_edit(&self, node: NodeId) -> Result<bool> {
+        match crate::authz::role_on(&*self.services.authz, &*self.services.nodes, self.ctx, node)
+            .await
+        {
+            Ok(role) => Ok(role.is_some_and(|r| r >= crate::authz::Role::Edit)),
+            Err(e) if is_hidden(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn can_view(&self, node: NodeId) -> Result<bool> {
         // `NodeStore::get` checks `view` with the scope, and the trash rule of the nodes area: a
         // trashed node has left the tree, and only those who may restore it (`manage`) still
@@ -652,6 +668,14 @@ impl Memo<'_> {
             EventType::NodePurged => false,
             _ => self.can_view(node).await?,
         };
+        // A decided publish request reaches only those who read publish requests: `edit` on
+        // the app, and an agent only for its own request (review R14, card W-3b).
+        if entry.event == EventType::AppApprovalDecided {
+            let own = self.ctx.actor.is_user()
+                || entry.data["agent_id"].as_str()
+                    == Some(self.ctx.actor.actor.id.to_string().as_str());
+            return Ok(now && own && self.access.can_edit(node).await?);
+        }
         let old_parent = self.old_parent(entry).await?;
         let before_place = self.can_view_opt(old_parent).await?;
         let mut before = before_place;
