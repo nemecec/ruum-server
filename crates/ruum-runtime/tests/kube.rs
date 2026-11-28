@@ -2841,7 +2841,13 @@ async fn a_pod_that_its_seal_does_not_name_is_ended() {
     w.fake.skip_launch_once.store(true, Ordering::SeqCst);
     assert_eq!(w.create_pod(&copy).await, 201);
     wait_pod_ip(&w, &again_pod).await;
-    w.change_record(again.id, age).await;
+    // Its start time moved a day into the future by the same writer (Kimi re-check of I620-R):
+    // the run counts as old, not as just started.
+    w.change_record(again.id, |r| {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() * 1000;
+        r["run_started_ms"] = serde_json::json!(now + 86_400_000);
+    })
+    .await;
     // A record without its first seal (a crash between the pod and the seal).
     let crash_id = identity();
     w.fake.skip_launch_once.store(true, Ordering::SeqCst);
@@ -2972,6 +2978,43 @@ async fn a_record_too_large_for_its_config_map_is_refused_at_start() {
     assert_eq!(
         wait_launched(&w, &ruum_runtime::kube::pod_name(s.id, 1)).await,
         200
+    );
+}
+
+/// Backlog I620-14 and the Kimi re-check of I620-R: a rotation that would grow the seal past what
+/// one ConfigMap holds is refused with the clear error, and the instance can still be stopped
+/// (the plain writes after a seal keep their room).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rotation_past_the_config_map_is_refused_and_the_run_still_stops() {
+    let w = world(false).await;
+    let d = w.quiet_driver();
+    let id = identity();
+    let mut spec = w.service(id, None);
+    // 120 KiB of control characters: about 960 KiB once escaped and sealed, within the cap.
+    spec.env = (0..8)
+        .map(|i| EnvVar::secret(format!("K{i}"), SecretValue::new("\u{1}".repeat(15 * 1024))))
+        .collect();
+    let s = d.start(spec).await.expect("start within the cap");
+    let mut refused = None;
+    for i in 0..15 {
+        let token = format!("{i:02}{}", "t".repeat(16 * 1024 - 2));
+        if let Err(e) = d
+            .rotate_token(id.tenant, s.id, SecretValue::new(token))
+            .await
+        {
+            refused = Some(e);
+            break;
+        }
+    }
+    let err = refused.expect("a rotation past the cap was taken");
+    assert!(
+        matches!(&err, RuntimeError::InvalidSpec { reason, .. } if reason.contains("ConfigMap")),
+        "{err:?}"
+    );
+    d.stop(id.tenant, s.id).await.expect("the stop");
+    assert_eq!(
+        d.status(id.tenant, s.id).await.unwrap().state,
+        InstanceState::Stopped
     );
 }
 
