@@ -2962,6 +2962,9 @@ async fn a_run_that_stays_starting_ends_at_the_start_deadline() {
             r["run_started_ms"] = serde_json::json!(now - secs * 1000);
         }
     };
+    // A pod whose creationTimestamp reads old (an API server clock behind the server's) does not
+    // move the deadline: it counts from the record's start (Kimi re-check 3 of I620-R).
+    w.fake.backdate_pod(NS, &pod_n, 3600);
     w.change_record(s.id, back(300)).await;
     assert_eq!(
         d.status(id.tenant, s.id).await.unwrap().state,

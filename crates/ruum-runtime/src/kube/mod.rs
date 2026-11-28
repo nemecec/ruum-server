@@ -1468,12 +1468,17 @@ impl Inner {
                     .map_or(i64::MIN, |t| {
                         now.saturating_sub((t.unix_timestamp_nanos() / 1_000_000) as i64)
                     });
+                // The seal check takes the larger age (a pod the seal does not name gets no
+                // launch, so ending it early harms nothing); the start deadline, which ends
+                // sealed runs too, takes the record's own age, so a lagging API server clock
+                // cannot end a legitimate start early (Kimi re-check 3 of I620-R).
                 let age = rec_age.max(pod_age);
                 let why = if age > ms(START_GRACE) && !self.run_sealed(&cm, &rec, p) {
                     Some(
                         "a sandbox pod that its run's seal does not name (a crash between its create and its seal, or a pod made again) is ended (backlog I620-8)",
                     )
-                } else if rec.state == InstanceState::Starting && age > ms(self.cfg.start_deadline)
+                } else if rec.state == InstanceState::Starting
+                    && rec_age > ms(self.cfg.start_deadline)
                 {
                     Some(
                         "a run that stayed starting past the start deadline is ended (backlog I6-21)",
