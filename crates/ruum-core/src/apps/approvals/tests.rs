@@ -878,6 +878,62 @@ async fn an_approval_for_another_archive_manifest_or_bindings_is_refused() {
     };
 }
 
+/// A binding that keeps its name but changes its target shows as removed and added again, and
+/// a later change of the live binding's target makes the approval stale (Kimi W-3b, 1).
+#[tokio::test]
+async fn a_changed_binding_target_is_shown_and_binds_the_approval() {
+    let w = world().await;
+    let app = w.app("Bound targets").await;
+    let (a, b, c) = (
+        w.node(w.folder, "A", NodeKind::Folder).await,
+        w.node(w.folder, "B", NodeKind::Folder).await,
+        w.node(w.folder, "C", NodeKind::Folder).await,
+    );
+    let bound = |name: &str, target: NodeId| {
+        let manifest = format!(
+            "runtime: static\nbindings:\n  docs:\n    node: \"node:{target}\"\n    role: view\n"
+        );
+        let w = &w;
+        let name = name.to_string();
+        async move {
+            w.site(
+                &name,
+                &[("app.yaml", manifest.as_bytes()), ("index.html", INDEX)],
+            )
+            .await
+        }
+    };
+    let site_a = bound("to a", a).await;
+    let site_b = bound("to b", b).await;
+    let site_c = bound("to c", c).await;
+    let first = w.preview(&w.o(), app, site_a).await;
+    let Published::Live(_) = w.publish(&w.o(), app, first, None).await.unwrap() else {
+        panic!("live");
+    };
+    let agent = w.agent(w.editor).await;
+    let dep = w.preview(&agent, app, site_b).await;
+    let id = w.ask(&agent, app, dep).await;
+    let changes = w.row(app, id).await.changes;
+    assert_eq!(changes["bindings_removed"], json!(["docs"]), "{changes}");
+    assert!(
+        changes["bindings_added"]
+            .to_string()
+            .contains(&b.to_string()),
+        "{changes}"
+    );
+    w.decide(&w.o(), app, id, json!({ "decision": "approve" }))
+        .await
+        .unwrap();
+    // The live binding moves from A to C: the same names, another live target.
+    let third = w.preview(&w.o(), app, site_c).await;
+    let Published::Live(live) = w.publish(&w.o(), app, third, None).await.unwrap() else {
+        panic!("live");
+    };
+    let e = w.publish(&agent, app, dep, Some(id)).await.unwrap_err();
+    assert_eq!(hint(&e).as_deref(), Some("approval_stale"));
+    assert_eq!(w.live(app).await, Some(live.id));
+}
+
 #[tokio::test]
 async fn a_persons_publish_ignores_approval_id() {
     let w = world().await;
@@ -940,6 +996,20 @@ async fn who_decides_and_with_which_rights() {
             .unwrap_err();
         assert_eq!(e.http_status(), 403, "{d}");
     }
+    // Classes from someone who may not decide: 403 whether the column is planned or not, so
+    // no one learns the planned columns of a request (Kimi W-3b, 4).
+    let e = w
+        .decide(
+            &w.e(),
+            app,
+            id,
+            json!({ "decision": "approve", "classes": [{
+                "database_id": Uuid::now_v7(), "schema": "public", "table": "plants",
+                "column": "owner_email", "class": "personal" }] }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.http_status(), 403);
     // The body: a long comment, classes for a column that is not planned, lists with a deny.
     let e = w
         .decide(
@@ -1244,8 +1314,10 @@ async fn the_decider_needs_manage_on_every_listed_database_and_the_publish_gets_
             .approved_migrations(&agent, app, only_mine)
             .await
             .unwrap();
+    assert_eq!(got.approval_id, only_mine);
+    assert_eq!(got.decided_by, w.editor);
     assert_eq!(
-        got,
+        got.databases,
         vec![ApprovedDatabase {
             database_id: mine,
             migrations: vec![ApprovedMigration {

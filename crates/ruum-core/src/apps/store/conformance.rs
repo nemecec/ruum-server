@@ -1550,6 +1550,54 @@ pub(crate) async fn approvals_follow_their_rules(h: &dyn Harness) {
             .http_status(),
         409
     );
+    // At the same time: two equal requests make one row, two decisions decide once, two takes
+    // take once (Kimi W-3b, 6; the Postgres run makes these real races).
+    let p2 = s
+        .insert_deployment(
+            &c,
+            deployment(n, Environment::Preview, DeploymentState::Ready),
+        )
+        .await
+        .unwrap();
+    let now = crate::now();
+    let (x, y) = futures::join!(
+        s.request_app_approval(&agent, new_approval(n, p2.id), 50, now),
+        s.request_app_approval(&agent, new_approval(n, p2.id), 50, now),
+    );
+    let (x, y) = (x.unwrap(), y.unwrap());
+    assert_eq!(x.0.id, y.0.id);
+    assert!(x.1 ^ y.1, "exactly one request makes the row");
+    let (d1, d2) = futures::join!(
+        s.decide_approval(&c, n, x.0.id, decision(true), now),
+        s.decide_approval(&c, n, x.0.id, decision(false), now),
+    );
+    assert!(
+        d1.is_ok() ^ d2.is_ok(),
+        "exactly one decision: {d1:?} {d2:?}"
+    );
+    if d1.is_err() {
+        // The deny won; approve a fresh request for the takes.
+        let mut fresh = new_approval(n, p2.id);
+        fresh.changes = serde_json::json!({ "fresh": true });
+        let (r, _) = s
+            .request_app_approval(&agent, fresh, 50, now)
+            .await
+            .unwrap();
+        s.decide_approval(&c, n, r.id, decision(true), now)
+            .await
+            .unwrap();
+        let (t1, t2) = futures::join!(
+            s.take_approval(&agent, n, r.id, p2.id, crate::now()),
+            s.take_approval(&agent, n, r.id, p2.id, crate::now()),
+        );
+        assert!(t1.unwrap().is_some() ^ t2.unwrap().is_some());
+    } else {
+        let (t1, t2) = futures::join!(
+            s.take_approval(&agent, n, x.0.id, p2.id, crate::now()),
+            s.take_approval(&agent, n, x.0.id, p2.id, crate::now()),
+        );
+        assert!(t1.unwrap().is_some() ^ t2.unwrap().is_some());
+    }
 }
 
 /// The approval methods of card W-3b read and write only their tenant's rows: tenant B with
