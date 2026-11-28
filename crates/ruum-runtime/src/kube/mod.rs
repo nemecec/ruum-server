@@ -99,10 +99,21 @@ const PEER_QUARANTINE: Duration = Duration::from_secs(30);
 /// for 60 s while the seal of its run is written).
 const LAUNCH_WINDOW_SECS: i64 = 120;
 
-/// The most bytes of an instance record's text (backlog I620-14): the API server refuses a
-/// ConfigMap whose data takes more than 1 MiB, and the record shares its ConfigMap with its seal.
-/// A kibibyte stays free for the key name.
-const MAX_RECORD_BYTES: usize = 1024 * 1024 - 1024;
+/// The most bytes of an instance record's text after a write that grows its seal (backlog
+/// I620-14): the API server refuses a ConfigMap whose data takes more than 1 MiB, and the record
+/// shares its ConfigMap with its seal. A kibibyte stays free for the key name and four for the
+/// plain writes that follow without a check (a state change, `ended_ms`, a registration's pod
+/// name), so a record that took its seal can always be ended (Kimi re-check of I620-R).
+const MAX_RECORD_BYTES: usize = 1024 * 1024 - 1024 - 4096;
+
+/// Checks the size of a record whose seal grows (the first seal, a rotation, a launch).
+fn check_record_size(rec: &Record) -> Result<(), RuntimeError> {
+    let bytes = serde_json::to_string(rec).map_or(usize::MAX, |t| t.len());
+    if bytes > MAX_RECORD_BYTES {
+        return Err(record_too_large(bytes));
+    }
+    Ok(())
+}
 
 /// The error of a record that does not fit its ConfigMap (backlog I620-14).
 fn record_too_large(bytes: usize) -> RuntimeError {
@@ -1085,11 +1096,6 @@ impl Inner {
 
     /// Replaces the record if nobody changed it since `rv`. `Ok(false)`: somebody did.
     async fn put(&self, rec: &Record, rv: &str) -> Result<bool, RuntimeError> {
-        // A clear error before the API server's (backlog I620-14).
-        let bytes = serde_json::to_string(rec).map_or(0, |t| t.len());
-        if bytes > MAX_RECORD_BYTES {
-            return Err(record_too_large(bytes));
-        }
         match self
             .api
             .replace(
@@ -1320,6 +1326,8 @@ impl Inner {
                 seal::seal(self.key(), &object_name(id), &uid, &s)
                     .map_err(|reason| RuntimeError::Internal { reason })?,
             );
+            // A clear error before the API server's (backlog I620-14).
+            check_record_size(&rec)?;
             if self.put(&rec, &rv).await? {
                 // The new mark at the ledger; a higher one there means another process wrote
                 // after this write, which is fine (this seal is no longer the newest). The
@@ -1441,7 +1449,13 @@ impl Inner {
                     Some(PodView::Pending { broken: false }) | Some(PodView::Running { .. })
                 )
             {
-                let age = now - rec.run_started_ms;
+                // A start time in the future (beyond a minute of clock skew) is one a writer of
+                // ConfigMaps set: such a run counts as old (Kimi re-check of I620-R).
+                let age = if rec.run_started_ms > now.saturating_add(ms(START_GRACE)) {
+                    i64::MAX
+                } else {
+                    now.saturating_sub(rec.run_started_ms)
+                };
                 let why = if age > ms(START_GRACE) && !self.run_sealed(&cm, &rec, p) {
                     Some(
                         "a sandbox pod that its run's seal does not name (a crash between its create and its seal, or a pod made again) is ended (backlog I620-8)",
@@ -2672,9 +2686,8 @@ impl Inner {
             rec.sealed = Some(text);
             // The size check of every record write (backlog I620-14; Kimi review of I620-R,
             // finding 3): refused before the write, so the claim is released.
-            let bytes = serde_json::to_string(&rec).map_or(usize::MAX, |t| t.len());
-            if bytes > MAX_RECORD_BYTES {
-                tracing::warn!(target: "ruum::runtime", pod = %pod_n, bytes, "a launch would make the instance record larger than its ConfigMap holds; refused");
+            if check_record_size(&rec).is_err() {
+                tracing::warn!(target: "ruum::runtime", pod = %pod_n, "a launch would make the instance record larger than its ConfigMap holds; refused");
                 return Err(LaunchRefusal::Forbidden);
             }
             let body = pod::record_body(&self.cfg, &rec, Some(rv.as_str()));
@@ -3135,10 +3148,7 @@ impl RuntimeDriver for KubeDriver {
                 seal::seal(inner.key(), &name, &uuid::Uuid::nil().to_string(), &largest)
                     .map_err(|reason| RuntimeError::Internal { reason })?,
             );
-            let bytes = serde_json::to_string(&probe).map_or(usize::MAX, |t| t.len());
-            if bytes > MAX_RECORD_BYTES {
-                return Err(record_too_large(bytes));
-            }
+            check_record_size(&probe)?;
         }
         let base: Vec<String> = spec
             .redacted_values()
