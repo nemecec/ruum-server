@@ -1001,7 +1001,7 @@ async fn an_agent_publishes_through_a_person_and_cannot_restore() {
             .starts_with("https://ruum.test/")
     );
     assert_eq!(w.live(app).await, None);
-    // A call with an approval is refused until card W-3b (fail closed).
+    // An approval ID that does not exist is `approval_stale` (card W-3b), and nothing goes live.
     let e =
         w.s.apps
             .publish_deployment(
