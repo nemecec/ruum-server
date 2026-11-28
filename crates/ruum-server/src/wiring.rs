@@ -286,7 +286,27 @@ pub fn install_apps(
     }
     ruum_core::apps::install(services, parts).context("set up the apps area")?;
     if let Some(k) = kube {
-        services.sandboxes = Some(Arc::new(sandbox_directory(services, k)));
+        // node22 deployments (card I6-13): only with the Kubernetes builder, whose images the
+        // driver runs from the same registry.
+        if let Some(b) = BUILDER.get() {
+            services
+                .apps
+                .set_node22(ruum_core::apps::deployments::node22::Node22 {
+                    builder: b.builder.clone(),
+                    settings: Default::default(),
+                    tokens: services.workload_tokens.clone(),
+                });
+            if services.workload_tokens.is_none() {
+                tracing::warn!(
+                    "node22 deployments without a workload key: each instance gets a random workload token, which the runtime API refuses"
+                );
+            }
+            tokio::spawn(sweep_builds(b.builder.clone()));
+            tracing::info!("node22 deployments: the Kubernetes builder (card I6-13)");
+        }
+        services.sandboxes = Some(Arc::new(
+            sandbox_directory(services, k).with_spec_maker(services.apps.spec_maker()),
+        ));
     }
     tokio::spawn(services.apps.clone().run_sweeper(PREVIEW_SWEEP_EVERY));
     Ok(())
@@ -389,7 +409,7 @@ pub fn kube_driver(
     )?;
     let driver = Arc::new(ruum_runtime::KubeDriver::with_ledger(
         cfg,
-        egress,
+        egress.clone(),
         Arc::new(UnmeteredUsage),
         Arc::new(crate::seal_ledger::PgSealLedger::new(pool)),
     )?);
@@ -398,6 +418,64 @@ pub fn kube_driver(
         runtime_class = %k.runtime_class,
         "runtime driver: Kubernetes (backlog I6-1)"
     );
+    // The node22 builder on Kubernetes (card I6-13), with the build channel of this process.
+    if let Some(b) = &k.builder {
+        let key = cfg_record_key(&key)?;
+        let identity = ruum_runtime::kube::tls::SupervisorTls::derive(&key)
+            .map_err(|e| anyhow::anyhow!("the build channel's TLS: {e}"))?;
+        let password = std::fs::read_to_string(&b.push_password_file)
+            .with_context(|| format!("cannot read {}", b.push_password_file.display()))?;
+        let mut bc = ruum_runtime::builder::kube::KubeBuilderConfig::new(
+            &k.api_url,
+            k.registry.as_deref().unwrap_or_default(),
+            &b.registry_url,
+            &b.channel_service.0,
+            b.channel_service.1,
+            ruum_runtime::builder::kube::ChannelTls {
+                cert_der: identity.cert_der.clone(),
+                pin: identity.pin.clone(),
+            },
+        );
+        bc.token_file = k.token_file.clone();
+        bc.ca_file = k.ca_file.clone();
+        bc.namespace = b.namespace.clone();
+        bc.runtime_class = k.runtime_class.clone();
+        bc.node_arch = k.node_arch.clone();
+        bc.credential = Some(ruum_runtime::RegistryCredential {
+            username: b.push_user.clone(),
+            password: SecretValue::new(password.trim_end_matches(['\r', '\n'])),
+        });
+        if let Some(n) = b.output_max {
+            bc.output_max = n;
+        }
+        if let Some(n) = b.max_parallel {
+            bc.max_parallel = n;
+            bc.per_tenant = bc.per_tenant.min(n);
+        }
+        if let Some(n) = b.tenant_max {
+            bc.per_tenant = n;
+        }
+        if let Some((host, port)) = &k.egress_proxy {
+            bc.egress_proxy = Some(SharedService {
+                address: host.clone(),
+                alias: "ruum-egress".to_owned(),
+                port: *port,
+            });
+        }
+        let builder = Arc::new(
+            ruum_runtime::builder::kube::KubeBuilder::new(
+                bc,
+                Arc::new(UnmeteredUsage),
+                egress.clone(),
+            )
+            .map_err(|e| anyhow::anyhow!("the Kubernetes builder: {e}"))?,
+        );
+        let _ = BUILDER.set(BuildChannel {
+            builder,
+            listen: b.channel_listen,
+            tls: crate::supervisor::tls_acceptor(&identity)?,
+        });
+    }
     // The supervisor listener of this process serves this driver (main.rs starts it).
     let _ = SUPERVISOR.set(Supervisor {
         driver: driver.clone(),
@@ -417,6 +495,43 @@ pub struct Supervisor {
 
 /// Set once by [`kube_driver`]; `main` serves [`crate::supervisor::router`] on it.
 pub static SUPERVISOR: std::sync::OnceLock<Supervisor> = std::sync::OnceLock::new();
+
+/// The Kubernetes builder (card I6-13), the address of its build channel and the channel's TLS
+/// acceptor (the supervisor listener's identity).
+pub struct BuildChannel {
+    pub builder: Arc<ruum_runtime::builder::kube::KubeBuilder>,
+    pub listen: std::net::SocketAddr,
+    pub tls: tokio_rustls::TlsAcceptor,
+}
+
+/// Set once by [`kube_driver`] with `RUUM_BUILDER=kubernetes`; `main` serves
+/// [`crate::build_channel::router`] on it.
+pub static BUILDER: std::sync::OnceLock<BuildChannel> = std::sync::OnceLock::new();
+
+/// How often the build pods that a stopped server process left behind are deleted, and how
+/// old they must be (longer than any build's timeout).
+const BUILD_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+const BUILD_SWEEP_AGE: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
+
+async fn sweep_builds(builder: Arc<ruum_runtime::builder::kube::KubeBuilder>) {
+    let mut every = tokio::time::interval(BUILD_SWEEP_EVERY);
+    loop {
+        every.tick().await;
+        match builder.sweep(BUILD_SWEEP_AGE).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(target: "ruum::runtime", deleted = n, "old build pods deleted"),
+            Err(e) => {
+                tracing::warn!(target: "ruum::runtime", code = e.code(), "the sweep of build pods failed")
+            }
+        }
+    }
+}
+
+/// The record key of the driver's settings (the build channel derives its TLS identity from it).
+fn cfg_record_key(hex: &str) -> anyhow::Result<ruum_runtime::kube::RecordKey> {
+    ruum_runtime::kube::RecordKey::from_hex(hex)
+        .map_err(|e| anyhow::anyhow!("RUUM_KUBE_RECORD_KEY_FILE: {e}"))
+}
 
 /// The sandbox directory over the Kubernetes driver: the gateway reaches a running pod at its
 /// address and the service port (the driver's last status of it). No spec maker yet: nothing

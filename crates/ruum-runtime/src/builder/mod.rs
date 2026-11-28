@@ -34,6 +34,7 @@
 //! layer must not hold one.
 
 pub mod job;
+pub mod kube;
 pub mod oci;
 pub mod output;
 pub mod registry;
@@ -458,9 +459,9 @@ impl Drop for Finish {
 }
 
 /// What the build has ready when its timeout ends: the push and the manifest to commit.
-struct Ready {
-    push: registry::RepositoryPush,
-    manifest: Bytes,
+pub(crate) struct Ready {
+    pub(crate) push: registry::RepositoryPush,
+    pub(crate) manifest: Bytes,
 }
 
 impl DockerBuilder {
@@ -620,38 +621,7 @@ impl DockerBuilder {
         trace: &Trace,
         log: &Mutex<job::LogTail>,
     ) -> Result<Ready, RuntimeError> {
-        let limits = archive::Limits {
-            max_total_bytes: self.cfg.output_max.min(input.limits.disk_bytes),
-            max_entry_bytes: self.cfg.output_max.min(input.limits.disk_bytes),
-            max_files: 100_000,
-            max_ratio: 200,
-        };
-        // Unpacking and the source tar are CPU work over up to the archive limit: off the async
-        // workers, so the build's timeout still ends the build.
-        let archive_bytes = input.archive.clone();
-        let bounds = SourceBounds {
-            names: MAX_SOURCE_NAME_TOTAL_BYTES,
-            entries: MAX_SOURCE_ENTRIES,
-            bytes: self.cfg.output_max,
-        };
-        let (recipe, source) = blocking(move || {
-            let files = archive::unpack(&archive_bytes, &limits).map_err(|r| match r {
-                archive::Refusal::Hostile { entry, reason } => failed(format!(
-                    "the archive entry {:?} is refused: {reason}",
-                    entry.escape_debug().take(200).collect::<String>()
-                )),
-                archive::Refusal::Corrupt { reason } => {
-                    failed(format!("the archive cannot be read: {reason}"))
-                }
-                archive::Refusal::Limit { what, limit } => {
-                    failed(format!("the archive is over the limit of {what} ({limit})"))
-                }
-            })?;
-            let recipe = read_manifest(&files).map_err(failed)?;
-            let source = source_tar(&files, bounds).map_err(failed)?;
-            Ok::<_, RuntimeError>((recipe, source))
-        })
-        .await??;
+        let (recipe, source) = prepare(input, self.cfg.output_max).await?;
         self.ensure_base().await?;
         let network = job::create_network(
             &self.docker,
@@ -693,63 +663,147 @@ impl DockerBuilder {
         // The job's work is done: free its sandbox before the assembly (the network's ID stays
         // in the trace when its unregistration failed: the final cleanup tries again).
         cleanup(&self.docker, &self.cfg, self.egress.as_ref(), build, trace).await;
-        // Reading the output and making the layer are CPU work over up to the output cap: off
-        // the async workers, so the build's timeout still ends the build.
-        let cap = self.cfg.output_max;
-        let out = blocking(move || output::read_output(output, cap))
-            .await?
-            .map_err(|e| failed(format!("the build's output is refused: {e}")))?;
-        {
-            let mut l = log.lock().unwrap_or_else(|p| p.into_inner());
-            for (name, why) in out.dropped.iter().take(100) {
-                l.note(&format!(
-                    "ruum-build: dropped output entry \"{name}\": {why}"
-                ));
-            }
-            if out.dropped_total > 100 {
-                l.note(&format!(
-                    "ruum-build: dropped {} more output entries",
-                    out.dropped_total - 100
-                ));
-            }
-        }
-        let push = registry::RepositoryPush::new(
-            &self.cfg.docker.registry_url,
-            repository(&input.identity),
-            self.cfg.base_repository.clone(),
-            self.cfg.credential.clone(),
-            self.cfg.token_realm.as_deref(),
-        )?;
-        let (_, base_manifest) = push.base_manifest(&self.base_manifest).await?;
-        let base = oci::parse_manifest(&base_manifest)?;
-        let base_config = push
-            .base_blob(&OciDigest::parse(&base.config.digest)?)
-            .await?;
-        let layer = blocking(move || oci::build_layer(&out.entries, cap))
-            .await?
-            .map_err(|e| failed(format!("the build's output is refused: {e}")))?;
-        let mut labels: BTreeMap<String, String> = self.cfg.docker.extra_labels.clone();
-        labels.insert(
-            crate::LABEL_APP.to_owned(),
-            input.identity.app.0.to_string(),
-        );
-        labels.insert(
-            crate::LABEL_TENANT.to_owned(),
-            input.identity.tenant.0.to_string(),
-        );
-        labels.insert(LABEL_BUILD.to_owned(), build.to_string());
-        labels.insert(crate::LABEL_MANAGED.to_owned(), MANAGED_BY.to_owned());
-        let config = oci::image_config(&base_config, &layer, &recipe.start, &labels)?;
-        let manifest = oci::image_manifest(&base.layers, &config, &layer);
-        for d in &base.layers {
-            push.bring_base_blob(&OciDigest::parse(&d.digest)?, d.size)
-                .await?;
-        }
-        push.push_blob(&layer.digest, layer.gz.clone()).await?;
-        push.push_blob(&OciDigest::of(&config), config.clone())
-            .await?;
-        Ok(Ready { push, manifest })
+        assemble(
+            &Assembly {
+                registry_url: &self.cfg.docker.registry_url,
+                base_repository: &self.cfg.base_repository,
+                base_manifest: &self.base_manifest,
+                credential: self.cfg.credential.clone(),
+                token_realm: self.cfg.token_realm.as_deref(),
+                extra_labels: &self.cfg.docker.extra_labels,
+                output_max: self.cfg.output_max,
+            },
+            input,
+            build,
+            &recipe,
+            output,
+            log,
+        )
+        .await
     }
+}
+
+/// The checked archive of a build, off the async workers: the recipe of `app.yaml` and the
+/// source tar the job unpacks (both builders, card R-2b and card I6-13).
+pub(crate) async fn prepare(
+    input: &BuildInput,
+    output_max: u64,
+) -> Result<(Recipe, Bytes), RuntimeError> {
+    let limits = archive::Limits {
+        max_total_bytes: output_max.min(input.limits.disk_bytes),
+        max_entry_bytes: output_max.min(input.limits.disk_bytes),
+        max_files: 100_000,
+        max_ratio: 200,
+    };
+    // Unpacking and the source tar are CPU work over up to the archive limit: off the async
+    // workers, so the build's timeout still ends the build.
+    let archive_bytes = input.archive.clone();
+    let bounds = SourceBounds {
+        names: MAX_SOURCE_NAME_TOTAL_BYTES,
+        entries: MAX_SOURCE_ENTRIES,
+        bytes: output_max,
+    };
+    let (recipe, source) = blocking(move || {
+        let files = archive::unpack(&archive_bytes, &limits).map_err(|r| match r {
+            archive::Refusal::Hostile { entry, reason } => failed(format!(
+                "the archive entry {:?} is refused: {reason}",
+                entry.escape_debug().take(200).collect::<String>()
+            )),
+            archive::Refusal::Corrupt { reason } => {
+                failed(format!("the archive cannot be read: {reason}"))
+            }
+            archive::Refusal::Limit { what, limit } => {
+                failed(format!("the archive is over the limit of {what} ({limit})"))
+            }
+        })?;
+        let recipe = read_manifest(&files).map_err(failed)?;
+        let source = source_tar(&files, bounds).map_err(failed)?;
+        Ok::<_, RuntimeError>((recipe, source))
+    })
+    .await??;
+    Ok((recipe, source))
+}
+
+/// Where an assembled image goes and how it is labelled ([`assemble`]).
+pub(crate) struct Assembly<'a> {
+    pub registry_url: &'a str,
+    pub base_repository: &'a str,
+    /// The base image's manifest for the platform of the nodes.
+    pub base_manifest: &'a OciDigest,
+    pub credential: Option<RegistryCredential>,
+    pub token_realm: Option<&'a str>,
+    pub extra_labels: &'a BTreeMap<String, String>,
+    pub output_max: u64,
+}
+
+/// The build's output tar to a pushed image, up to its manifest (the commit point, which the
+/// caller pushes outside the build's timeout): the output read under its cap
+/// ([`output::read_output`]), the layer, the config and the blobs pushed to the build's own
+/// repository only (both builders, card R-2b and card I6-13).
+pub(crate) async fn assemble(
+    a: &Assembly<'_>,
+    input: &BuildInput,
+    build: uuid::Uuid,
+    recipe: &Recipe,
+    output: Bytes,
+    log: &Mutex<job::LogTail>,
+) -> Result<Ready, RuntimeError> {
+    // Reading the output and making the layer are CPU work over up to the output cap: off
+    // the async workers, so the build's timeout still ends the build.
+    let cap = a.output_max;
+    let out = blocking(move || output::read_output(output, cap))
+        .await?
+        .map_err(|e| failed(format!("the build's output is refused: {e}")))?;
+    {
+        let mut l = log.lock().unwrap_or_else(|p| p.into_inner());
+        for (name, why) in out.dropped.iter().take(100) {
+            l.note(&format!(
+                "ruum-build: dropped output entry \"{name}\": {why}"
+            ));
+        }
+        if out.dropped_total > 100 {
+            l.note(&format!(
+                "ruum-build: dropped {} more output entries",
+                out.dropped_total - 100
+            ));
+        }
+    }
+    let push = registry::RepositoryPush::new(
+        a.registry_url,
+        repository(&input.identity),
+        a.base_repository.to_owned(),
+        a.credential.clone(),
+        a.token_realm,
+    )?;
+    let (_, base_manifest) = push.base_manifest(a.base_manifest).await?;
+    let base = oci::parse_manifest(&base_manifest)?;
+    let base_config = push
+        .base_blob(&OciDigest::parse(&base.config.digest)?)
+        .await?;
+    let layer = blocking(move || oci::build_layer(&out.entries, cap))
+        .await?
+        .map_err(|e| failed(format!("the build's output is refused: {e}")))?;
+    let mut labels: BTreeMap<String, String> = a.extra_labels.clone();
+    labels.insert(
+        crate::LABEL_APP.to_owned(),
+        input.identity.app.0.to_string(),
+    );
+    labels.insert(
+        crate::LABEL_TENANT.to_owned(),
+        input.identity.tenant.0.to_string(),
+    );
+    labels.insert(LABEL_BUILD.to_owned(), build.to_string());
+    labels.insert(crate::LABEL_MANAGED.to_owned(), MANAGED_BY.to_owned());
+    let config = oci::image_config(&base_config, &layer, &recipe.start, &labels)?;
+    let manifest = oci::image_manifest(&base.layers, &config, &layer);
+    for d in &base.layers {
+        push.bring_base_blob(&OciDigest::parse(&d.digest)?, d.size)
+            .await?;
+    }
+    push.push_blob(&layer.digest, layer.gz.clone()).await?;
+    push.push_blob(&OciDigest::of(&config), config.clone())
+        .await?;
+    Ok(Ready { push, manifest })
 }
 
 /// Runs CPU work on the blocking pool.
