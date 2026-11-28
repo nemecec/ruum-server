@@ -2799,6 +2799,207 @@ fn the_launch_channel_is_tls_with_the_pin_or_refused() {
 /// `crates/ruum-server` `wiring.rs`): the namespace, the runtime class and its overhead, the
 /// egress proxy, the supervisor listener with TLS. The image digest is a placeholder (a dry run pulls
 /// nothing).
+/// Backlog I620-16: a writer of ConfigMaps changes a new record between its create and its first
+/// seal (here its limits, or the record made again under another uid). The first seal binds the
+/// record as the server made it, so the start fails, the pod goes and nothing is sealed; the
+/// control start without the change runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_seal_binds_the_record_as_made() {
+    let w = world(false).await;
+    let d = w.quiet_driver();
+    type Edit = Box<dyn FnOnce(&mut serde_json::Value) + Send>;
+    let edits: Vec<(&str, Edit)> = vec![
+        (
+            "forged limits",
+            Box::new(|cm| {
+                let mut rec: serde_json::Value =
+                    serde_json::from_str(cm["data"]["record"].as_str().unwrap()).unwrap();
+                rec["limits"]["memory_bytes"] = serde_json::json!(8u64 << 30);
+                cm["data"]["record"] = serde_json::json!(rec.to_string());
+            }),
+        ),
+        (
+            "a record made again",
+            Box::new(|cm| {
+                cm["metadata"]["uid"] = serde_json::json!(uuid::Uuid::now_v7().to_string());
+            }),
+        ),
+    ];
+    for (what, edit) in edits {
+        *w.fake.edit_created_config_map_once.lock().unwrap() = Some(edit);
+        let pods_before = w.fake.pods().len();
+        let err = d.start(w.service(identity(), None)).await.unwrap_err();
+        assert!(
+            matches!(&err, RuntimeError::Internal { reason } if reason.contains("first seal")),
+            "{what}: {err:?}"
+        );
+        assert_eq!(w.fake.pods().len(), pods_before, "{what}: a pod stayed");
+        assert!(
+            w.fake.config_maps().iter().all(|cm| !cm["data"]["record"]
+                .as_str()
+                .is_some_and(|t| t.contains("\"sealed\":\"v1."))),
+            "{what}: a forged record was sealed"
+        );
+    }
+    let s = d
+        .start(w.service(identity(), None))
+        .await
+        .expect("the control");
+    let pod_n = ruum_runtime::kube::pod_name(s.id, 1);
+    assert_eq!(wait_launched(&w, &pod_n).await, 200);
+}
+
+/// Backlog I620-8: past the start grace, a pod that its run's seal does not name ends the run as
+/// killed and goes: a pod made again under the run's name (another uid), and a record that a
+/// crash left without its first seal. An honest run of the same age keeps running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pod_that_its_seal_does_not_name_is_ended() {
+    let w = world(false).await;
+    let d = w.quiet_driver();
+    let age = |r: &mut serde_json::Value| {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() * 1000;
+        r["run_started_ms"] = serde_json::json!(now - 120_000);
+    };
+    let gone_or_going = |pod: &str| {
+        w.fake
+            .pod(NS, pod)
+            .is_none_or(|p| p["metadata"]["deletionTimestamp"].is_string())
+    };
+    // The honest control.
+    let honest_id = identity();
+    let honest = d.start(w.service(honest_id, None)).await.unwrap();
+    let honest_pod = ruum_runtime::kube::pod_name(honest.id, 1);
+    assert_eq!(wait_launched(&w, &honest_pod).await, 200);
+    wait_pod_ip(&w, &honest_pod).await;
+    w.change_record(honest.id, age).await;
+    // A pod made again by a holder of the runtime token.
+    let again_id = identity();
+    let again = d.start(w.service(again_id, None)).await.unwrap();
+    let again_pod = ruum_runtime::kube::pod_name(again.id, 1);
+    assert_eq!(wait_launched(&w, &again_pod).await, 200);
+    let copy = w.fake.pod(NS, &again_pod).unwrap();
+    w.fake.remove_pod(NS, &again_pod);
+    // The copy waits for a launch that never comes (it does not ask, so it does not exit).
+    w.fake.skip_launch_once.store(true, Ordering::SeqCst);
+    assert_eq!(w.create_pod(&copy).await, 201);
+    wait_pod_ip(&w, &again_pod).await;
+    w.change_record(again.id, age).await;
+    // A record without its first seal (a crash between the pod and the seal).
+    let crash_id = identity();
+    w.fake.skip_launch_once.store(true, Ordering::SeqCst);
+    let crash = d.start(w.service(crash_id, None)).await.unwrap();
+    let crash_pod = ruum_runtime::kube::pod_name(crash.id, 1);
+    wait_pod_ip(&w, &crash_pod).await;
+    w.change_record(crash.id, |r| {
+        r["sealed"] = serde_json::Value::Null;
+        age(r);
+    })
+    .await;
+    for (tenant, id, pod) in [
+        (again_id.tenant, again.id, &again_pod),
+        (crash_id.tenant, crash.id, &crash_pod),
+    ] {
+        match d.status(tenant, id).await.unwrap().state {
+            InstanceState::Exited(e) => assert_eq!(e.reason, ExitReason::Killed, "{pod}"),
+            other => panic!("{pod}: the state is {}", other.name()),
+        }
+        assert!(gone_or_going(pod), "{pod} stayed");
+    }
+    let st = d.status(honest_id.tenant, honest.id).await.unwrap().state;
+    assert!(
+        matches!(st, InstanceState::Running | InstanceState::Starting),
+        "the honest run: {}",
+        st.name()
+    );
+    assert!(!gone_or_going(&honest_pod));
+}
+
+/// Backlog I6-21: a run whose pod stays pending (an image that does not pull) ends as killed past
+/// the start deadline, and its pod goes; before the deadline it stays starting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_that_stays_starting_ends_at_the_start_deadline() {
+    let w = world(false).await;
+    let d = w.quiet_driver();
+    let id = identity();
+    let s = d.start(w.service(id, None)).await.unwrap();
+    let pod_n = ruum_runtime::kube::pod_name(s.id, 1);
+    assert_eq!(wait_launched(&w, &pod_n).await, 200);
+    wait_pod_ip(&w, &pod_n).await;
+    w.fake.edit_pod_status(NS, &pod_n, |st| {
+        *st = serde_json::json!({
+            "phase": "Pending",
+            "containerStatuses": [{ "name": "app", "ready": false,
+                "state": { "waiting": { "reason": "ImagePullBackOff" } } }],
+        });
+    });
+    let back = |secs: i64| {
+        move |r: &mut serde_json::Value| {
+            let now = time::OffsetDateTime::now_utc().unix_timestamp() * 1000;
+            r["run_started_ms"] = serde_json::json!(now - secs * 1000);
+        }
+    };
+    w.change_record(s.id, back(300)).await;
+    assert_eq!(
+        d.status(id.tenant, s.id).await.unwrap().state,
+        InstanceState::Starting,
+        "before the deadline"
+    );
+    w.change_record(s.id, back(601)).await;
+    match d.status(id.tenant, s.id).await.unwrap().state {
+        InstanceState::Exited(e) => assert_eq!(e.reason, ExitReason::Killed),
+        other => panic!("the state is {}", other.name()),
+    }
+    assert!(
+        w.fake
+            .pod(NS, &pod_n)
+            .is_none_or(|p| p["metadata"]["deletionTimestamp"].is_string()),
+        "the pod stayed"
+    );
+}
+
+/// Backlog I620-14: values that do not fit one ConfigMap once escaped and sealed are refused at
+/// the start with a clear error, before anything is made; values of the same length that fit
+/// start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_too_large_for_its_config_map_is_refused_at_start() {
+    let w = world(false).await;
+    let d = w.quiet_driver();
+    let with_values = |c: char| {
+        let mut spec = w.service(identity(), None);
+        spec.env = (0..15)
+            .map(|i| {
+                EnvVar::secret(
+                    format!("K{i}"),
+                    SecretValue::new(c.to_string().repeat(16 * 1024)),
+                )
+            })
+            .collect();
+        spec
+    };
+    let creates = || {
+        w.fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, verb, _)| verb == "create")
+            .count()
+    };
+    let before = creates();
+    // Control characters: six bytes each once escaped as JSON.
+    let err = d.start(with_values('\u{1}')).await.unwrap_err();
+    assert!(
+        matches!(&err, RuntimeError::InvalidSpec { reason, .. } if reason.contains("ConfigMap")),
+        "{err:?}"
+    );
+    assert_eq!(creates(), before, "a record or a pod was made");
+    let s = d.start(with_values('a')).await.expect("values that fit");
+    assert_eq!(
+        wait_launched(&w, &ruum_runtime::kube::pod_name(s.id, 1)).await,
+        200
+    );
+}
+
 fn staging_config() -> KubeConfig {
     let mut c = KubeConfig::new("https://kubernetes.default.svc", "ruum-apps", "gvisor");
     c.runtime_class_overhead = kube_fake::staging_runtime_class_overhead();

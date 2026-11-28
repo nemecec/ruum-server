@@ -99,6 +99,21 @@ const PEER_QUARANTINE: Duration = Duration::from_secs(30);
 /// for 60 s while the seal of its run is written).
 const LAUNCH_WINDOW_SECS: i64 = 120;
 
+/// The most bytes of an instance record's text (backlog I620-14): the API server refuses a
+/// ConfigMap whose data takes more than 1 MiB, and the record shares its ConfigMap with its seal.
+/// A kibibyte stays free for the key name.
+const MAX_RECORD_BYTES: usize = 1024 * 1024 - 1024;
+
+/// The error of a record that does not fit its ConfigMap (backlog I620-14).
+fn record_too_large(bytes: usize) -> RuntimeError {
+    RuntimeError::invalid(
+        "env",
+        format!(
+            "the instance record would take {bytes} bytes once its values are escaped and sealed, more than the {MAX_RECORD_BYTES} a Kubernetes ConfigMap holds; use fewer or shorter secret values, previous values or environment values"
+        ),
+    )
+}
+
 /// A shared service of a route (the egress proxy, the internal gateway, the pooler), as the
 /// platform deploys it. The spec cannot name one.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,6 +124,17 @@ pub struct SharedService {
     /// The name the sandbox reaches it by (an `/etc/hosts` line), such as `ruum-egress`.
     pub alias: String,
     pub port: u16,
+}
+
+/// The platform's PriorityClass of the sandbox pods (backlog I620-10): its name, its value and
+/// its preemption policy, exactly as the class has them. Needed where the cluster has a
+/// cluster-wide default class (`globalDefault: true`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PodPriority {
+    pub class: String,
+    pub value: i32,
+    /// `PreemptLowerPriority` or `Never`.
+    pub preemption: String,
 }
 
 /// The settings of [`KubeDriver`]. The crate reads no environment: the server's wiring builds it.
@@ -148,10 +174,19 @@ pub struct KubeConfig {
     /// How long a failing readiness probe may take before the instance is unhealthy, on top of
     /// the probe's own interval times its threshold.
     pub start_period: Duration,
+    /// How long a run may stay `starting` with its pod (backlog I6-21): an image that does not
+    /// pull (`ImagePullBackOff`), a pod that is never scheduled, or an egress registration that
+    /// keeps failing. Past it the run ends as killed and its pod is deleted, so it gives back its
+    /// resources. At least a minute.
+    pub start_deadline: Duration,
     /// Extra labels on every object (tests set `ruum.test`); the sweep selects on them too.
     pub extra_labels: BTreeMap<String, String>,
     /// Pods only on these nodes (none on staging).
     pub node_selector: Option<BTreeMap<String, String>>,
+    /// The PriorityClass every pod names (backlog I620-10); `None` (staging): no class, and the
+    /// read-back holds the pod to priority 0, so a cluster-wide default class refuses every pod
+    /// (fails closed).
+    pub priority_class: Option<PodPriority>,
     /// One API call at most (not a followed log stream).
     pub api_timeout: Duration,
     /// How often the sweep looks at every instance (exits, idle services, cleanup).
@@ -265,8 +300,10 @@ impl KubeConfig {
                 .map(|s| (*s).to_owned())
                 .collect(),
             start_period: Duration::from_secs(10),
+            start_deadline: Duration::from_secs(10 * 60),
             extra_labels: BTreeMap::new(),
             node_selector: None,
+            priority_class: None,
             api_timeout: Duration::from_secs(30),
             sweep_every: Duration::from_secs(5),
             ended_retention: Duration::from_secs(15 * 60),
@@ -302,7 +339,38 @@ impl KubeConfig {
         }
     }
 
+    /// The PriorityClass setting: a DNS-1123 name, a value a user class may have (at most one
+    /// billion) and a preemption policy Kubernetes knows.
+    pub(crate) fn check_priority(&self) -> Result<(), RuntimeError> {
+        let Some(p) = &self.priority_class else {
+            return Ok(());
+        };
+        let name_ok = !p.class.is_empty()
+            && p.class.len() <= 253
+            && p.class
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+            && p.class
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_alphanumeric())
+            && p.class
+                .bytes()
+                .last()
+                .is_some_and(|b| b.is_ascii_alphanumeric());
+        if !name_ok
+            || p.value > 1_000_000_000
+            || !matches!(p.preemption.as_str(), "PreemptLowerPriority" | "Never")
+        {
+            return Err(RuntimeError::Internal {
+                reason: "the priority class is a DNS name with a value of at most 1000000000 and the preemption policy PreemptLowerPriority or Never".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     fn check(&self) -> Result<(), RuntimeError> {
+        self.check_priority()?;
         let bad = |reason: &str| {
             Err(RuntimeError::Internal {
                 reason: reason.to_owned(),
@@ -340,6 +408,9 @@ impl KubeConfig {
         }
         if self.health_command.is_empty() || self.sweep_every.is_zero() {
             return bad("the health command and the sweep interval must be set");
+        }
+        if self.start_deadline < START_GRACE {
+            return bad("the start deadline is at least a minute");
         }
         if self.max_tenant_live_log_bytes == 0
             || self.max_tenant_live_log_bytes > self.max_live_log_bytes
@@ -532,6 +603,9 @@ struct Inner {
     peer_tenants: Mutex<HashMap<IpAddr, PeerPod>>,
     /// The addresses whose pre-check failed, and since when ([`PEER_QUARANTINE`]).
     refused_peers: Mutex<HashMap<IpAddr, Instant>>,
+    /// The run and the pod uid whose seal this process found naming that pod, per live
+    /// instance (backlog I620-8): the seal is opened once per run, not at every observation.
+    sealed_runs: Mutex<HashMap<InstanceId, (u32, String)>>,
 }
 
 /// The pod at a peer address: its tenant, its uid and when it was noted.
@@ -540,6 +614,15 @@ type PeerPod = (TenantId, String, Instant);
 /// A positive `TokenReview` kept: the pod name and uid, its tenant (the pod's label, read by the
 /// pre-check), and until when.
 type CachedReview = (String, String, TenantId, Instant);
+
+/// The first seal of a new instance (backlog I620-16): the sealed values as `start` made them
+/// (their digest is of the record as made, from memory) and the uid of the record's ConfigMap
+/// from the API server's answer to the create.
+#[derive(Clone, Copy)]
+struct Fresh<'a> {
+    sealed: &'a Sealed,
+    record_uid: &'a str,
+}
 
 /// The Kubernetes driver (see the module docs).
 pub struct KubeDriver {
@@ -632,6 +715,7 @@ impl KubeDriver {
             unknown_requests: Mutex::new((Instant::now(), f64::from(unknown_burst))),
             peer_tenants: Mutex::new(HashMap::new()),
             refused_peers: Mutex::new(HashMap::new()),
+            sealed_runs: Mutex::new(HashMap::new()),
         });
         let sweeper = tokio::runtime::Handle::try_current()
             .ok()
@@ -991,6 +1075,11 @@ impl Inner {
 
     /// Replaces the record if nobody changed it since `rv`. `Ok(false)`: somebody did.
     async fn put(&self, rec: &Record, rv: &str) -> Result<bool, RuntimeError> {
+        // A clear error before the API server's (backlog I620-14).
+        let bytes = serde_json::to_string(rec).map_or(0, |t| t.len());
+        if bytes > MAX_RECORD_BYTES {
+            return Err(record_too_large(bytes));
+        }
         match self
             .api
             .replace(
@@ -1163,10 +1252,16 @@ impl Inner {
     /// `fresh` for a record without one), one generation up, and writes it with the record's
     /// `resourceVersion`; a lost race reads the record again. `change` returns `false` to stop
     /// (the record moved on).
+    ///
+    /// The first seal binds the record this process made, not the one it reads back (backlog
+    /// I620-16): `fresh` carries the digest of the fixed fields of the record as made (from
+    /// memory) and the uid the API server gave its ConfigMap at the create. A record read back
+    /// under another uid (deleted and made again) or with other fixed fields (a writer of
+    /// ConfigMaps changed it between the create and this seal) is refused, never sealed.
     async fn reseal(
         &self,
         id: InstanceId,
-        fresh: Option<&Sealed>,
+        fresh: Option<Fresh<'_>>,
         change: impl Fn(&Record, &mut Sealed) -> bool,
     ) -> Result<(), RuntimeError> {
         let mut stale = false;
@@ -1180,7 +1275,16 @@ impl Inner {
                         reason: "an instance record's seal does not open or does not match it"
                             .to_owned(),
                     })?,
-                (false, Some(f)) => f.clone(),
+                (false, Some(f)) => {
+                    if uid != f.record_uid || pod::fixed_digest(&rec) != f.sealed.digest {
+                        return Err(RuntimeError::Internal {
+                            reason:
+                                "the instance record changed between its create and its first seal"
+                                    .to_owned(),
+                        });
+                    }
+                    f.sealed.clone()
+                }
                 (false, None) => {
                     return Err(RuntimeError::Internal {
                         reason: "an instance record has no seal".to_owned(),
@@ -1259,6 +1363,37 @@ impl Inner {
         }
     }
 
+    /// Whether the seal of the record `cm` names `pod` (its uid) for the record's run (backlog
+    /// I620-8). Remembered per instance once true; a seal that does not open is `false`.
+    fn run_sealed(&self, cm: &Value, rec: &Record, pod: &Value) -> bool {
+        let Some(pod_uid) = pod.pointer("/metadata/uid").and_then(Value::as_str) else {
+            return false;
+        };
+        if self
+            .sealed_runs
+            .lock()
+            .expect("sealed runs lock")
+            .get(&rec.instance)
+            .is_some_and(|(run, uid)| *run == rec.run && uid == pod_uid)
+        {
+            return true;
+        }
+        let record_uid = cm
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let sealed = self
+            .unsealed(rec, record_uid)
+            .is_some_and(|s| s.run == rec.run && s.pod_uid.as_deref() == Some(pod_uid));
+        if sealed {
+            self.sealed_runs
+                .lock()
+                .expect("sealed runs lock")
+                .insert(rec.instance, (rec.run, pod_uid.to_owned()));
+        }
+        sealed
+    }
+
     /// The status of an instance from its record and its pod, making the state changes the pod
     /// shows (exit, idle, registration). Every process may run it; the record's
     /// resourceVersion lets only one make each change.
@@ -1273,6 +1408,10 @@ impl Inner {
             let live = matches!(rec.state, InstanceState::Starting | InstanceState::Running);
             self.keep_addr(id, live.then_some(rec.run));
             if !live {
+                self.sealed_runs
+                    .lock()
+                    .expect("sealed runs lock")
+                    .remove(&id);
                 return Ok(self.status_of(&rec, Health::Unknown));
             }
             let pod_n = pod_name(id, rec.run);
@@ -1282,6 +1421,54 @@ impl Inner {
                 self.keep_addr(id, None);
             }
             let now = pod::now_ms();
+            // A pod that is not ended, past the start grace, whose run the seal does not name
+            // with this pod's uid: a crash between its create and its seal, or a pod made again
+            // by hand (backlog I620-8). No launch ever comes for it. And a run that stays
+            // starting past the start deadline (backlog I6-21). Both end as killed, the pod goes.
+            if let Some(p) = &pod
+                && matches!(
+                    view,
+                    Some(PodView::Pending { broken: false }) | Some(PodView::Running { .. })
+                )
+            {
+                let age = now - rec.run_started_ms;
+                let why = if age > ms(START_GRACE) && !self.run_sealed(&cm, &rec, p) {
+                    Some(
+                        "a sandbox pod that its run's seal does not name (a crash between its create and its seal, or a pod made again) is ended (backlog I620-8)",
+                    )
+                } else if rec.state == InstanceState::Starting && age > ms(self.cfg.start_deadline)
+                {
+                    Some(
+                        "a run that stayed starting past the start deadline is ended (backlog I6-21)",
+                    )
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    tracing::warn!(target: "ruum::runtime", instance = %id.0, run = rec.run, "{why}");
+                    let killed = InstanceState::Exited(ExitStatus::of(ExitReason::Killed));
+                    // With an egress registration the pod stays until the unregistration is
+                    // done (its address must not be reused while the proxy names this app for
+                    // it): the sweep unregisters, then deletes it.
+                    let registered = rec.registered.is_some();
+                    match self.end_run(rec, &rv, killed).await? {
+                        Some(rec) => {
+                            let grace = self.cfg.stop_timeout.as_secs();
+                            if !registered
+                                && let Err(e) =
+                                    self.api.delete(Kind::Pod, &pod_n, Some(grace)).await
+                            {
+                                tracing::warn!(target: "ruum::runtime", code = e.code(), "deleting a sandbox pod failed; the sweep tries again");
+                            }
+                            return Ok(self.status_of(&rec, Health::Unknown));
+                        }
+                        None => {
+                            cm = self.reload(id).await?;
+                            continue;
+                        }
+                    }
+                }
+            }
             let changed = match view {
                 // A run that is still being made (the record is written before its pod, by this
                 // or another process).
@@ -1560,7 +1747,7 @@ impl Inner {
     async fn begin_run(
         self: &Arc<Self>,
         rec: &Record,
-        fresh: Option<&Sealed>,
+        fresh: Option<Fresh<'_>>,
     ) -> Result<(), RuntimeError> {
         let body = self.expected_pod(rec).await?;
         let name = pod_name(rec.instance, rec.run);
@@ -2734,6 +2921,10 @@ impl Inner {
             }
         }
         self.addrs.lock().expect("addrs lock").remove(&id);
+        self.sealed_runs
+            .lock()
+            .expect("sealed runs lock")
+            .remove(&id);
     }
 }
 
@@ -2906,6 +3097,25 @@ impl RuntimeDriver for KubeDriver {
         }
         .check()
         .map_err(|why| RuntimeError::invalid("spec", why))?;
+        // The record with its largest seal must fit one ConfigMap (backlog I620-14): the seal of a
+        // launched run (a pod uid, the most launched pods kept) after the most token rotations
+        // (earlier tokens of this token's length and some more), checked before anything is made.
+        {
+            let mut largest = fresh.clone();
+            largest.generation = u64::MAX;
+            largest.pod_uid = Some(uuid::Uuid::nil().to_string());
+            largest.launched = vec![uuid::Uuid::nil().to_string(); MAX_LAUNCHED];
+            largest.earlier_tokens = vec!["x".repeat(token.len() + 256); MAX_KEPT_TOKENS - 1];
+            let mut probe = rec.clone();
+            probe.sealed = Some(
+                seal::seal(inner.key(), &name, &uuid::Uuid::nil().to_string(), &largest)
+                    .map_err(|reason| RuntimeError::Internal { reason })?,
+            );
+            let bytes = serde_json::to_string(&probe).map_or(usize::MAX, |t| t.len());
+            if bytes > MAX_RECORD_BYTES {
+                return Err(record_too_large(bytes));
+            }
+        }
         let base: Vec<String> = spec
             .redacted_values()
             .into_iter()
@@ -2942,6 +3152,7 @@ impl RuntimeDriver for KubeDriver {
             Ok(Write::Done(v)) => v
                 .pointer("/metadata/uid")
                 .and_then(Value::as_str)
+                .filter(|u| !u.is_empty())
                 .map(str::to_owned),
             other => {
                 inner.locals.lock().expect("locals lock").remove(&id);
@@ -2950,7 +3161,20 @@ impl RuntimeDriver for KubeDriver {
                 }));
             }
         };
-        if let Err(e) = inner.begin_run(&rec, Some(&fresh)).await {
+        let first = match &made_uid {
+            Some(uid) => Ok(Fresh {
+                sealed: &fresh,
+                record_uid: uid,
+            }),
+            None => Err(RuntimeError::Internal {
+                reason: format!("the API server gave the instance record {name} no uid"),
+            }),
+        };
+        let begun = match first {
+            Ok(f) => inner.begin_run(&rec, Some(f)).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = begun {
             let _ = inner.api.delete(Kind::Pod, &pod_name(id, 1), Some(0)).await;
             let deleted = inner
                 .api

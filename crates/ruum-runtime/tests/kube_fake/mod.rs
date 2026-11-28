@@ -177,6 +177,11 @@ pub struct Fake {
     /// The next ConfigMap update that changes the record's sealed part (a launch write) answers
     /// this status and writes nothing (review of I620-G, required change 2; backlog T-103).
     pub fail_config_map_put_once: Mutex<Option<u16>>,
+    /// Changes the next ConfigMap made, after the create answered with what was sent: a writer
+    /// of ConfigMaps that changes a new record between its create and its first seal (backlog
+    /// I620-16).
+    #[allow(clippy::type_complexity)]
+    pub edit_created_config_map_once: Mutex<Option<Box<dyn FnOnce(&mut Value) + Send>>>,
     /// Told when the held read has its answer (from before any later write).
     pub get_held: Notify,
     /// Lets the held read answer.
@@ -346,6 +351,7 @@ impl Fake {
             runtime_class_overhead: Mutex::new(staging_runtime_class_overhead()),
             hold_get: Mutex::new(None),
             fail_config_map_put_once: Mutex::new(None),
+            edit_created_config_map_once: Mutex::new(None),
             get_held: Notify::new(),
             get_release: Notify::new(),
         });
@@ -843,7 +849,12 @@ async fn collection_post(
                     return status(StatusCode::CONFLICT, "AlreadyExists");
                 }
                 Fake::bump(&mut o, &mut obj);
-                o.cms.insert(key, obj.clone());
+                let mut kept = obj.clone();
+                if let Some(edit) = f.edit_created_config_map_once.lock().unwrap().take() {
+                    edit(&mut kept);
+                    Fake::bump(&mut o, &mut kept);
+                }
+                o.cms.insert(key, kept);
             }
             f.orphans(&obj);
             (StatusCode::CREATED, axum::Json(obj)).into_response()
