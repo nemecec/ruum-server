@@ -1149,15 +1149,21 @@ impl Inner {
     /// The unregistration of `reg`, a registration key read from the record of `id` at its run
     /// `run`. A record can be written by a writer of ConfigMaps, and the egress proxy deletes a
     /// key without a tenant check, so only a key that is the pod name of one of this instance's
-    /// runs is unregistered. Another key is left alone, and the key of the run's own pod goes
-    /// instead (the record may have named it before the change; an unregistration is
-    /// idempotent). Independent Kimi review of I620-R, finding 4.
+    /// runs is unregistered. Another key is left alone. The key of the run's own pod always goes
+    /// too (the record may have named it before the change; an unregistration is idempotent).
+    /// Independent Kimi review of I620-R, finding 4, and its re-check.
     async fn unregister_recorded(&self, id: InstanceId, run: u32, reg: &str) -> bool {
-        if own_registration(id, reg) {
-            return self.unregister(reg).await;
+        let current = pod_name(id, run);
+        if reg != current {
+            if own_registration(id, reg) {
+                if !self.unregister(reg).await {
+                    return false;
+                }
+            } else {
+                tracing::warn!(target: "ruum::runtime", instance = %id.0, "an instance record names an egress registration of another pod; that one is not unregistered");
+            }
         }
-        tracing::warn!(target: "ruum::runtime", instance = %id.0, "an instance record names an egress registration of another pod; that one is not unregistered");
-        self.unregister(&pod_name(id, run)).await
+        self.unregister(&current).await
     }
 
     fn record_usage(&self, rec: &Record) {
@@ -2991,8 +2997,15 @@ impl Inner {
             Ok(None) => return true,
             Err(_) => return false,
         };
-        if rec.run != run || rec.registered.as_deref() == Some(pod) {
-            return rec.run != run && rec.registered.as_deref() != Some(pod);
+        // The pod of another run is left over even when the record names it as registered: the
+        // sweep unregisters it by its own name before the delete. A record whose `registered` a
+        // writer of ConfigMaps pointed at an earlier run's pod does not keep that pod (Kimi
+        // re-check of the I620-R fixes).
+        if rec.run != run {
+            return true;
+        }
+        if rec.registered.as_deref() == Some(pod) {
+            return false;
         }
         match rec.state {
             InstanceState::Starting | InstanceState::Running => false,
