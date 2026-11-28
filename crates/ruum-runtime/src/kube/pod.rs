@@ -502,6 +502,15 @@ pub(crate) fn pod_body(
     if !cfg.runtime_class_overhead.is_empty() {
         spec["overhead"] = json!(cfg.runtime_class_overhead);
     }
+    // The platform's PriorityClass (backlog I620-10): with a cluster-wide default class the
+    // Priority admission plugin would write that class into the pod, which the read-back refuses.
+    // The pod names the class with its value and preemption policy, so the plugin adds nothing
+    // (and refuses the pod when the class says otherwise).
+    if let Some(p) = &cfg.priority_class {
+        spec["priorityClassName"] = json!(p.class);
+        spec["priority"] = json!(p.value);
+        spec["preemptionPolicy"] = json!(p.preemption);
+    }
     json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -935,6 +944,54 @@ mod tests {
         let mut c = KubeConfig::new("https://k", "ruum-apps", "gvisor");
         c.supervisor_image = "r/ruum-supervisor@sha256:11".into();
         c
+    }
+
+    /// Backlog I620-10: with a platform PriorityClass the pod names it, its value and its
+    /// preemption policy; the stored pod must keep exactly those, and a cluster-wide default
+    /// class written into a pod without one is refused.
+    #[test]
+    fn the_platform_priority_class_is_sent_and_held() {
+        let mut cfg = config();
+        let rec = record();
+        let plain = pod_body(&cfg, &rec, &[], "http://10.0.0.5:8091");
+        assert!(plain["spec"].get("priorityClassName").is_none());
+        let mut defaulted = plain.clone();
+        defaulted["spec"]["priorityClassName"] = json!("cluster-default");
+        defaulted["spec"]["priority"] = json!(1000);
+        assert!(verify(&cfg, &plain, &defaulted).is_err(), "a default class");
+        cfg.priority_class = Some(super::super::PodPriority {
+            class: "ruum-sandbox".into(),
+            value: 0,
+            preemption: "Never".into(),
+        });
+        assert!(cfg.check_priority().is_ok());
+        let sent = pod_body(&cfg, &rec, &[], "http://10.0.0.5:8091");
+        assert_eq!(sent["spec"]["priorityClassName"], json!("ruum-sandbox"));
+        assert_eq!(sent["spec"]["priority"], json!(0));
+        assert_eq!(sent["spec"]["preemptionPolicy"], json!("Never"));
+        assert_eq!(verify(&cfg, &sent, &sent), Ok(()));
+        for (path, v) in [
+            ("priorityClassName", json!("cluster-default")),
+            ("priority", json!(1000)),
+            ("preemptionPolicy", json!("PreemptLowerPriority")),
+        ] {
+            let mut stored = sent.clone();
+            stored["spec"][path] = v;
+            assert!(verify(&cfg, &sent, &stored).is_err(), "{path}");
+        }
+        for bad in [
+            ("", 0, "Never"),
+            ("Not_A_Name", 0, "Never"),
+            ("ruum-sandbox", 2_000_000_000, "Never"),
+            ("ruum-sandbox", 0, "Sometimes"),
+        ] {
+            cfg.priority_class = Some(super::super::PodPriority {
+                class: bad.0.into(),
+                value: bad.1,
+                preemption: bad.2.into(),
+            });
+            assert!(cfg.check_priority().is_err(), "{bad:?}");
+        }
     }
 
     /// The exhaustive read-back (S-89): API server defaults pass; any other added or changed key

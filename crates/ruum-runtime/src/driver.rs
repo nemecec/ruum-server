@@ -117,6 +117,9 @@ struct St {
     /// When the logs of the ended instance were read to the end
     /// ([`DockerConfig::drained_retention`]).
     drained: Option<Instant>,
+    /// When the instance scaled to zero (backlog I620-11): its logs left the live budget and
+    /// count to the ended byte cap, as in the Kubernetes driver. `None` while it runs.
+    parked: Option<Instant>,
 }
 
 struct Instance {
@@ -165,9 +168,25 @@ impl St {
     fn mark_ended(&mut self, has_container: bool) {
         if self.ended.is_none() && self.is_ended(has_container) {
             self.ended = Some(Instant::now());
+            self.parked = None;
             // Its logs leave the live budget and count to the ended cap (S-91).
             self.ring.leave_budget();
         }
+    }
+
+    /// The instance scaled to zero (backlog I620-11): its logs leave the live budget and count
+    /// to the ended byte cap; past the cap they go (the instance keeps the rest, for a wake).
+    fn park(&mut self) {
+        if self.parked.is_none() {
+            self.parked = Some(Instant::now());
+        }
+        self.ring.leave_budget();
+    }
+
+    /// The instance runs again (a wake): its logs count to the live budget again.
+    fn unpark(&mut self) {
+        self.parked = None;
+        self.ring.join_budget();
     }
 }
 
@@ -1256,6 +1275,8 @@ impl Inner {
                 reason: "no container".to_owned(),
             })?;
         let secrets = inst.secrets();
+        // A wake: the logs of the instance count to the live budget again (backlog I620-11).
+        inst.lock().unpark();
         let opts = AttachContainerOptionsBuilder::new()
             .stream(true)
             .stdin(inst.launch.is_some())
@@ -1336,6 +1357,9 @@ impl Inner {
         let cfg = &self.cfg;
         let mut evict = Vec::new();
         let mut ended: HashMap<TenantId, Ended> = HashMap::new();
+        // The rings of instances scaled to zero (backlog I620-11): they count to the byte cap,
+        // and past it the oldest of them (of the tenant with the most bytes) loses its lines.
+        let mut parked: HashMap<TenantId, Ended> = HashMap::new();
         // The instances each tenant keeps after this sweep, running and ended.
         let mut totals: HashMap<TenantId, usize> = HashMap::new();
         if let Some(t) = room {
@@ -1349,6 +1373,14 @@ impl Inner {
             let mut st = inst.lock();
             st.mark_ended(inst.container.is_some());
             let Some(at) = st.ended else {
+                if let Some(at) = st.parked
+                    && st.ring.memory() > 0
+                {
+                    let p = parked.entry(inst.identity.tenant).or_default();
+                    let b = st.ring.memory();
+                    p.list.push((at, *id, b));
+                    p.bytes += b;
+                }
                 continue;
             };
             let expired = now.duration_since(at) >= cfg.ended_retention
@@ -1367,25 +1399,57 @@ impl Inner {
                 e.bytes += b;
             }
         }
-        for e in ended.values_mut() {
+        for e in ended.values_mut().chain(parked.values_mut()) {
             // Newest first, so the oldest is popped from the end.
             e.list.sort_by_key(|(at, _, _)| std::cmp::Reverse(*at));
         }
         let mut count: usize = ended.values().map(|e| e.list.len()).sum();
-        let mut bytes: usize = ended.values().map(|e| e.bytes).sum();
+        let mut bytes: usize = ended.values().chain(parked.values()).map(|e| e.bytes).sum();
         let mut kept = map.len() - evict.len();
         let oldest = |e: &Ended| e.list.last().map(|(at, _, _)| std::cmp::Reverse(*at));
         loop {
             let by_bytes = bytes > cfg.max_ended_log_bytes;
             let by_count = count > cfg.max_ended_instances;
+            let bytes_of = |t: &TenantId| {
+                ended.get(t).map_or(0, |e| e.bytes) + parked.get(t).map_or(0, |e| e.bytes)
+            };
+            if by_bytes {
+                // Past the byte cap the tenant with the most ended and parked bytes gives first:
+                // its oldest parked ring loses its lines when it is older than the tenant's
+                // oldest ended instance (backlog I620-11, as the Kubernetes driver).
+                let top = ended
+                    .iter()
+                    .chain(parked.iter())
+                    .filter(|(_, e)| !e.list.is_empty())
+                    .map(|(t, _)| *t)
+                    .max_by_key(|t| bytes_of(t));
+                if let Some(t) = top
+                    && let Some((pat, pid, pb)) =
+                        parked.get(&t).and_then(|p| p.list.last().copied())
+                    && ended
+                        .get(&t)
+                        .and_then(|e| e.list.last())
+                        .is_none_or(|(eat, _, _)| pat < *eat)
+                {
+                    if let Some(i) = map.get(&pid) {
+                        i.lock().ring.clear();
+                    }
+                    if let Some(p) = parked.get_mut(&t) {
+                        p.list.pop();
+                        p.bytes -= pb;
+                    }
+                    bytes -= pb;
+                    continue;
+                }
+            }
             let victim = if by_bytes || by_count {
-                // The tenant with the largest ended share; on a tie, the one with the oldest
-                // instance.
+                // The tenant with the largest share (ended and parked bytes, or ended
+                // instances); on a tie, the one with the oldest instance.
                 ended
                     .iter()
                     .filter(|(_, e)| !e.list.is_empty())
-                    .max_by_key(|(_, e)| {
-                        let share = if by_bytes { e.bytes } else { e.list.len() };
+                    .max_by_key(|(t, e)| {
+                        let share = if by_bytes { bytes_of(t) } else { e.list.len() };
                         (share, oldest(e))
                     })
                     .map(|(t, _)| *t)
@@ -1806,6 +1870,8 @@ async fn supervise(inner: Arc<Inner>, inst: Arc<Instance>, pump: JoinHandle<()>)
         if next != InstanceState::ScaledToZero {
             // The supervisor (this task) is about to end.
             st.ended.get_or_insert_with(Instant::now);
+        } else {
+            st.park();
         }
     }
     inner.sweep_now();
@@ -1846,6 +1912,7 @@ impl RuntimeDriver for DockerDriver {
             torn_down: false,
             ended: None,
             drained: None,
+            parked: None,
         };
         let digest = match &spec.image {
             ImageRef::Static(_) => {
@@ -2542,6 +2609,54 @@ mod tests {
             d.logs(quiet, q, None, 10_000).await.unwrap().len(),
             quiet_lines
         );
+    }
+
+    /// Backlog I620-11: the ring of an instance scaled to zero leaves the live budget and counts
+    /// to the ended byte cap; past the cap it loses its lines (the instance stays, for a wake)
+    /// before another tenant's ended instance goes, and a wake counts it to the live budget again.
+    #[tokio::test]
+    async fn scaled_to_zero_logs_count_to_the_byte_cap() {
+        let mut cfg = config();
+        cfg.max_ended_log_bytes = 96 * 1024;
+        let d = offline(cfg);
+        let (noisy, quiet) = (TenantId::new(), TenantId::new());
+        let quiet_ended = start_and_end(&d, quiet, 8).await;
+        let p = d.start(spec(noisy)).await.expect("start").id;
+        fill(&d, p, 64);
+        let live = &d.inner.live;
+        assert!(live.used(Some(noisy)) >= 64 * 1024);
+        {
+            let inst = d.inner.get(p).expect("kept");
+            let mut st = inst.lock();
+            st.state = InstanceState::ScaledToZero;
+            st.park();
+        }
+        assert_eq!(
+            live.used(Some(noisy)),
+            0,
+            "a parked ring leaves the live budget"
+        );
+        // Within the cap nothing goes.
+        d.inner.sweep_now();
+        assert!(!d.logs(noisy, p, None, 10_000).await.unwrap().is_empty());
+        // Past the cap the parked ring of the tenant with the most bytes loses its lines; the
+        // other tenant's ended instance and the parked instance itself stay.
+        fill(&d, p, 64);
+        d.inner.sweep_now();
+        assert!(d.logs(noisy, p, None, 10_000).await.unwrap().is_empty());
+        assert!(!gone(d.status(noisy, p).await), "the parked instance stays");
+        assert!(
+            !d.logs(quiet, quiet_ended, None, 10_000)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the quiet tenant's ended instance keeps its logs"
+        );
+        assert!(d.kept_log_bytes() <= 96 * 1024, "{}", d.kept_log_bytes());
+        // A wake: its new lines count to the live budget again.
+        d.inner.get(p).expect("kept").lock().unpark();
+        fill(&d, p, 4);
+        assert!(live.used(Some(noisy)) >= 4 * 1024);
     }
 
     #[tokio::test]

@@ -12,12 +12,17 @@ through `bollard` 0.21.1 (features `http` and `pipe` only: no TLS). The OCI runt
 | `RUUM_RUNTIME_DRIVER` | `docker` (runc, default) or `runsc`. With `runsc` the driver refuses to start when the engine has no runtime `runsc`. |
 | `RUUM_REGISTRY` | The local registry (`host:port`). The driver pulls `RUUM_REGISTRY/ruum/<tenant>/<app>@<digest>` only. |
 | `RUUM_RUNTIME_STATE_DIR` | A folder on the engine's host for the workload token files (0700 per instance). |
+| `RUUM_SUPERVISOR_BIN` | `DockerConfig::supervisor`: the absolute path of the static `ruum-supervisor` binary on the engine's host (backlog I620-7). Required by I-4's wiring outside the tests; the driver refuses a path that is not a file. |
 
-`DockerConfig::supervisor` (no variable yet; I-4 wires the Docker driver): the static
-`ruum-supervisor` binary on the engine's host (backlog I6-20, "The sandbox supervisor" below).
-With it the driver binds it read-only at `/ruum/bin/ruum-supervisor` as the entrypoint and gives
-the secret values on standard input; without it the app runs directly with its secret values in
-its environment. `max_live_log_bytes` and `max_tenant_live_log_bytes` (64 MiB, 16 MiB) bound the
+`DockerConfig::supervisor` (backlog I6-20, "The sandbox supervisor" below; the server reads
+`RUUM_SUPERVISOR_BIN` once I-4 wires the Docker driver, backlog I620-7): with it the driver binds
+the binary read-only at `/ruum/bin/ruum-supervisor` as the entrypoint and gives the secret values
+on standard input, and the engine's log holds only redacted output; without it the app runs
+directly with its secret values in its environment and its raw output in the engine's log, so
+I-4 must not wire the driver without it (the tests do, for the cases that need no supervisor).
+The binary comes from the image of `crates/ruum-runtime/supervisor/Dockerfile` (published as
+`ghcr.io/nemecec/ruum-supervisor`, the file `/ruum-supervisor`), as the tests copy it out
+(`tests/common/mod.rs` `supervisor_bin`, which also reads `RUUM_SUPERVISOR_BIN`). `max_live_log_bytes` and `max_tenant_live_log_bytes` (64 MiB, 16 MiB) bound the
 live instances' log rings (backlog S-91).
 
 The crate reads no environment itself: the server's wiring (I-4) reads these settings, adds them
@@ -115,8 +120,11 @@ they run with plain Docker; without an engine they fail when `CI` is set.
   `max_tenant_live_log_bytes` (backlog S-91, `logs::LogBudget`): a ring whose tenant is past its
   share drops its own oldest lines as lines arrive (never past the budget plus one share), and
   each sweep takes from the tenant with the most bytes until the budget holds. An ended
-  instance's ring leaves the budget and counts to `max_ended_log_bytes`; a scaled-to-zero
-  instance's ring stays in the live budget (backlog I620-11).
+  instance's ring leaves the budget and counts to `max_ended_log_bytes`; so does a scaled-to-zero
+  instance's ring (backlog I620-11, as in the Kubernetes driver): past the cap the oldest of the
+  tenant with the most ended and parked bytes goes first (an ended instance is forgotten, a parked
+  one loses its log lines and stays for a wake), and a wake counts its ring to the live budget
+  again.
 - Redaction bounds: at most 256 values and 256 KiB per spec (`check_secret_set`), 16 KiB per
   value, and the newest 16 workload tokens of an instance (the current one and 15 earlier); an
   older token is no longer redacted. When a value is part of the marker `<hidden secret>`, a
@@ -224,13 +232,36 @@ annotations). A difference deletes the pod and fails the start, or refuses the l
 namespace's admission policy (`k8s/manifests/apps-admission.yaml`, backlog S-83 and S-89) holds
 the shape for every pod, whoever makes it, and admits no Secret in `ruum-apps`.
 
+With `priority_class` (`RUUM_KUBE_PRIORITY_CLASS`, backlog I620-10) every pod names that
+PriorityClass with its value and preemption policy, and the stored pod must keep exactly those.
+Without it (staging) a cluster-wide default class, which the Priority admission plugin writes
+into every pod, makes the read-back refuse every pod (fails closed): create a class for the
+sandboxes and set the three settings.
+
+The first seal of a new instance binds the record as `start` made it (backlog I620-16): the
+digest of its fixed fields comes from memory and the uid from the API server's answer to the
+create. A record read back with other fixed fields or under another uid (a writer of ConfigMaps
+changed it, or deleted and made it again, between the create and the seal) fails the start; the
+pod goes and nothing is sealed.
+
+The record and its seal share one ConfigMap, whose data the API server holds to 1 MiB (backlog
+I620-14). `start` seals the largest seal the run can reach (a pod uid, 16 launched pods, 15
+earlier tokens of the current token's length plus 256 bytes) before it makes anything and refuses
+a spec that does not fit with `invalid_spec` (escaping can make a value six times longer:
+control characters); every later write of the record checks its size too.
+
 ### States
 
 The record's state moves as the pod shows: a pod that runs is `running` (with the egress route,
 only after the pod's address is registered at the egress proxy as `<ip>/32`, key = the pod name);
 a terminated container is `exited` (`OOMKilled` is out of memory, the pod reason
 `DeadlineExceeded` is timed out, otherwise the exit code); a pod that is gone or cannot start
-(`CreateContainerConfigError`, an invalid image name) is `exited` as killed. A service past its
+(`CreateContainerConfigError`, an invalid image name) is `exited` as killed. Two more end a run
+as killed and delete its pod: a pod past the start grace (60 s) that the run's seal does not name
+by its uid (a crash between the pod's create and its seal, or a pod made again under the run's
+name; no launch ever comes for it; backlog I620-8), and a run that stays `starting` with its pod
+past `start_deadline` (10 minutes: an image that does not pull, a pod that is never scheduled, an
+egress registration that keeps failing; backlog I6-21). A service past its
 idle timeout (the newest touch of the record and of this process; `touch` writes the record at
 most every quarter of the idle timeout) scales to zero: the pod goes, the record (with its seal)
 stays, and `wake` makes the next run from the record and seals its new pod's `uid`. Health: healthy when the container is ready;
@@ -317,6 +348,8 @@ its digest), and the egress proxy's control listener (`EgressRegistry`, as the D
 | `RUUM_KUBE_SUPERVISOR_LISTEN` | The listener of this process (`addr:port`; `crates/ruum-server` `supervisor.rs`). Required. |
 | `RUUM_KUBE_SUPERVISOR_NETWORK` | `tls`: the launch channel is TLS 1.3 with the key every replica derives from the record key, pinned by each supervisor (backlog I620-2; staging). `encrypted`: plain HTTP, because node-to-node traffic is encrypted and authenticated (decision 0006 I point 4). Required. With `kubernetes` the server also needs the platform database (`DATABASE_URL`): the launch ledger (backlog I620-9). |
 | `RUUM_KUBE_NODE_ARCH` | The nodes' architecture for a multi-arch image (`amd64` by default). |
+| `RUUM_KUBE_PRIORITY_CLASS`, `RUUM_KUBE_PRIORITY_VALUE`, `RUUM_KUBE_PREEMPTION_POLICY` | The PriorityClass of every sandbox pod with its value (default `0`) and preemption policy (default `PreemptLowerPriority`), exactly as the class has them (backlog I620-10). Unset (staging): no class. Needed only where the cluster has a cluster-wide default class. |
+| `RUUM_KUBE_START_DEADLINE_SECS` | How long a run may stay starting with its pod (default `600`, at least `60`; backlog I6-21). |
 
 ### Tests
 

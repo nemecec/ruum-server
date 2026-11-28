@@ -68,4 +68,4 @@ pub use driver::{
 pub use egress::{EgressNetwork, EgressRegistry, HttpEgressRegistry, NoEgress};
 
 pub use builder::{BuilderConfig, DockerBuilder, RegistryCredential};
-pub use kube::{KubeConfig, KubeDriver, SharedService};
+pub use kube::{KubeConfig, KubeDriver, PodPriority, SharedService};

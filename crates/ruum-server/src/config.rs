@@ -222,6 +222,12 @@ impl GallerySettings {
 /// - `RUUM_KUBE_RUNTIME_CLASS_OVERHEAD` (`cpu=50m,memory=64Mi`; default none): the runtime
 ///   class's `overhead.podFixed`, exactly as its manifest has it. The RuntimeClass admission
 ///   plugin writes it into every pod and the driver's read-back must know it (review of I6-20).
+/// - `RUUM_KUBE_PRIORITY_CLASS` (default none), `RUUM_KUBE_PRIORITY_VALUE` (default `0`) and
+///   `RUUM_KUBE_PREEMPTION_POLICY` (default `PreemptLowerPriority`): the platform's
+///   PriorityClass of the sandbox pods, exactly as the class has them; needed only in a cluster
+///   with a cluster-wide default class (backlog I620-10). Staging has none.
+/// - `RUUM_KUBE_START_DEADLINE_SECS` (default `600`, at least `60`): how long a run may stay
+///   starting with its pod before it ends as killed (backlog I6-21).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeSettings {
     Memory,
@@ -248,6 +254,10 @@ pub struct KubeSettings {
     pub supervisor_tls: bool,
     pub node_arch: String,
     pub runtime_class_overhead: std::collections::BTreeMap<String, String>,
+    /// The PriorityClass of the pods: name, value, preemption policy (backlog I620-10).
+    pub priority_class: Option<(String, i32, String)>,
+    /// `RUUM_KUBE_START_DEADLINE_SECS` (backlog I6-21).
+    pub start_deadline_secs: u64,
 }
 
 /// `name=quantity,...` of `RUUM_KUBE_RUNTIME_CLASS_OVERHEAD` (the driver checks the names and
@@ -366,6 +376,40 @@ impl RuntimeSettings {
                 "RUUM_KUBE_SUPERVISOR_NETWORK must be tls (the launch channel with a pinned certificate, backlog I620-2) or encrypted (plain HTTP over node-to-node traffic that is encrypted and authenticated; decision 0006 I point 4)"
             ),
         };
+        // The platform's PriorityClass (backlog I620-10); the driver checks the name and values.
+        let priority_class = match get("RUUM_KUBE_PRIORITY_CLASS") {
+            None => {
+                anyhow::ensure!(
+                    get("RUUM_KUBE_PRIORITY_VALUE").is_none()
+                        && get("RUUM_KUBE_PREEMPTION_POLICY").is_none(),
+                    "RUUM_KUBE_PRIORITY_VALUE and RUUM_KUBE_PREEMPTION_POLICY need RUUM_KUBE_PRIORITY_CLASS"
+                );
+                None
+            }
+            Some(name) => {
+                let value: i32 = get("RUUM_KUBE_PRIORITY_VALUE")
+                    .as_deref()
+                    .unwrap_or("0")
+                    .parse()
+                    .context("RUUM_KUBE_PRIORITY_VALUE must be a whole number")?;
+                let policy = get("RUUM_KUBE_PREEMPTION_POLICY")
+                    .unwrap_or_else(|| "PreemptLowerPriority".into());
+                anyhow::ensure!(
+                    matches!(policy.as_str(), "PreemptLowerPriority" | "Never"),
+                    "RUUM_KUBE_PREEMPTION_POLICY must be PreemptLowerPriority or Never"
+                );
+                Some((name, value, policy))
+            }
+        };
+        let start_deadline_secs: u64 = get("RUUM_KUBE_START_DEADLINE_SECS")
+            .as_deref()
+            .unwrap_or("600")
+            .parse()
+            .context("RUUM_KUBE_START_DEADLINE_SECS must be a number of seconds")?;
+        anyhow::ensure!(
+            start_deadline_secs >= 60,
+            "RUUM_KUBE_START_DEADLINE_SECS is at least 60"
+        );
         // The service account token goes to the API server over TLS only.
         let api_url =
             get("RUUM_KUBE_API_URL").unwrap_or_else(|| "https://kubernetes.default.svc".into());
@@ -393,6 +437,8 @@ impl RuntimeSettings {
             runtime_class_overhead: overhead(
                 &get("RUUM_KUBE_RUNTIME_CLASS_OVERHEAD").unwrap_or_default(),
             )?,
+            priority_class,
+            start_deadline_secs,
         })))
     }
 }
@@ -487,6 +533,32 @@ mod tests {
         assert!(!k.supervisor_tls);
         assert_eq!(k.node_arch, "amd64");
         assert!(k.runtime_class_overhead.is_empty());
+        assert_eq!(k.priority_class, None);
+        assert_eq!(k.start_deadline_secs, 600);
+        // The platform's PriorityClass (backlog I620-10) and the start deadline (I6-21).
+        let mut prio = ok.clone();
+        prio.push(("RUUM_KUBE_PRIORITY_CLASS", "ruum-sandbox"));
+        prio.push(("RUUM_KUBE_PREEMPTION_POLICY", "Never"));
+        prio.push(("RUUM_KUBE_START_DEADLINE_SECS", "300"));
+        let RuntimeSettings::Kubernetes(k) = runtime(&prio).unwrap() else {
+            panic!("not kubernetes");
+        };
+        assert_eq!(
+            k.priority_class,
+            Some(("ruum-sandbox".to_owned(), 0, "Never".to_owned()))
+        );
+        assert_eq!(k.start_deadline_secs, 300);
+        for extra in [
+            ("RUUM_KUBE_PRIORITY_VALUE", "10"),
+            ("RUUM_KUBE_START_DEADLINE_SECS", "59"),
+        ] {
+            let mut bad = ok.clone();
+            bad.push(extra);
+            assert!(runtime(&bad).is_err(), "{extra:?}");
+        }
+        let mut bad = prio.clone();
+        bad.push(("RUUM_KUBE_PRIORITY_VALUE", "high"));
+        assert!(runtime(&bad).is_err(), "a value that is no number");
         let mut with = ok.clone();
         with.push(("RUUM_KUBE_RUNTIME_CLASS_OVERHEAD", "cpu=50m, memory=64Mi"));
         let RuntimeSettings::Kubernetes(k) = runtime(&with).unwrap() else {

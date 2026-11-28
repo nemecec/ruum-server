@@ -342,6 +342,15 @@ pub fn kube_driver(
     };
     cfg.node_arch = k.node_arch.clone();
     cfg.runtime_class_overhead = k.runtime_class_overhead.clone();
+    cfg.priority_class =
+        k.priority_class
+            .clone()
+            .map(|(class, value, preemption)| ruum_runtime::PodPriority {
+                class,
+                value,
+                preemption,
+            });
+    cfg.start_deadline = std::time::Duration::from_secs(k.start_deadline_secs);
     if let Some((host, port)) = &k.egress_proxy {
         cfg.routes.insert(
             Route::EgressProxy,
