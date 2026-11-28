@@ -1767,3 +1767,86 @@ async fn the_release_grants_only_the_approved_binding_plan() {
             .is_err()
     );
 }
+
+/// End to end (Kimi W-3b re-check 4): an approved rollback to a release without rows of its own
+/// resolves its path binding again in the release; when the path moves to another folder
+/// between the use's check and the release, the release refuses (approval_stale) and nothing
+/// changes: the same live deployment, the same live grant, no grant to the new folder.
+#[tokio::test]
+async fn a_path_that_moves_during_an_approved_rollback_stops_the_release() {
+    let w = Arc::new(world().await);
+    let app = w.app("Moving path").await;
+    let a = w.node(w.folder, "Shared", NodeKind::Folder).await;
+    let path = w.s.nodes.path_of(&w.o(), a).await.unwrap();
+    let manifest =
+        format!("runtime: static\nbindings:\n  docs:\n    node: \"{path}\"\n    role: view\n");
+    let site = w
+        .site(
+            "moving",
+            &[("app.yaml", manifest.as_bytes()), ("index.html", INDEX)],
+        )
+        .await;
+    // Three releases of the same manifest; the live row stays the first release's.
+    let mut releases = Vec::new();
+    for _ in 0..3 {
+        let p = w.preview(&w.o(), app, site).await;
+        let Published::Live(l) = w.publish(&w.o(), app, p, None).await.unwrap() else {
+            panic!("live");
+        };
+        releases.push(l.id);
+    }
+    let live_rows = || {
+        let w = w.clone();
+        async move {
+            w.s.apps
+                .store()
+                .list_bindings(
+                    w.team.id,
+                    &crate::apps::store::BindingQuery {
+                        principal: Some(app.0),
+                        active_only: true,
+                        limit: 100,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let before = live_rows().await;
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].target_node_id, a);
+    // The agent asks to roll back to the second release; nothing changes about bindings.
+    let agent = w.agent(w.editor).await;
+    let id = w.ask(&agent, app, releases[1]).await;
+    assert_eq!(w.row(app, id).await.changes["bindings_removed"], json!([]));
+    w.decide(&w.o(), app, id, json!({ "decision": "approve" }))
+        .await
+        .unwrap();
+    // Stop the publish after its checks and the take, move the path, then let it go on.
+    let (entered, release) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    *USE_PAUSE.lock().unwrap() = Some((id, entered.clone(), release.clone()));
+    let publishing = {
+        let (w, agent, rollback) = (w.clone(), agent.clone(), releases[1]);
+        tokio::spawn(async move { w.publish(&agent, app, rollback, Some(id)).await })
+    };
+    entered.notified().await;
+    w.s.nodes
+        .rename(&w.o(), a, "Shared A".into(), OnConflict::Fail, None)
+        .await
+        .unwrap();
+    let b = w.node(w.folder, "Shared", NodeKind::Folder).await;
+    release.notify_one();
+    let e = publishing.await.unwrap().unwrap_err();
+    *USE_PAUSE.lock().unwrap() = None;
+    assert_eq!(hint(&e).as_deref(), Some("approval_stale"), "{e:?}");
+    assert_eq!(w.live(app).await, Some(releases[2]));
+    let after = live_rows().await;
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, before[0].id);
+    assert_ne!(after[0].target_node_id, b);
+    assert_eq!(w.row(app, id).await.status, "used");
+}
