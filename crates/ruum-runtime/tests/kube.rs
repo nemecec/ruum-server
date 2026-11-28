@@ -2077,6 +2077,9 @@ fn claims_of(w: &World, pod: &str) -> kube_fake::Issued {
 async fn forged_tokens_cost_no_review_and_reviews_are_bounded() {
     let w = world(false).await;
     let mut cfg = w.cfg.clone();
+    // Few instances, so the small bounds below pass the driver's capacity check.
+    cfg.max_instances = 8;
+    cfg.max_tenant_instances = 4;
     cfg.peer_reviews_per_minute = 3;
     let d = w.driver_with(
         cfg,
@@ -2203,6 +2206,9 @@ async fn forged_tokens_cost_no_review_and_reviews_are_bounded() {
     );
     // The bound of all peers together: a burst of two, one more per second.
     let mut cfg = w.cfg.clone();
+    // Few instances, so the small bounds below pass the driver's capacity check.
+    cfg.max_instances = 8;
+    cfg.max_tenant_instances = 4;
     cfg.review_burst = 2;
     cfg.review_rate_per_sec = 1;
     // A tenant's share is at most the bound of all peers (the bound of all peers alone, with
@@ -2260,6 +2266,9 @@ async fn one_tenant_cannot_spend_every_tenants_reviews() {
     let (other, other_ip) = pods[1].clone();
     for (share, other_reviewed) in [(2, true), (4, false)] {
         let mut cfg = w.cfg.clone();
+        // Few instances, so the small bounds below pass the driver's capacity check.
+        cfg.max_instances = 8;
+        cfg.max_tenant_instances = 4;
         cfg.peer_reviews_per_minute = 1000;
         cfg.review_burst = 4;
         cfg.review_rate_per_sec = 1;
@@ -2302,6 +2311,9 @@ async fn one_tenant_cannot_spend_every_tenants_reviews() {
     }
     // A request refused by a bucket spends none of the peer's allowance.
     let mut cfg = w.cfg.clone();
+    // Few instances, so the small bounds below pass the driver's capacity check.
+    cfg.max_instances = 8;
+    cfg.max_tenant_instances = 4;
     cfg.peer_reviews_per_minute = 2;
     cfg.review_burst = 1;
     cfg.review_rate_per_sec = 1;
@@ -2366,10 +2378,15 @@ async fn one_tenant_cannot_spend_every_tenants_requests() {
     };
     for (share, other_answered) in [(3, true), (6, false)] {
         let mut cfg = w.cfg.clone();
+        // Few instances, so the small bounds below pass the driver's capacity check.
+        cfg.max_instances = 8;
+        cfg.max_tenant_instances = 4;
         cfg.request_burst = 6;
         cfg.request_rate_per_sec = 1;
         cfg.tenant_request_burst = share;
         cfg.tenant_request_rate_per_sec = 1;
+        cfg.unknown_request_burst = 6;
+        cfg.unknown_request_rate_per_sec = 1;
         let g = w.driver_with(
             cfg,
             Arc::new(ruum_runtime::kube::ledger::MemoryLedger::new()),
@@ -2422,6 +2439,151 @@ async fn one_tenant_cannot_spend_every_tenants_requests() {
             );
         }
     }
+}
+
+/// Kimi, run 17, second re-check findings 1 and 2: the tenant of an address comes from the pods
+/// the sweep lists, so a sandbox whose forged tokens name a pod that does not exist (no pod read
+/// ever reveals its tenant) still pays from its own tenant's share; requests from an address of
+/// no known pod spend only the unknown addresses' share, never the bound of all; and an address
+/// that another tenant's pod took over is that tenant's after the next sweep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn requests_that_reveal_no_tenant_spend_no_other_tenants_share() {
+    let w = world(false).await;
+    let d = w.driver_with(
+        w.cfg.clone(),
+        Arc::new(ruum_runtime::kube::ledger::MemoryLedger::new()),
+    );
+    let mut pods = Vec::new();
+    for _ in 0..2 {
+        let s = d.start(w.service(identity(), None)).await.unwrap();
+        let pod_n = ruum_runtime::kube::pod_name(s.id, 1);
+        assert_eq!(wait_launched(&w, &pod_n).await, 200);
+        let (tok, ip) = w.pod_token(&pod_n);
+        pods.push((pod_n, tok, ip));
+    }
+    let (a_pod, a_tok, a_ip) = pods[0].clone();
+    let (b_pod, b_tok, b_ip) = pods[1].clone();
+    // Claims of a pod that does not exist (the driver's name form, another instance).
+    let mut ghost = claims_of(&w, &a_pod);
+    ghost.pod =
+        ruum_runtime::kube::pod_name(ruum_core::runtime::InstanceId(uuid::Uuid::now_v7()), 1);
+    ghost.pod_uid = uuid::Uuid::now_v7().hyphenated().to_string();
+    let ghost = kube_fake::unsigned_token(&ghost);
+    let driver = || {
+        let mut cfg = w.cfg.clone();
+        // Few instances, so the small bounds below pass the driver's capacity check.
+        cfg.max_instances = 8;
+        cfg.max_tenant_instances = 4;
+        cfg.request_burst = 6;
+        cfg.request_rate_per_sec = 1;
+        cfg.tenant_request_burst = 3;
+        cfg.tenant_request_rate_per_sec = 1;
+        cfg.unknown_request_burst = 2;
+        cfg.unknown_request_rate_per_sec = 1;
+        w.driver_with(
+            cfg,
+            Arc::new(ruum_runtime::kube::ledger::MemoryLedger::new()),
+        )
+    };
+    let flood = |g: Arc<KubeDriver>, tok: String, ip: std::net::IpAddr| async move {
+        let mut answers = Vec::new();
+        for _ in 0..8 {
+            let a = g.supervisor_token(&tok, ip).await.map(|_| ());
+            let stop = a == Err(LaunchRefusal::NotReady);
+            answers.push(a);
+            if stop {
+                break;
+            }
+        }
+        answers
+    };
+    // 1. A tenant's own address, a pod that does not exist: its share, then 503.
+    let g = driver();
+    g.sweep().await;
+    let answers = flood(g.clone(), ghost.clone(), a_ip).await;
+    assert_eq!(
+        answers,
+        vec![
+            Err(LaunchRefusal::Forbidden),
+            Err(LaunchRefusal::Forbidden),
+            Err(LaunchRefusal::Forbidden),
+            Err(LaunchRefusal::NotReady)
+        ],
+        "a tenant's address past its share"
+    );
+    assert!(
+        g.supervisor_token(&b_tok, b_ip).await.is_ok(),
+        "the other tenant was refused"
+    );
+    // 2. An address of no pod: the unknown addresses' share only.
+    let g = driver();
+    g.sweep().await;
+    let nowhere: std::net::IpAddr = "10.123.0.9".parse().unwrap();
+    let answers = flood(g.clone(), ghost.clone(), nowhere).await;
+    assert_eq!(
+        answers,
+        vec![
+            Err(LaunchRefusal::Forbidden),
+            Err(LaunchRefusal::Forbidden),
+            Err(LaunchRefusal::NotReady)
+        ],
+        "an unknown address past its share"
+    );
+    assert!(
+        g.supervisor_token(&b_tok, b_ip).await.is_ok(),
+        "a known tenant was refused after an unknown address's flood"
+    );
+    // 3. The first tenant spends its share, its pod goes, and the second tenant's pod gets its
+    // address: after the next sweep the address is the second tenant's.
+    let g = driver();
+    g.sweep().await;
+    let answers = flood(g.clone(), a_tok.clone(), a_ip).await;
+    assert_eq!(answers.last(), Some(&Err(LaunchRefusal::NotReady)));
+    w.fake.remove_pod(NS, &a_pod);
+    let moved = a_ip.to_string();
+    w.fake.edit_pod_status(NS, &b_pod, |st| {
+        st["podIP"] = serde_json::json!(moved);
+        st["podIPs"] = serde_json::json!([{ "ip": moved }]);
+    });
+    g.sweep().await;
+    let a = g.supervisor_token(&b_tok, a_ip).await;
+    assert!(
+        a.is_ok(),
+        "a reused address was charged to its former tenant: {:?}",
+        a.err()
+    );
+}
+
+/// Kimi, run 17, second re-check finding 3: the review and request bounds must serve the
+/// instance caps (a review per sandbox per review lifetime, a request per token poll, with
+/// headroom); the driver refuses bounds that cannot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bounds_too_low_for_the_instance_caps_are_refused() {
+    let w = world(false).await;
+    let ok = |cfg: KubeConfig| {
+        KubeDriver::with_ledger(
+            cfg,
+            w.egress.clone(),
+            Arc::new(MemoryUsage::new()),
+            Arc::new(ruum_runtime::kube::ledger::MemoryLedger::new()),
+        )
+        .is_ok()
+    };
+    assert!(ok(w.cfg.clone()), "the defaults");
+    let mut c = w.cfg.clone();
+    c.tenant_review_rate_per_sec = 4;
+    c.tenant_review_burst = 8;
+    assert!(!ok(c), "4 reviews a second for 512 instances of a tenant");
+    let mut c = w.cfg.clone();
+    c.review_rate_per_sec = 20;
+    c.review_burst = 40;
+    c.tenant_review_rate_per_sec = 4;
+    c.tenant_review_burst = 8;
+    c.max_tenant_instances = 64;
+    assert!(!ok(c), "20 reviews a second for 4096 instances");
+    let mut c = w.cfg.clone();
+    c.tenant_request_rate_per_sec = 10;
+    assert!(!ok(c), "10 requests a second for 512 instances of a tenant");
 }
 
 /// Review of I620-G, required change 2: a launch whose record write the API server refused

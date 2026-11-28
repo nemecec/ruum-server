@@ -90,8 +90,9 @@ const PEER_REQUESTS: u32 = 30;
 const PEER_WINDOW: Duration = Duration::from_secs(10);
 /// The window of [`KubeConfig::peer_reviews_per_minute`].
 const PEER_REVIEW_WINDOW: Duration = Duration::from_secs(60);
-/// How long the tenant of the pod found at a peer address is kept (pod addresses are reused).
-const PEER_TENANT_TTL: Duration = Duration::from_secs(600);
+/// How long the tenant of the pod found at a peer address is kept without a sweep that lists it
+/// (pod addresses are reused; the sweep makes the map again every `sweep_every`).
+const PEER_TENANT_TTL: Duration = Duration::from_secs(60);
 /// How long after the app container's start its supervisor may take the launch data (it tries
 /// for 60 s while the seal of its run is written).
 const LAUNCH_WINDOW_SECS: i64 = 120;
@@ -228,6 +229,12 @@ pub struct KubeConfig {
     pub tenant_request_burst: u32,
     pub request_rate_per_sec: u32,
     pub request_burst: u32,
+    /// The share of requests from addresses whose tenant is not known yet (no pod of the
+    /// sweep's list or of an earlier pre-check is at the address): within the bound of all, so
+    /// requests that never reveal a tenant cannot spend it (Kimi, run 17, second re-check
+    /// finding 1).
+    pub unknown_request_rate_per_sec: u32,
+    pub unknown_request_burst: u32,
 }
 
 impl KubeConfig {
@@ -279,14 +286,16 @@ impl KubeConfig {
             supervisor_tls: false,
             node_arch: "amd64".to_owned(),
             peer_reviews_per_minute: 6,
-            review_rate_per_sec: 20,
-            review_burst: 40,
-            tenant_review_rate_per_sec: 4,
-            tenant_review_burst: 8,
+            review_rate_per_sec: 128,
+            review_burst: 256,
+            tenant_review_rate_per_sec: 16,
+            tenant_review_burst: 32,
             tenant_request_rate_per_sec: 40,
             tenant_request_burst: 120,
             request_rate_per_sec: 400,
             request_burst: 800,
+            unknown_request_rate_per_sec: 100,
+            unknown_request_burst: 200,
         }
     }
 
@@ -379,8 +388,31 @@ impl KubeConfig {
         }
         if self.tenant_request_rate_per_sec > self.request_rate_per_sec
             || self.tenant_request_burst > self.request_burst
+            || self.unknown_request_rate_per_sec == 0
+            || self.unknown_request_burst == 0
+            || self.unknown_request_rate_per_sec > self.request_rate_per_sec
+            || self.unknown_request_burst > self.request_burst
         {
-            return bad("a tenant's share of the supervisor requests is at most the bound of all");
+            return bad(
+                "a tenant's share and the unknown addresses' share of the supervisor requests are above zero and at most the bound of all",
+            );
+        }
+        // The bounds carry the instances they serve, with half again as headroom (Kimi, run 17,
+        // second re-check finding 3): each sandbox needs a review per REVIEW_TTL (its cached
+        // review expires) and a request per token poll (30 s), so a tenant at its instance cap,
+        // and all instances, are served in steady state; a tenant's cap of new sandboxes gets
+        // its reviews within the supervisor's 60 s launch window.
+        let need = |instances: usize, per: u64| (instances as u64).saturating_mul(3) / 2 / per;
+        let ttl = REVIEW_TTL.as_secs();
+        if u64::from(self.tenant_review_rate_per_sec) < need(self.max_tenant_instances, ttl)
+            || u64::from(self.review_rate_per_sec) < need(self.max_instances, ttl)
+            || u64::from(self.tenant_request_rate_per_sec)
+                < need(self.max_tenant_instances.saturating_mul(2), 60)
+            || u64::from(self.request_rate_per_sec) < need(self.max_instances.saturating_mul(2), 60)
+        {
+            return bad(
+                "the token review and supervisor request bounds are too low for max_tenant_instances and max_instances",
+            );
         }
         if self.pids_limit.is_some_and(|p| p < 64) {
             return bad("the PID limit is at least 64");
@@ -489,6 +521,8 @@ struct Inner {
     /// (Kimi, run 17, re-check finding 1).
     tenant_requests: Mutex<HashMap<TenantId, (Instant, f64)>>,
     request_bucket: Mutex<(Instant, f64)>,
+    /// The share of requests from addresses of no known tenant.
+    unknown_requests: Mutex<(Instant, f64)>,
     /// The tenant of the pod the pre-check found at a peer address, and when.
     peer_tenants: Mutex<HashMap<IpAddr, (TenantId, Instant)>>,
 }
@@ -564,6 +598,7 @@ impl KubeDriver {
         let live = LogBudget::new(cfg.max_live_log_bytes, cfg.max_tenant_live_log_bytes);
         let review_burst = cfg.review_burst;
         let request_burst = cfg.request_burst;
+        let unknown_burst = cfg.unknown_request_burst;
         let inner = Arc::new(Inner {
             cfg,
             api,
@@ -584,6 +619,7 @@ impl KubeDriver {
             tenant_reviews: Mutex::new(HashMap::new()),
             tenant_requests: Mutex::new(HashMap::new()),
             request_bucket: Mutex::new((Instant::now(), f64::from(request_burst))),
+            unknown_requests: Mutex::new((Instant::now(), f64::from(unknown_burst))),
             peer_tenants: Mutex::new(HashMap::new()),
         });
         let sweeper = tokio::runtime::Handle::try_current()
@@ -1704,7 +1740,9 @@ impl Inner {
             }
         }
         // Pods without a running record (a crash between the record and the delete).
+        let listed = Instant::now();
         if let Ok(pods) = self.api.list(Kind::Pod, &sel).await {
+            self.set_peer_tenants(&pods, listed);
             for p in pods {
                 let Some(name) = p.pointer("/metadata/name").and_then(Value::as_str) else {
                     continue;
@@ -1851,10 +1889,11 @@ impl Inner {
     }
 
     /// One more whole supervisor request, within its bounds (Kimi, run 17, re-check finding 1):
-    /// of `tenant`'s share when known, and of all tenants together when `all`; past either
+    /// of `tenant`'s share when known, and of all tenants together when `all`; with `all` and
+    /// no tenant, of the unknown addresses' share too (second re-check finding 1). Past any
     /// `NotReady` (the supervisor asks again). A refused request spends nothing.
     fn request_budget(&self, all: bool, tenant: Option<TenantId>) -> Result<(), LaunchRefusal> {
-        // One order of the locks: the tenants, all.
+        // One order of the locks: the tenants, the unknown addresses, all.
         let (rate, burst) = (
             self.cfg.tenant_request_rate_per_sec,
             self.cfg.tenant_request_burst,
@@ -1877,6 +1916,19 @@ impl Inner {
             tracing::warn!(target: "ruum::runtime", tenant = %id.0, "the supervisor requests of one tenant's sandboxes are at their share");
             return Err(LaunchRefusal::NotReady);
         }
+        let mut unknown = (all && tenant.is_none()).then(|| {
+            let mut u = self.unknown_requests.lock().expect("unknown requests lock");
+            refill(
+                &mut u,
+                self.cfg.unknown_request_rate_per_sec,
+                self.cfg.unknown_request_burst,
+            );
+            u
+        });
+        if unknown.as_ref().is_some_and(|u| u.1 < 1.0) {
+            tracing::warn!(target: "ruum::runtime", "the supervisor requests from addresses of no known tenant are at their share");
+            return Err(LaunchRefusal::NotReady);
+        }
         if all {
             let mut g = self.request_bucket.lock().expect("request bucket lock");
             refill(
@@ -1890,10 +1942,50 @@ impl Inner {
             }
             g.1 -= 1.0;
         }
+        if let Some(u) = unknown.as_mut() {
+            u.1 -= 1.0;
+        }
         if let Some(b) = tb {
             b.1 -= 1.0;
         }
         Ok(())
+    }
+
+    /// The tenants of the addresses of the sandbox pods the sweep listed (their tenant label,
+    /// which the driver wrote, and their status addresses; a pod being deleted is left out).
+    /// The map is made again from them, keeping only the pre-check's entries made since
+    /// `since`: an address another pod took over is mapped to its new tenant by the next sweep
+    /// (Kimi, run 17, second re-check findings 1 and 2).
+    fn set_peer_tenants(&self, pods: &[Value], since: Instant) {
+        let label = format!(
+            "/metadata/labels/{}",
+            crate::driver::LABEL_TENANT.replace('/', "~1")
+        );
+        let now = Instant::now();
+        let mut fresh: HashMap<IpAddr, (TenantId, Instant)> = HashMap::new();
+        for p in pods {
+            if p.pointer("/metadata/deletionTimestamp").is_some() {
+                continue;
+            }
+            let Some(tenant) = p
+                .pointer(&label)
+                .and_then(Value::as_str)
+                .and_then(|t| uuid::Uuid::parse_str(t).ok())
+                .map(TenantId)
+            else {
+                continue;
+            };
+            for ip in pod_ips(p) {
+                fresh.insert(canonical(ip), (tenant, now));
+            }
+        }
+        let mut m = self.peer_tenants.lock().expect("peer tenants lock");
+        for (ip, (tenant, at)) in m.iter() {
+            if *at >= since {
+                fresh.insert(*ip, (*tenant, *at));
+            }
+        }
+        *m = fresh;
     }
 
     /// The tenant of the pod the pre-check last found at `peer` (within [`PEER_TENANT_TTL`]).

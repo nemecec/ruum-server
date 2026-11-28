@@ -640,7 +640,9 @@ refuses to render.
   a holder of the record key; no node network change is needed. Each request costs at most one
   `TokenReview` after cheap checks (the token reads as the sandbox account's projected token of
   a pod that exists at the caller's address), and the reviews are bounded per address (6 a
-  minute) and for all sandboxes together (20 a second, a burst of 40; backlog I620-12).
+  minute), per tenant (16 a second, a burst of 32) and for all sandboxes together (128 a second,
+  a burst of 256; backlog I620-12, sized for the instance caps). Whole requests are bounded per
+  tenant and in all too (backlog I620-17).
 - **The launch ledger** (backlog I620-9): the generation mark of each sealed record and the pods
   that took their launch data live in the platform database (`runtime_seal_marks`,
   `runtime_launches`, migration 0018), shared by both server replicas; a seal put back into a
