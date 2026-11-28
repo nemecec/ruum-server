@@ -2177,6 +2177,8 @@ mod node22_pipeline {
         stall: std::sync::atomic::AtomicBool,
         /// A start takes this long before it reaches the memory driver.
         start_delay: Mutex<Duration>,
+        /// A status request takes this long.
+        status_delay: Mutex<Duration>,
     }
 
     impl Counting {
@@ -2239,6 +2241,8 @@ mod node22_pipeline {
             i: crate::runtime::InstanceId,
         ) -> std::result::Result<crate::runtime::InstanceStatus, crate::runtime::RuntimeError>
         {
+            let delay = *self.status_delay.lock().unwrap();
+            tokio::time::sleep(delay).await;
             Ok(self.stalled(self.inner.status(t, i).await?))
         }
         async fn stop(
@@ -2327,6 +2331,7 @@ mod node22_pipeline {
             stopped: Mutex::default(),
             stall: std::sync::atomic::AtomicBool::new(false),
             start_delay: Mutex::new(Duration::ZERO),
+            status_delay: Mutex::new(Duration::ZERO),
         });
         let mut parts = crate::apps::AppParts::memory(None);
         parts.runtime = driver.clone();
@@ -2722,6 +2727,49 @@ mod node22_pipeline {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(stopped, "the late start's instance was not stopped");
+    }
+
+    /// The cap bounds the status requests of the start check too (Kimi re-check 2 of the
+    /// review of I6-13): a status request that hangs ends at the cap and the instance is
+    /// stopped.
+    #[tokio::test]
+    async fn a_slow_status_request_ends_at_the_publish_cap() {
+        let settings = Node22Settings {
+            start_wait: Duration::from_secs(120),
+            publish_start_wait: Duration::from_secs(1),
+            ..Node22Settings::default()
+        };
+        let (w, driver, _) = node22_world_with(None, settings).await;
+        let app = w.app("Slow status").await;
+        let src = w
+            .folder(
+                "slow status src",
+                &[("app.yaml", SERVER), ("server.js", SERVER_JS)],
+            )
+            .await;
+        let p = w.preview(app, src, None).await;
+        // The first answer (of the start) says starting; every status request hangs.
+        driver
+            .stall
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *driver.status_delay.lock().unwrap() = Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        let err = w.publish(&w.m(), app, p.id).await.unwrap_err();
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_secs(1) && took < Duration::from_secs(10),
+            "the publish waited for the status request: {took:?}"
+        );
+        let Error::Api(e) = err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(
+            e.details.as_deref().and_then(|d| d.get("reason")),
+            Some(&serde_json::json!("not_ready")),
+            "{e:?}"
+        );
+        assert_eq!(w.live(app).await, None, "nothing went live");
+        assert!(driver.left_running().is_empty());
     }
 
     #[tokio::test]
