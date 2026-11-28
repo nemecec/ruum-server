@@ -109,6 +109,13 @@ fn runtime_env(e: AppEnv) -> Environment {
     }
 }
 
+fn record_env_of(e: Environment) -> RecordEnv {
+    match e {
+        Environment::Live => RecordEnv::Live,
+        Environment::Preview => RecordEnv::Preview,
+    }
+}
+
 fn record_env(e: AppEnv) -> RecordEnv {
     match e {
         AppEnv::Live => RecordEnv::Live,
@@ -227,6 +234,75 @@ impl SandboxDirectory {
         if let Some(slot) = slots.get_mut(&(tenant, deployment, environment)) {
             slot.instance = None;
             slot.epoch += 1;
+        }
+    }
+
+    /// Stops the instances of this process whose deployment no longer serves: a live deployment
+    /// that a publish or rollback replaced, an expired, superseded or failed preview, an app
+    /// that is gone (card I6-13; Kimi I6-13, finding 1). The record decides, as for a request.
+    /// The count of stopped instances. Instances that another process started are that
+    /// process's (each one sweeps its own); an instance whose process ended scales to zero after
+    /// its idle time (node22 refuses always-on instances).
+    pub async fn sweep(&self) -> usize {
+        let held: Vec<(Key, InstanceId)> = {
+            let slots = self.inner.slots.lock().expect("sandbox slots lock");
+            slots
+                .iter()
+                .filter_map(|(k, s)| s.instance.map(|i| (*k, i)))
+                .collect()
+        };
+        let mut stopped = 0;
+        for (key, id) in held {
+            let (tenant, deployment, _) = key;
+            let st = match self.inner.driver.status(tenant, id).await {
+                Ok(st) => st,
+                Err(RuntimeError::NotFound { .. }) => {
+                    self.inner.drop_instance(&key, id);
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            if matches!(st.state, InstanceState::Stopped | InstanceState::Exited(_)) {
+                continue;
+            }
+            let store = &self.inner.store;
+            let app = st.identity.app;
+            let keep = match (
+                store.get_app(tenant, app).await,
+                store.get_deployment(tenant, app, deployment).await,
+            ) {
+                (Ok(Some(a)), Ok(Some(d))) => {
+                    d.environment == record_env_of(key.2) && serving(&a, &d, crate::now())
+                }
+                (Ok(_), Ok(_)) => false,
+                // A store error decides nothing: the next sweep tries again.
+                _ => true,
+            };
+            if keep {
+                continue;
+            }
+            match self.inner.driver.stop(tenant, id).await {
+                Ok(()) => {
+                    self.inner.drop_instance(&key, id);
+                    stopped += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(target: "ruum::apps", code = e.code(), "could not stop the instance of a retired deployment; the next sweep tries again")
+                }
+            }
+        }
+        stopped
+    }
+
+    /// Runs [`Self::sweep`] every `every` until the process ends.
+    pub async fn run_sweeper(self, every: Duration) {
+        let mut tick = tokio::time::interval(every);
+        loop {
+            tick.tick().await;
+            let n = self.sweep().await;
+            if n > 0 {
+                tracing::info!(target: "ruum::apps", stopped = n, "instances of retired deployments stopped");
+            }
         }
     }
 
@@ -793,6 +869,62 @@ mod tests {
             .url(),
             "http://[fd00::1]:8080"
         );
+    }
+
+    #[tokio::test]
+    async fn the_sweep_stops_the_instance_of_a_retired_deployment_only() {
+        let w = world().await;
+        let (a, owner) = w.tenant_app("acme").await;
+        let keep = w
+            .deployment(
+                &a,
+                owner,
+                RecordEnv::Preview,
+                DeploymentState::Ready,
+                "node22",
+            )
+            .await;
+        let retired = w
+            .deployment(
+                &a,
+                owner,
+                RecordEnv::Preview,
+                DeploymentState::Ready,
+                "node22",
+            )
+            .await;
+        let d = w.directory(None);
+        let mut ids = Vec::new();
+        for row in [&keep, &retired] {
+            let st = w
+                .driver
+                .start(spec_for(identity_of(row), Vec::new()))
+                .await
+                .unwrap();
+            d.register(a.tenant, st.id).await.unwrap();
+            ids.push(st.id);
+        }
+        assert_eq!(d.sweep().await, 0, "both serve");
+        // A newer draft preview supersedes it, or it expires: it no longer serves.
+        assert!(
+            w.s.apps
+                .store()
+                .set_deployment_state(a.tenant, retired.id, DeploymentState::Superseded)
+                .await
+                .unwrap()
+        );
+        assert_eq!(d.sweep().await, 1);
+        assert_eq!(
+            w.driver.status(a.tenant, ids[1]).await.unwrap().state,
+            InstanceState::Stopped
+        );
+        assert_ne!(
+            w.driver.status(a.tenant, ids[0]).await.unwrap().state,
+            InstanceState::Stopped
+        );
+        assert_eq!(d.instance_of(&query(&retired, AppEnv::Preview)), None);
+        assert_eq!(d.instance_of(&query(&keep, AppEnv::Preview)), Some(ids[0]));
+        assert_eq!(d.sweep().await, 0);
     }
 
     #[tokio::test]

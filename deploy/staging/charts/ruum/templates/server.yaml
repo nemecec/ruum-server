@@ -197,7 +197,11 @@ spec:
             - { name: RUUM_BUILD_REGISTRY_URL, value: {{ .Values.runtime.registryPushUrl | quote }} }
             - { name: RUUM_BUILD_PUSH_USER, value: ruum-push }
             - { name: RUUM_BUILD_PUSH_PASSWORD_FILE, value: /var/run/secrets/ruum-registry/push-password }
-            - { name: RUUM_BUILD_CHANNEL_SERVICE, value: "ruum-build-channel.ruum.svc.cluster.local:8092" }
+            # This pod's own address: a build's channel entry lives in the server process that
+            # started it, so its build pod must reach that replica, not the Service (Kimi I6-13, 5).
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            - { name: RUUM_BUILD_CHANNEL_SERVICE, value: "$(POD_IP):8092" }
             - { name: RUUM_BUILD_CHANNEL_LISTEN, value: "0.0.0.0:8092" }
             - { name: RUUM_BUILD_NAMESPACE, value: ruum-builds }
             # The output of a build is in the server's memory until it is pushed (with its
@@ -308,20 +312,6 @@ spec:
   selector: { app: ruum-server }
   ports:
     - { name: supervisor, port: 8091, targetPort: supervisor }
----
-{{- end }}
-{{- if $builder }}
-# The build channel (card I6-13): the build pods of ruum-builds fetch their source and send their
-# output here (charts/platform builder-rbac.yaml lets only them reach it). No public route.
-apiVersion: v1
-kind: Service
-metadata:
-  name: ruum-build-channel
-  namespace: ruum
-spec:
-  selector: { app: ruum-server }
-  ports:
-    - { name: build-channel, port: 8092, targetPort: build-channel }
 ---
 {{- end }}
 # The internal listener: the edge's on-demand TLS `ask` (review 1 B-6). No public route.

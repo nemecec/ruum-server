@@ -66,6 +66,12 @@ an app image|.spec.containers[0].image = "registry.ruum.internal:5000/ruum/t/a@s
 a value from a Secret|.spec.containers[0].env += [{ name: "X", valueFrom: { secretKeyRef: { name: "x", key: "y" } } }]
 envFrom|.spec.containers[0].envFrom = [{ configMapRef: { name: "x" } }]
 the host network|.spec.hostNetwork = true
+no deadline|del(.spec.activeDeadlineSeconds)
+restartPolicy Always|.spec.restartPolicy = "Always"
+no memory limit|del(.spec.containers[0].resources.limits.memory)
+a writable root|.spec.containers[0].securityContext.readOnlyRootFilesystem = false
+a memory-backed volume|.spec.volumes[0].emptyDir.medium = "Memory"
+a volume without a size limit|del(.spec.volumes[0].emptyDir.sizeLimit)
 CASES
 if kubectl -n "$NS" create secret generic ruum-check --from-literal=a=b --dry-run=server >/dev/null 2>&1; then
   fail "$NS admits a Secret"

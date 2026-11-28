@@ -100,13 +100,14 @@ pub async fn services_with(
     // takes `services.authz`, so it runs after the engine is chosen.
     install(&mut services, identity, pool.clone()).context("set up the identity area")?;
     install_databases(&mut services, pool.clone(), &handles).await?;
-    install_apps(&mut services, pool.clone(), &handles)?;
-    install_telemetry(&mut services, pool)?;
-    install_templates(&mut services, &crate::config::GallerySettings::from_env()?)?;
+    // The workload key before the apps area: node22 instances get tokens it signs (card I6-13).
     services.workload_tokens = workload_tokens(
         &identity.public_url,
         &crate::config::WorkloadTokenSettings::from_env(),
     )?;
+    install_apps(&mut services, pool.clone(), &handles)?;
+    install_telemetry(&mut services, pool)?;
+    install_templates(&mut services, &crate::config::GallerySettings::from_env()?)?;
     Ok(services)
 }
 
@@ -305,9 +306,10 @@ pub fn install_apps(
             tokio::spawn(mirror_base(b.builder.clone()));
             tracing::info!("node22 deployments: the Kubernetes builder (card I6-13)");
         }
-        services.sandboxes = Some(Arc::new(
-            sandbox_directory(services, k).with_spec_maker(services.apps.spec_maker()),
-        ));
+        let directory = sandbox_directory(services, k).with_spec_maker(services.apps.spec_maker());
+        // Instances of retired deployments stop (card I6-13; Kimi I6-13, finding 1).
+        tokio::spawn(directory.clone().run_sweeper(SANDBOX_SWEEP_EVERY));
+        services.sandboxes = Some(Arc::new(directory));
     }
     tokio::spawn(services.apps.clone().run_sweeper(PREVIEW_SWEEP_EVERY));
     Ok(())
@@ -394,6 +396,19 @@ pub fn kube_driver(
             "the runtime driver has no registry (RUUM_REGISTRY): every app image is image_not_found"
         );
     }
+    // With the builder (card I6-13) the driver checks app images at the cluster registry with
+    // the builder's credential (no anonymous access there); the nodes pull by `RUUM_REGISTRY`.
+    let push_password = match &k.builder {
+        Some(b) => {
+            let password = std::fs::read_to_string(&b.push_password_file)
+                .with_context(|| format!("cannot read {}", b.push_password_file.display()))?;
+            let password = SecretValue::new(password.trim_end_matches(['\r', '\n']));
+            cfg.registry_url = Some(b.registry_url.clone());
+            cfg.registry_credential = Some((b.push_user.clone(), password.clone()));
+            Some(password)
+        }
+        None => None,
+    };
     // The anti-rollback ledger that every server replica shares (backlog I620-9): the platform
     // database. A process without one would keep the marks to itself, so it does not start.
     let pool = pool.context(
@@ -415,8 +430,9 @@ pub fn kube_driver(
         let key = cfg_record_key(&key)?;
         let identity = ruum_runtime::kube::tls::SupervisorTls::derive(&key)
             .map_err(|e| anyhow::anyhow!("the build channel's TLS: {e}"))?;
-        let password = std::fs::read_to_string(&b.push_password_file)
-            .with_context(|| format!("cannot read {}", b.push_password_file.display()))?;
+        let password = push_password
+            .clone()
+            .context("the builder's push password")?;
         let mut bc = ruum_runtime::builder::kube::KubeBuilderConfig::new(
             &k.api_url,
             k.registry.as_deref().unwrap_or_default(),
@@ -435,7 +451,7 @@ pub fn kube_driver(
         bc.node_arch = k.node_arch.clone();
         bc.credential = Some(ruum_runtime::RegistryCredential {
             username: b.push_user.clone(),
-            password: SecretValue::new(password.trim_end_matches(['\r', '\n'])),
+            password,
         });
         if let Some(n) = b.output_max {
             bc.output_max = n;
@@ -499,6 +515,9 @@ pub struct BuildChannel {
 /// Set once by [`kube_driver`] with `RUUM_BUILDER=kubernetes`; `main` serves
 /// [`crate::build_channel::router`] on it.
 pub static BUILDER: std::sync::OnceLock<BuildChannel> = std::sync::OnceLock::new();
+
+/// How often the sandbox directory stops the instances of retired deployments.
+const SANDBOX_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How often the build pods that a stopped server process left behind are deleted, and how
 /// old they must be (longer than any build's timeout).

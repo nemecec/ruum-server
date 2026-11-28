@@ -1214,7 +1214,8 @@ YAML
   expect 1 "charts/ruum refuses a push URL with a path (P-84)" helm template ruum "$STG/charts/ruum" "${A[@]}" "${KD[@]}" --set runtime.builder=true --set runtime.registry=registry.ruum.internal:5000 --set runtime.registryPushUrl=http://r:5000/x
   expect 0 "render charts/ruum with the builder on (I6-13)" helm template ruum "$STG/charts/ruum" "${A[@]}" "${KD[@]}" --set runtime.builder=true --set runtime.registry=registry.ruum.internal:5000
   cp "$TMP/out" "$TMP/ruum-builder.yaml"
-  doc_of "$TMP/ruum-builder.yaml" Service ruum-build-channel | grep -qF 'port: 8092' && ok "the build channel has its Service (8092)" || bad "no Service ruum-build-channel"
+  grep -qF '{ name: RUUM_BUILD_CHANNEL_SERVICE, value: "$(POD_IP):8092" }' "$TMP/ruum-builder.yaml" && grep -qF 'fieldPath: status.podIP' "$TMP/ruum-builder.yaml" &&
+    ok "a build pod reaches the server replica that started it (its pod address, port 8092)" || bad "the build channel address is not the server pod's own"
   doc_of "$TMP/ruum-builder.yaml" Deployment ruum-server >"$TMP/srv-builder.yaml"
   grep -qF '{ name: RUUM_BUILDER, value: kubernetes }' "$TMP/srv-builder.yaml" && grep -qF 'secretName: ruum-registry-push' "$TMP/srv-builder.yaml" &&
     grep -qF '{ name: RUUM_BUILD_CHANNEL_LISTEN, value: "0.0.0.0:8092" }' "$TMP/srv-builder.yaml" &&

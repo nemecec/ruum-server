@@ -793,8 +793,9 @@ node22 spec maker. The pieces on staging, all **off** (decision 0008-5):
 - **The builder** in ruum-server (`runtime.builder`): build pods in `ruum-builds` (its Role:
   pods and `pods/log` there, `charts/platform` `builder-rbac.yaml`; the account `ruum-build` has
   no right and no token; `k8s/manifests/builds-admission.yaml` admits only the build pod's shape
-  and no Secret), the build channel on port 8092 (Service `ruum/ruum-build-channel`, TLS with
-  the supervisor listener's pinned key; only `ruum-builds` reaches it), the push password as a
+  and no Secret), the build channel on port 8092 of the server pod that started the build (its own
+  address: the channel entry lives in that process; TLS with the supervisor listener's pinned
+  key; only `ruum-builds` reaches it), the push password as a
   file (Secret `ruum/ruum-registry-push`). At start it copies the node22 base image from Docker
   Hub into the registry (`ruum-base/node22`, by digest).
 - **No internet for builds yet**: the egress proxy refuses every pod until the egress control is
@@ -805,7 +806,9 @@ node22 spec maker. The pieces on staging, all **off** (decision 0008-5):
 
 The person, once: decide to turn on node22 apps on staging (a line in
 `docs/decisions/0008-person-decisions-2026-11-13.md` item 5, next to the driver's line of step 1
-above). Nothing in a console.
+above), accepting the open rows of `docs/backlog/2026-11-28-i613.md` while only test apps run:
+among them I613-4 (the registry keeps every image: a tenant can fill its 20 GiB volume) and
+I613-5 (plain HTTP to the registry on the private node network). Nothing in a console.
 
 The orchestrator, in this order (each step stops on the first error; the live release keeps
 serving). The driver's steps 4 to 9 above come first, or with step 5 below.

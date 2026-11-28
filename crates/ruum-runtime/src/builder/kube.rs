@@ -75,6 +75,10 @@ pub const CONTAINER: &str = "build";
 pub const BUILD_UID: u32 = 10001;
 /// The label of everything a build owns: its ID.
 pub const LABEL_BUILD: &str = super::LABEL_BUILD;
+/// The default output cap of a Kubernetes build (64 MiB).
+pub const KUBE_OUTPUT_MAX: u64 = 64 * 1024 * 1024;
+/// The most bytes of a token or manifest answer of Docker Hub while mirroring the base.
+const MIRROR_SMALL_MAX: usize = 1024 * 1024;
 /// How often the builder reads the pod while the build runs.
 const POLL: Duration = Duration::from_millis(1000);
 /// The most bytes of the build log the builder reads back.
@@ -210,6 +214,8 @@ pub struct KubeBuilderConfig {
     pub max_parallel: usize,
     pub per_tenant: usize,
     pub npm_registry: String,
+    /// The allow list of a build at the egress proxy: the npm registry hosts.
+    pub npm_hosts: Vec<String>,
     /// The egress proxy as the build pod reaches it (an `/etc/hosts` line); `None`: the build
     /// has no route to the internet (only builds without downloads work).
     pub egress_proxy: Option<SharedService>,
@@ -247,10 +253,13 @@ impl KubeBuilderConfig {
             base_repository: super::BASE_REPOSITORY.to_owned(),
             base_index: NODE22_BASE_INDEX.to_owned(),
             node_arch: "amd64".to_owned(),
-            output_max: super::BUILD_OUTPUT_MAX,
-            max_parallel: 4,
-            per_tenant: 2,
+            // An output and its layer are in the server's memory until the push (Kimi I6-13, 3):
+            // one build of at most 64 MiB at a time unless the settings say more.
+            output_max: KUBE_OUTPUT_MAX,
+            max_parallel: 1,
+            per_tenant: 1,
             npm_registry: super::NPM_REGISTRY.to_owned(),
+            npm_hosts: vec!["registry.npmjs.org".to_owned()],
             egress_proxy: None,
             channel_address: channel_address.to_owned(),
             channel_port,
@@ -287,6 +296,9 @@ impl KubeBuilderConfig {
         }
         if !self.channel_tls.pin.starts_with("sha256:") || self.channel_tls.cert_der.is_empty() {
             return bad("the build channel needs its TLS certificate and pin");
+        }
+        if self.npm_hosts.is_empty() {
+            return bad("a build needs the npm registry on its allow list");
         }
         if self.namespace.is_empty() || self.runtime_class.is_empty() {
             return bad("the namespace and the runtime class must be set");
@@ -345,6 +357,25 @@ fn canonical(ip: IpAddr) -> IpAddr {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
         v4 => v4,
     }
+}
+
+/// A successful answer's body, read under `max` bytes (Kimi I6-13, finding 10).
+async fn capped(req: reqwest::RequestBuilder, max: usize) -> Result<Bytes, String> {
+    let mut r = req.send().await.map_err(|e| e.without_url().to_string())?;
+    if !r.status().is_success() {
+        return Err(format!("HTTP {}", r.status()));
+    }
+    if r.content_length().is_some_and(|n| n > max as u64) {
+        return Err(format!("the answer is over {max} bytes"));
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = r.chunk().await.map_err(|e| e.without_url().to_string())? {
+        if out.len() + chunk.len() > max {
+            return Err(format!("the answer is over {max} bytes"));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(out))
 }
 
 /// The name of a build's pod.
@@ -559,17 +590,32 @@ async fn cleanup(
         .unwrap_or_else(|p| p.into_inner())
         .remove(&build);
     let pod = pod_name(build);
-    if let Err(e) = api.delete(Kind::Pod, &pod, Some(0)).await {
-        tracing::warn!(target: "ruum::runtime", %build, code = e.code(), "a build pod could not be deleted; the next sweep of the namespace must");
-    }
+    // The egress registration goes first: while the pod exists its address cannot go to another
+    // pod. When the proxy cannot be reached the pod stays, and the sweep unregisters and deletes
+    // it later (Kimi I6-13, finding 9).
     let was = *registered.lock().unwrap_or_else(|p| p.into_inner());
     if was {
-        match egress.unregister(&pod).await {
-            Ok(()) => *registered.lock().unwrap_or_else(|p| p.into_inner()) = false,
-            Err(e) => {
-                tracing::warn!(target: "ruum::runtime", %build, code = e.code(), "a build's egress registration could not be removed")
+        let mut ok = false;
+        for attempt in 0..3u64 {
+            match egress.unregister(&pod).await {
+                Ok(()) => {
+                    ok = true;
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(target: "ruum::runtime", %build, code = e.code(), "a build's egress registration could not be removed");
+                    tokio::time::sleep(Duration::from_millis(200 * (attempt + 1))).await;
+                }
             }
         }
+        if !ok {
+            tracing::warn!(target: "ruum::runtime", %build, "the build pod stays until the sweep removes its egress registration");
+            return;
+        }
+        *registered.lock().unwrap_or_else(|p| p.into_inner()) = false;
+    }
+    if let Err(e) = api.delete(Kind::Pod, &pod, Some(0)).await {
+        tracing::warn!(target: "ruum::runtime", %build, code = e.code(), "a build pod could not be deleted; the next sweep of the namespace must");
     }
 }
 
@@ -863,41 +909,38 @@ impl KubeBuilder {
         struct Tok {
             token: String,
         }
-        let tok: Tok = c
-            .get(format!(
+        let tok = capped(
+            c.get(format!(
                 "{auth}?service=registry.docker.io&scope=repository:library/node:pull"
-            ))
-            .send()
-            .await
-            .map_err(|e| un("token", &e))?
-            .json()
-            .await
-            .map_err(|e| un("token", &e))?;
+            )),
+            MIRROR_SMALL_MAX,
+        )
+        .await
+        .map_err(|e| un("token", &e))?;
+        let tok: Tok = serde_json::from_slice(&tok).map_err(|e| un("token", &e))?;
         let from = format!("{}/v2/library/node", hub.trim_end_matches('/'));
-        let manifest = c
-            .get(format!("{from}/manifests/{}", d.digest))
-            .bearer_auth(&tok.token)
-            .header("Accept", &d.media_type)
-            .send()
-            .await
-            .map_err(|e| un("manifest", &e))?
-            .bytes()
-            .await
-            .map_err(|e| un("manifest", &e))?;
+        let manifest = capped(
+            c.get(format!("{from}/manifests/{}", d.digest))
+                .bearer_auth(&tok.token)
+                .header("Accept", &d.media_type),
+            MIRROR_SMALL_MAX,
+        )
+        .await
+        .map_err(|e| un("manifest", &e))?;
         if OciDigest::of(&manifest) != self.base_manifest {
             return Err(un("manifest", &"the manifest does not match the pin"));
         }
         let m = oci::parse_manifest(&manifest)?;
         for b in std::iter::once(&m.config).chain(m.layers.iter()) {
-            let data = c
-                .get(format!("{from}/blobs/{}", b.digest))
-                .bearer_auth(&tok.token)
-                .send()
-                .await
-                .map_err(|e| un("blob", &e))?
-                .bytes()
-                .await
-                .map_err(|e| un("blob", &e))?;
+            // Exactly the size the (pinned) manifest gives, never more.
+            let size = usize::try_from(b.size).map_err(|e| un("blob", &e))?;
+            let data = capped(
+                c.get(format!("{from}/blobs/{}", b.digest))
+                    .bearer_auth(&tok.token),
+                size,
+            )
+            .await
+            .map_err(|e| un("blob", &e))?;
             if OciDigest::of(&data).as_str() != b.digest {
                 return Err(un(
                     "blob",
@@ -945,6 +988,10 @@ impl KubeBuilder {
                         .ok()
                 });
             if created.is_some_and(|c| now - c < age) {
+                continue;
+            }
+            // Its egress registration first (a no-op when there is none), then the pod.
+            if self.cfg.egress_proxy.is_some() && self.egress.unregister(name).await.is_err() {
                 continue;
             }
             if self.api.delete(Kind::Pod, name, Some(0)).await.is_ok() {
@@ -1050,7 +1097,8 @@ impl KubeBuilder {
                             network: pod.clone(),
                             subnet,
                             identity: input.identity,
-                            allow: None,
+                            // The npm registry only, as the Docker builder (Kimi I6-13, 6).
+                            allow: Some(self.cfg.npm_hosts.clone()),
                         })
                         .await?;
                 }
