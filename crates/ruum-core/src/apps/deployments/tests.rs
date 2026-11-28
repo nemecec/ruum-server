@@ -2175,6 +2175,8 @@ mod node22_pipeline {
         started: Mutex<Vec<crate::runtime::InstanceId>>,
         stopped: Mutex<Vec<crate::runtime::InstanceId>>,
         stall: std::sync::atomic::AtomicBool,
+        /// A start takes this long before it reaches the memory driver.
+        start_delay: Mutex<Duration>,
     }
 
     impl Counting {
@@ -2225,6 +2227,8 @@ mod node22_pipeline {
             spec: crate::runtime::WorkloadSpec,
         ) -> std::result::Result<crate::runtime::InstanceStatus, crate::runtime::RuntimeError>
         {
+            let delay = *self.start_delay.lock().unwrap();
+            tokio::time::sleep(delay).await;
             let st = self.inner.start(spec).await?;
             self.started.lock().unwrap().push(st.id);
             Ok(self.stalled(st))
@@ -2322,6 +2326,7 @@ mod node22_pipeline {
             started: Mutex::default(),
             stopped: Mutex::default(),
             stall: std::sync::atomic::AtomicBool::new(false),
+            start_delay: Mutex::new(Duration::ZERO),
         });
         let mut parts = crate::apps::AppParts::memory(None);
         parts.runtime = driver.clone();
@@ -2667,6 +2672,56 @@ mod node22_pipeline {
         );
         assert_eq!(w.live(app).await, None, "nothing went live");
         assert!(driver.left_running().is_empty());
+    }
+
+    /// The cap of the start before a publish bounds a slow start request too (Kimi re-check of
+    /// the review of I6-13): the publish answers at the cap, and the instance that the late
+    /// start makes is stopped once the start returns.
+    #[tokio::test]
+    async fn a_slow_start_request_ends_at_the_publish_cap_and_is_stopped() {
+        let settings = Node22Settings {
+            start_wait: Duration::from_secs(120),
+            publish_start_wait: Duration::from_secs(1),
+            ..Node22Settings::default()
+        };
+        let (w, driver, _) = node22_world_with(None, settings).await;
+        let app = w.app("Slow runtime").await;
+        let src = w
+            .folder(
+                "slow runtime src",
+                &[("app.yaml", SERVER), ("server.js", SERVER_JS)],
+            )
+            .await;
+        let p = w.preview(app, src, None).await;
+        let before = driver.started.lock().unwrap().len();
+        *driver.start_delay.lock().unwrap() = Duration::from_secs(3);
+        let started = std::time::Instant::now();
+        let err = w.publish(&w.m(), app, p.id).await.unwrap_err();
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_secs(1) && took < Duration::from_secs(3),
+            "the publish waited for the slow start: {took:?}"
+        );
+        let Error::Api(e) = err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(e.code, ErrorCode::Conflict);
+        assert_eq!(
+            e.details.as_deref().and_then(|d| d.get("reason")),
+            Some(&serde_json::json!("not_ready")),
+            "{e:?}"
+        );
+        assert_eq!(w.live(app).await, None, "nothing went live");
+        // The late start ends and its instance is stopped.
+        let mut stopped = false;
+        for _ in 0..100 {
+            if driver.started.lock().unwrap().len() > before && driver.left_running().is_empty() {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(stopped, "the late start's instance was not stopped");
     }
 
     #[tokio::test]
