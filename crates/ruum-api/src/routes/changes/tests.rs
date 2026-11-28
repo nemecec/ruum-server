@@ -80,6 +80,9 @@ impl FeedAccess for SeesAll {
     async fn manager_since(&self) -> Result<Option<time::OffsetDateTime>> {
         self.member_since().await
     }
+    async fn can_edit(&self, _node: NodeId) -> Result<bool> {
+        Ok(true)
+    }
 }
 
 fn agent_ctx(tenant: TenantId, owner: UserId) -> Context {

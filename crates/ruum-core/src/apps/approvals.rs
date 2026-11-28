@@ -567,14 +567,48 @@ impl AppService {
         let rows = self.preview_rows(tenant, dep.id).await?;
         let (mut bindings_added, mut bindings_removed, bound_bindings) =
             super::bindings::approval_bindings(&manifest, live_manifest.as_ref(), &rows);
-        // A binding whose name stays but whose target, role, API or scopes change (Kimi W-3b,
-        // 1): it is removed and added again, so the person sees it and a later change of the
-        // live binding makes the approval stale.
+        // A binding whose name stays but whose spec or resolved target, role, API or scopes
+        // change (Kimi W-3b, 1 and its re-check): it is removed and added again, so the person
+        // sees it. The live side is the live principal's active rows (what the live app holds
+        // now); a preview's database row names a branch and compares as its source.
         let spec = |m: Option<&Value>, name: &str| {
             m.and_then(|m| m.get("bindings"))
                 .and_then(|b| b.get(name))
                 .cloned()
         };
+        let live_rows = match app.live_deployment_id {
+            Some(_) => {
+                self.deps
+                    .store
+                    .list_bindings(
+                        tenant,
+                        &super::store::BindingQuery {
+                            principal: Some(app.node_id.0),
+                            active_only: true,
+                            limit: 500,
+                            ..Default::default()
+                        },
+                    )
+                    .await?
+            }
+            None => Vec::new(),
+        };
+        let sources = self.branch_sources(tenant, &rows).await?;
+        let resolved = |b: &super::store::BindingRow, target: NodeId| {
+            json!({
+                "name": b.name,
+                "target_node_id": target,
+                "role": b.role,
+                "api": b.api,
+                "scopes": b.scopes,
+                "on_behalf_of_user": b.on_behalf_of_user,
+            })
+        };
+        let mut live_resolved: Vec<Value> = live_rows
+            .iter()
+            .map(|b| resolved(b, b.target_node_id))
+            .collect();
+        live_resolved.sort_by_key(|v| v.to_string());
         let names: Vec<String> = manifest
             .get("bindings")
             .and_then(Value::as_object)
@@ -582,9 +616,21 @@ impl AppService {
             .unwrap_or_default();
         for name in names {
             let old = spec(live_manifest.as_ref(), &name);
-            if old.is_some() && old != spec(Some(&manifest), &name) {
+            if old.is_none() {
+                continue;
+            }
+            let row = rows.iter().find(|r| r.name == name);
+            let new_target =
+                row.map(|r| resolved(r, sources.get(&name).copied().unwrap_or(r.target_node_id)));
+            let old_target = live_rows
+                .iter()
+                .find(|r| r.name == name)
+                .map(|r| resolved(r, r.target_node_id));
+            let target_changed =
+                new_target.is_some() && old_target.is_some() && new_target != old_target;
+            if old != spec(Some(&manifest), &name) || target_changed {
                 bindings_removed.push(name.clone());
-                if let Some(row) = rows.iter().find(|r| r.name == name) {
+                if let Some(row) = row {
                     bindings_added.push(super::bindings::app_binding_json(row));
                 }
             }
@@ -604,8 +650,9 @@ impl AppService {
             "unconfirmed_columns": 0,
         });
         // The approval is bound to the preview's resolved rows and to the live bindings the
-        // changes were computed against (Kimi W-3b, 1: a live binding that changes its target
-        // after the decision makes the approval stale, also when the names stay).
+        // changes were computed against, as the manifest names them and as the live rows
+        // resolve them (Kimi W-3b, 1: a live binding that changes its target after the decision
+        // makes the approval stale, also when the names and the manifest text stay).
         let bound_bindings = json!({
             "preview": bound_bindings,
             "live": live_manifest
@@ -613,6 +660,7 @@ impl AppService {
                 .and_then(|m| m.get("bindings"))
                 .cloned()
                 .unwrap_or_else(|| json!({})),
+            "live_rows": live_resolved,
         });
         Ok(Requested {
             changes,

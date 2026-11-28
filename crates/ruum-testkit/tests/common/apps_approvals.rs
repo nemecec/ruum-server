@@ -271,6 +271,68 @@ pub fn cases() -> Vec<Case> {
             }
         ),
         case!(
+            "two_publishes_with_one_approval_make_one_release",
+            [
+                "updateAgent",
+                "createApp",
+                "createNode",
+                "putContent",
+                "createAppDeployment",
+                "getAppDeployment",
+                "publishAppDeployment",
+                "decideAppApproval",
+                "getAppApproval",
+                "listAppDeployments"
+            ],
+            "the agent sends two publishes with one approved approval_id at the same time: \
+             exactly one answers 200 and the other 409 approval_stale; one live release, and \
+             the approval is used (decision 0006-4: used once)",
+            |cx| {
+                let (app, dep, id) = asked(&cx, "raced").await?;
+                cx.ok(
+                    Who::Member,
+                    decide(&cx, &app, &id, json!({ "decision": "approve" })),
+                    &[200],
+                )
+                .await?;
+                let body = json!({ "approval_id": id });
+                let (a, b) = tokio::join!(
+                    cx.ok(
+                        Who::Agent,
+                        publish(&cx, &app, &dep, body.clone()),
+                        &[200, 409]
+                    ),
+                    cx.ok(
+                        Who::Agent,
+                        publish(&cx, &app, &dep, body.clone()),
+                        &[200, 409]
+                    ),
+                );
+                let (a, b) = (a?, b?);
+                let live = [&a, &b]
+                    .iter()
+                    .filter(|v| v["environment"] == "live")
+                    .count();
+                check!(live == 1, "two publishes with one approval: {a} / {b}");
+                let page = cx
+                    .ok(
+                        Who::Member,
+                        list_deployments(&cx, &app, "?environment=live"),
+                        &[200],
+                    )
+                    .await?;
+                check!(items(&page).len() == 1, "the live releases: {page}");
+                let row = cx
+                    .ok(Who::Agent, get_approval(&cx, &app, &id, ""), &[200])
+                    .await?;
+                check!(
+                    row["status"] == "used",
+                    "the approval after the race: {row}"
+                );
+                Ok(())
+            }
+        ),
+        case!(
             "get_app_approval_waits_for_the_decision",
             [
                 "updateAgent",

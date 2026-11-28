@@ -934,6 +934,66 @@ async fn a_changed_binding_target_is_shown_and_binds_the_approval() {
     assert_eq!(w.live(app).await, Some(live.id));
 }
 
+/// The same manifest text resolving to another folder (a path binding after a rename) is a
+/// changed binding too, on the request and after the decision (Kimi W-3b re-check, 1).
+#[tokio::test]
+async fn a_path_binding_that_resolves_elsewhere_is_shown_and_binds_the_approval() {
+    let w = world().await;
+    let app = w.app("Bound paths").await;
+    let a = w.node(w.folder, "Shared", NodeKind::Folder).await;
+    let path = w.s.nodes.path_of(&w.o(), a).await.unwrap();
+    let manifest =
+        format!("runtime: static\nbindings:\n  docs:\n    node: \"{path}\"\n    role: view\n");
+    let site = w
+        .site(
+            "by path",
+            &[("app.yaml", manifest.as_bytes()), ("index.html", INDEX)],
+        )
+        .await;
+    let move_away = |n: NodeId, name: &str| {
+        let w = &w;
+        let name = name.to_string();
+        async move {
+            w.s.nodes
+                .rename(&w.o(), n, name, OnConflict::Fail, None)
+                .await
+                .unwrap();
+        }
+    };
+    let first = w.preview(&w.o(), app, site).await;
+    let Published::Live(_) = w.publish(&w.o(), app, first, None).await.unwrap() else {
+        panic!("live");
+    };
+    // Another folder takes the name: the same manifest now resolves to B.
+    move_away(a, "Shared A").await;
+    let b = w.node(w.folder, "Shared", NodeKind::Folder).await;
+    let agent = w.agent(w.editor).await;
+    let dep = w.preview(&agent, app, site).await;
+    let id = w.ask(&agent, app, dep).await;
+    let changes = w.row(app, id).await.changes;
+    assert_eq!(changes["bindings_removed"], json!(["docs"]), "{changes}");
+    assert!(
+        changes["bindings_added"]
+            .to_string()
+            .contains(&b.to_string()),
+        "{changes}"
+    );
+    w.decide(&w.o(), app, id, json!({ "decision": "approve" }))
+        .await
+        .unwrap();
+    // Then the live binding moves to C through the same path: stale.
+    move_away(b, "Shared B").await;
+    let c = w.node(w.folder, "Shared", NodeKind::Folder).await;
+    let third = w.preview(&w.o(), app, site).await;
+    let Published::Live(live) = w.publish(&w.o(), app, third, None).await.unwrap() else {
+        panic!("live");
+    };
+    let _ = c;
+    let e = w.publish(&agent, app, dep, Some(id)).await.unwrap_err();
+    assert_eq!(hint(&e).as_deref(), Some("approval_stale"));
+    assert_eq!(w.live(app).await, Some(live.id));
+}
+
 #[tokio::test]
 async fn a_persons_publish_ignores_approval_id() {
     let w = world().await;
@@ -1484,4 +1544,64 @@ async fn get_with_wait_returns_when_the_person_decides() {
     let (v, took) = waiter.await.unwrap();
     assert_eq!(v["status"], "approved");
     assert!(took < Duration::from_secs(10), "{took:?}");
+}
+
+/// `app.approval_decided` in the changes feed reaches only those who read publish requests:
+/// `edit` on the app, and an agent only for its own request (Kimi W-3b, 2).
+#[tokio::test]
+async fn the_decision_entry_reaches_only_readers_of_publish_requests() {
+    use crate::journal::feed::{ChangesQuery, ServicesAccess, list_changes};
+    let w = world().await;
+    let app = w.app("Feed").await;
+    let site = w
+        .site("site", &[("app.yaml", MANIFEST), ("index.html", INDEX)])
+        .await;
+    let agent = w.agent(w.editor).await;
+    let dep = w.preview(&agent, app, site).await;
+    let id = w.ask(&agent, app, dep).await;
+    w.decide(&w.o(), app, id, json!({ "decision": "deny" }))
+        .await
+        .unwrap();
+    let sees = |c: Context| {
+        let w = &w;
+        async move {
+            let access = ServicesAccess {
+                services: &w.s,
+                ctx: &c,
+            };
+            let mut after = None;
+            loop {
+                let page = list_changes(
+                    &*w.s.journal,
+                    &access,
+                    &c,
+                    ChangesQuery {
+                        after,
+                        limit: Some(500),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                if page
+                    .items
+                    .iter()
+                    .any(|e| e.event == EventType::AppApprovalDecided)
+                {
+                    return true;
+                }
+                if !page.has_more {
+                    return false;
+                }
+                after = crate::journal::decode_cursor(&page.next_cursor).ok();
+            }
+        }
+    };
+    assert!(sees(w.o()).await, "the owner");
+    assert!(sees(w.e()).await, "the editor (edit on the app)");
+    assert!(sees(agent.clone()).await, "the agent that asked");
+    let other = w.agent(w.editor).await;
+    assert!(!sees(other).await, "another agent of the same user");
+    let viewer = w.agent_with(w.editor, Role::View).await;
+    assert!(!sees(viewer).await, "an agent with the scope view");
 }
