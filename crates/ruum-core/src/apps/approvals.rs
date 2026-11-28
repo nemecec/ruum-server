@@ -63,10 +63,17 @@
 //! One decision covers the D-2 migration approvals of the publish (decision 0006-4: the person
 //! is asked once, `write_live` of an agent included). After step 4 the publish calls
 //! [`AppService::approved_migrations`] with the taken approval: it returns, per database, the
-//! migrations the request listed and the classes the decider confirmed. The publish then runs
-//! each migration through `DatabaseService::run_migration` as covered by this decision (the
-//! decider held `manage` on every listed database when deciding). Today the list is always
+//! migrations the request listed, the classes the decider confirmed and who decided. The publish
+//! then runs each migration through `DatabaseService::run_migration` as covered by this decision
+//! (the decider held `manage` on every listed database when deciding). Today the list is always
 //! empty: a manifest with migrations is refused at deploy (`migrations_not_ready`).
+//!
+//! Open for W-3a-m (backlog W3B-5, a D-2 hook): `MigrationRun` takes an approval only as an A-2
+//! row of `database_approvals` (`ApprovalUse`), and confirms classes only as the run's own actor
+//! (`author_confirms`). Running the listed migrations as covered by this decision, with the
+//! decider's classes confirmed as the decider's, needs a field of `MigrationRun` for "decided
+//! elsewhere by this user, with these classes" (or the A-2 rows made and approved with the app
+//! decision). This card does not edit `databases/`.
 
 #[cfg(test)]
 mod tests;
@@ -443,6 +450,16 @@ pub struct ApprovedMigration {
     pub name: String,
 }
 
+/// What an approved publish hands over to card W-3a-m ([`AppService::approved_migrations`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovedMigrations {
+    pub approval_id: Uuid,
+    /// The person who decided: the classes are confirmed as theirs, and the migrations run as
+    /// covered by their decision.
+    pub decided_by: UserId,
+    pub databases: Vec<ApprovedDatabase>,
+}
+
 /// The migrations and the decider's classes of one database of an approved publish.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApprovedDatabase {
@@ -548,8 +565,30 @@ impl AppService {
         };
         let (new_roles, old_roles) = (roles(Some(&manifest)), roles(live_manifest.as_ref()));
         let rows = self.preview_rows(tenant, dep.id).await?;
-        let (bindings_added, bindings_removed, bound_bindings) =
+        let (mut bindings_added, mut bindings_removed, bound_bindings) =
             super::bindings::approval_bindings(&manifest, live_manifest.as_ref(), &rows);
+        // A binding whose name stays but whose target, role, API or scopes change (Kimi W-3b,
+        // 1): it is removed and added again, so the person sees it and a later change of the
+        // live binding makes the approval stale.
+        let spec = |m: Option<&Value>, name: &str| {
+            m.and_then(|m| m.get("bindings"))
+                .and_then(|b| b.get(name))
+                .cloned()
+        };
+        let names: Vec<String> = manifest
+            .get("bindings")
+            .and_then(Value::as_object)
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+        for name in names {
+            let old = spec(live_manifest.as_ref(), &name);
+            if old.is_some() && old != spec(Some(&manifest), &name) {
+                bindings_removed.push(name.clone());
+                if let Some(row) = rows.iter().find(|r| r.name == name) {
+                    bindings_added.push(super::bindings::app_binding_json(row));
+                }
+            }
+        }
         // `secrets_missing` waits for card W-4, `migrations` and `planned_columns` for W-3a-m;
         // `unconfirmed_telemetry_fields` stays 0 until the request can read the app's field
         // list in one store call (backlog W3B-1).
@@ -563,6 +602,17 @@ impl AppService {
             "planned_columns": [],
             "unconfirmed_telemetry_fields": 0,
             "unconfirmed_columns": 0,
+        });
+        // The approval is bound to the preview's resolved rows and to the live bindings the
+        // changes were computed against (Kimi W-3b, 1: a live binding that changes its target
+        // after the decision makes the approval stale, also when the names stay).
+        let bound_bindings = json!({
+            "preview": bound_bindings,
+            "live": live_manifest
+                .as_ref()
+                .and_then(|m| m.get("bindings"))
+                .cloned()
+                .unwrap_or_else(|| json!({})),
         });
         Ok(Requested {
             changes,
@@ -702,8 +752,9 @@ impl AppService {
     }
 
     /// `decideAppApproval` (users only). See the module docs. The order: `403 user_required`,
-    /// `404` (the app and the request), `422` (the body), `403` (the decider and the rights),
-    /// `409` (a trashed app, a request that is not pending).
+    /// `404` (the app and the request), `422` (the body), `403` (the decider and `edit`), `422`
+    /// (the classes against the request's planned columns), `403` (the databases), `409` (a
+    /// trashed app, a request that is not pending).
     pub async fn decide_approval(
         &self,
         s: &crate::Services,
@@ -750,6 +801,15 @@ impl AppService {
         if !approve && !classes.is_empty() {
             return Err(invalid("classes go with approve only", "/classes"));
         }
+        // Who decides (decision 0006-4), with every right the publish needs.
+        let role = authz::role_on(&*d.authz, &*d.nodes, ctx, app).await?;
+        let agents_user = a.requested_by.on_behalf_of == Some(user);
+        if !(agents_user || role.is_some_and(|r| r >= Role::Manage)) {
+            return Err(not_a_decider());
+        }
+        authz::require(&*d.authz, &*d.nodes, ctx, app, Role::Edit).await?;
+        // The classes against the request's planned columns, only for a caller who may decide
+        // (no oracle of planned columns for others; Kimi W-3b, 4).
         let planned = planned_keys(&a.changes);
         let mut seen = Vec::with_capacity(classes.len());
         for (i, c) in classes.iter().enumerate() {
@@ -765,13 +825,6 @@ impl AppService {
             }
             seen.push(key);
         }
-        // Who decides (decision 0006-4), with every right the publish needs.
-        let role = authz::role_on(&*d.authz, &*d.nodes, ctx, app).await?;
-        let agents_user = a.requested_by.on_behalf_of == Some(user);
-        if !(agents_user || role.is_some_and(|r| r >= Role::Manage)) {
-            return Err(not_a_decider());
-        }
-        authz::require(&*d.authz, &*d.nodes, ctx, app, Role::Edit).await?;
         if approve {
             let mut databases = listed_databases(&a.changes)?;
             for c in &classes {
@@ -841,16 +894,16 @@ impl AppService {
     }
 
     /// The hand-over to card W-3a-m (module docs): for the approval `id` that the publish of the
-    /// agent in `ctx` took less than [`USE_WITHIN_MINUTES`] ago, the migrations the request
-    /// listed and the classes the decider confirmed, per database (in the order the request
-    /// lists them). Any other approval is `409 conflict`, hint `approval_stale` (`404` when it
+    /// agent in `ctx` took less than [`USE_WITHIN_MINUTES`] ago, the decider, and the migrations
+    /// the request listed and the classes the decider confirmed, per database (in the order the
+    /// request lists them). Any other approval is `409 conflict`, hint `approval_stale` (`404` when it
     /// is not of `app` in the tenant).
     pub async fn approved_migrations(
         &self,
         ctx: &Context,
         app: NodeId,
         id: Uuid,
-    ) -> Result<Vec<ApprovedDatabase>> {
+    ) -> Result<ApprovedMigrations> {
         let a = self
             .deps
             .store
@@ -904,7 +957,15 @@ impl AppService {
         }
         let mut list: Vec<(usize, ApprovedDatabase)> = out.into_values().collect();
         list.sort_by_key(|(n, _)| *n);
-        Ok(list.into_iter().map(|(_, d)| d).collect())
+        let decided_by = a
+            .decided_by
+            .map(UserId)
+            .ok_or_else(|| Error::Internal(format!("approval {} has no decided_by", a.id)))?;
+        Ok(ApprovedMigrations {
+            approval_id: a.id,
+            decided_by,
+            databases: list.into_iter().map(|(_, d)| d).collect(),
+        })
     }
 }
 
