@@ -93,6 +93,41 @@ async fn world() -> World {
 }
 
 impl World {
+    /// Another team on the same services (its owner is also the member).
+    async fn other_team(&self) -> World {
+        let s = self.s.clone();
+        let owner = s.identity.upsert_from_login(&login("other")).await.unwrap();
+        let team = s
+            .tenants
+            .create_team(&Actor::user(owner.id), "Other Club".into())
+            .await
+            .unwrap();
+        let folder = s
+            .nodes
+            .create(
+                &ctx(team.id, owner.id),
+                NewNode {
+                    parent_id: team.root_node_id,
+                    name: "Projects".into(),
+                    kind: NodeKind::Folder,
+                    node_type: None,
+                    link: None,
+                    on_conflict: OnConflict::Fail,
+                },
+            )
+            .await
+            .unwrap()
+            .value
+            .id;
+        World {
+            s,
+            team,
+            owner: owner.id,
+            member: owner.id,
+            folder,
+        }
+    }
+
     fn m(&self) -> Context {
         ctx(self.team.id, self.member)
     }
@@ -1179,6 +1214,37 @@ async fn deploy_slots_bound_each_tenant_and_the_process() {
     assert_eq!(slots.global.available_permits(), 3);
 }
 
+/// Server runtimes hold at most all slots but one (review I6-13, 1): one more is refused at
+/// once, and its freed slot goes to another deployment.
+#[tokio::test]
+async fn server_deploys_leave_a_slot_for_the_others() {
+    let slots = DeploySlots::new(2, GLOBAL_DEPLOYS, Duration::from_millis(100));
+    let mut held = Vec::new();
+    for _ in 0..SERVER_DEPLOYS {
+        let mut slot = slots.take(TenantId::new()).await.unwrap();
+        slots.take_server(&mut slot).unwrap();
+        // Marking twice takes nothing more.
+        slots.take_server(&mut slot).unwrap();
+        held.push(slot);
+    }
+    let mut extra = slots.take(TenantId::new()).await.unwrap();
+    match slots.take_server(&mut extra) {
+        Err(Error::Api(e)) => {
+            assert_eq!(e.code, ErrorCode::Conflict);
+            assert!(e.retry_after.is_some());
+        }
+        other => panic!("{other:?}"),
+    }
+    drop(extra);
+    // A static deployment of another tenant gets the slot left over.
+    let other = slots.take(TenantId::new()).await.unwrap();
+    drop(other);
+    // A freed server slot goes to the next server deployment.
+    drop(held.pop());
+    let mut next = slots.take(TenantId::new()).await.unwrap();
+    slots.take_server(&mut next).unwrap();
+}
+
 /// A cancelled request does not free its slot while its unpacking still runs: the slot is in
 /// the blocking task (Kimi W-2s run 11, 4).
 #[tokio::test]
@@ -2102,11 +2168,51 @@ mod node22_pipeline {
     const SERVER_JS: &[u8] =
         b"require('http').createServer((q, s) => s.end('hi')).listen(process.env.PORT)\n";
 
-    /// The memory driver, with the instances that were started and stopped.
+    /// The memory driver, with the instances that were started and stopped. With `stall`,
+    /// an instance never leaves `starting`.
     struct Counting {
         inner: MemoryDriver,
         started: Mutex<Vec<crate::runtime::InstanceId>>,
         stopped: Mutex<Vec<crate::runtime::InstanceId>>,
+        stall: std::sync::atomic::AtomicBool,
+    }
+
+    impl Counting {
+        fn stalled(
+            &self,
+            mut st: crate::runtime::InstanceStatus,
+        ) -> crate::runtime::InstanceStatus {
+            if self.stall.load(std::sync::atomic::Ordering::SeqCst) {
+                st.state = InstanceState::Starting;
+                st.health = crate::runtime::Health::Unknown;
+            }
+            st
+        }
+    }
+
+    /// The memory builder behind a gate: a build waits until the gate opens.
+    struct Gated {
+        inner: MemoryBuilder,
+        waiting: std::sync::atomic::AtomicUsize,
+        open: tokio::sync::watch::Receiver<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::runtime::Builder for Gated {
+        fn name(&self) -> &str {
+            "gated"
+        }
+        async fn build(
+            &self,
+            input: crate::runtime::BuildInput,
+        ) -> std::result::Result<crate::runtime::BuildOutput, crate::runtime::RuntimeError>
+        {
+            self.waiting
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut open = self.open.clone();
+            let _ = open.wait_for(|o| *o).await;
+            self.inner.build(input).await
+        }
     }
 
     #[async_trait::async_trait]
@@ -2121,7 +2227,7 @@ mod node22_pipeline {
         {
             let st = self.inner.start(spec).await?;
             self.started.lock().unwrap().push(st.id);
-            Ok(st)
+            Ok(self.stalled(st))
         }
         async fn status(
             &self,
@@ -2129,7 +2235,7 @@ mod node22_pipeline {
             i: crate::runtime::InstanceId,
         ) -> std::result::Result<crate::runtime::InstanceStatus, crate::runtime::RuntimeError>
         {
-            self.inner.status(t, i).await
+            Ok(self.stalled(self.inner.status(t, i).await?))
         }
         async fn stop(
             &self,
@@ -2191,6 +2297,23 @@ mod node22_pipeline {
     /// A world whose apps area runs node22 over one in-memory registry: the memory builder
     /// pushes there and the memory driver starts only what is there.
     async fn node22_world() -> (World, Arc<Counting>) {
+        let (w, driver, _) = node22_world_with(
+            None,
+            Node22Settings {
+                start_wait: Duration::from_secs(5),
+                ..Node22Settings::default()
+            },
+        )
+        .await;
+        (w, driver)
+    }
+
+    /// [`node22_world`] with these settings; with `gate`, every build waits until the gate
+    /// opens (the builder is returned too).
+    async fn node22_world_with(
+        gate: Option<tokio::sync::watch::Receiver<bool>>,
+        settings: Node22Settings,
+    ) -> (World, Arc<Counting>, Option<Arc<Gated>>) {
         let mut w = world().await;
         let registry = MemoryRegistry::new();
         let usage = Arc::new(MemoryUsage::new());
@@ -2198,19 +2321,29 @@ mod node22_pipeline {
             inner: MemoryDriver::new(registry.clone(), usage.clone()),
             started: Mutex::default(),
             stopped: Mutex::default(),
+            stall: std::sync::atomic::AtomicBool::new(false),
         });
         let mut parts = crate::apps::AppParts::memory(None);
         parts.runtime = driver.clone();
         crate::apps::install(&mut w.s, parts).unwrap();
+        let memory = MemoryBuilder::new(registry, usage);
+        let (builder, gated): (Arc<dyn crate::runtime::Builder>, _) = match gate {
+            Some(open) => {
+                let g = Arc::new(Gated {
+                    inner: memory,
+                    waiting: std::sync::atomic::AtomicUsize::new(0),
+                    open,
+                });
+                (g.clone(), Some(g))
+            }
+            None => (Arc::new(memory), None),
+        };
         w.s.apps.set_node22(Node22 {
-            builder: Arc::new(MemoryBuilder::new(registry, usage)),
-            settings: Node22Settings {
-                start_wait: Duration::from_secs(5),
-                ..Node22Settings::default()
-            },
+            builder,
+            settings,
             tokens: None,
         });
-        (w, driver)
+        (w, driver, gated)
     }
 
     async fn row(w: &World, app: NodeId, id: Uuid) -> DeploymentRow {
@@ -2377,6 +2510,163 @@ mod node22_pipeline {
                 .unwrap()
                 .unwrap();
         assert_eq!(spec.identity.environment, crate::runtime::Environment::Live);
+    }
+
+    /// A node22 app and its source folder.
+    async fn server_app(w: &World, name: &str) -> (NodeId, NodeId) {
+        let app = w.app(name).await;
+        let src = w
+            .folder(
+                &format!("{name} src"),
+                &[("app.yaml", SERVER), ("server.js", SERVER_JS)],
+            )
+            .await;
+        (app, src)
+    }
+
+    /// Queued node22 builds never stop another tenant's static deployment (review I6-13, 1):
+    /// node22 previews hold at most all deploy slots but one through their builds, and one
+    /// more is refused at once instead of taking the last slot.
+    #[tokio::test]
+    async fn queued_node22_builds_leave_a_slot_for_a_static_deploy() {
+        let (open_tx, open_rx) = tokio::sync::watch::channel(false);
+        let (a, _, gated) = node22_world_with(
+            Some(open_rx),
+            Node22Settings {
+                start_wait: Duration::from_secs(5),
+                ..Node22Settings::default()
+            },
+        )
+        .await;
+        let gated = gated.unwrap();
+        let b = a.other_team().await;
+        let c = a.other_team().await;
+        // Tenant A: two node22 previews (its share), tenant B: one; all wait in their builds.
+        let mut running = Vec::new();
+        for (w, n) in [(&a, 0), (&a, 1), (&b, 2)] {
+            let (app, src) = server_app(w, &format!("Server {n}")).await;
+            let d = w.deploy(&w.m(), app, src, None).await.unwrap();
+            running.push((w, app, d.id));
+        }
+        assert_eq!(running.len(), SERVER_DEPLOYS);
+        for _ in 0..200 {
+            if gated.waiting.load(std::sync::atomic::Ordering::SeqCst) == SERVER_DEPLOYS {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            gated.waiting.load(std::sync::atomic::Ordering::SeqCst),
+            SERVER_DEPLOYS
+        );
+        // One more node22 preview (tenant B's second) is refused at once.
+        let (app, src) = server_app(&b, "Server 3").await;
+        let started = std::time::Instant::now();
+        let err = b.deploy(&b.m(), app, src, None).await.unwrap_err();
+        assert!(
+            started.elapsed() < DEPLOY_SLOT_WAIT,
+            "the refusal waited for a slot"
+        );
+        let Error::Api(e) = err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(e.code, ErrorCode::Conflict);
+        assert!(e.retry_after.is_some());
+        // Tenant C's static deployment runs to the end while the builds still wait.
+        let app = c.app("Static site").await;
+        let site = c
+            .folder("site", &[("app.yaml", MANIFEST), ("index.html", INDEX)])
+            .await;
+        let started = std::time::Instant::now();
+        let d = c.deploy(&c.m(), app, site, None).await.unwrap();
+        assert!(started.elapsed() < DEPLOY_SLOT_WAIT);
+        let d = c.settled(app, d.id).await;
+        assert_eq!(d.state, DeploymentState::Ready, "{:?}", d.stages);
+        // The builds go on: every node22 preview ends ready.
+        open_tx.send(true).unwrap();
+        for (w, app, id) in running {
+            let d = w.settled(app, id).await;
+            assert_eq!(d.state, DeploymentState::Ready, "{:?}", d.stages);
+        }
+    }
+
+    /// A build that finds no free build slot in time fails its stage `build` with
+    /// `build_unavailable` and a "try again" hint (review I6-13, 1).
+    #[test]
+    fn a_busy_builder_fails_the_build_with_try_again() {
+        let e = n22::build_error(&crate::runtime::RuntimeError::Unavailable {
+            reason: "every build slot is busy; try again in a few minutes".into(),
+        });
+        assert_eq!(e.stage, "build");
+        assert_eq!(e.reason, "build_unavailable");
+        assert!(e.hint.as_deref().unwrap().contains("try again"));
+        assert_eq!(e.details["runtime_error"], "runtime_unavailable");
+    }
+
+    /// The start before a publish runs inside the request: it waits at most
+    /// `publish_start_wait`, also when the manifest's health timeout is longer (review I6-13,
+    /// 3), and its instance is stopped.
+    #[tokio::test]
+    async fn the_start_before_a_publish_has_its_own_lower_cap() {
+        let settings = Node22Settings {
+            start_wait: Duration::from_secs(120),
+            publish_start_wait: Duration::from_secs(1),
+            ..Node22Settings::default()
+        };
+        let slow: Value = serde_json::json!({
+            "runtime": "node22", "start": "node server.js",
+            "health": { "path": "/", "timeout_seconds": 90 },
+        });
+        assert_eq!(
+            n22::start_check_wait(&slow, &settings, false),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            n22::start_check_wait(&slow, &settings, true),
+            Duration::from_secs(1)
+        );
+        let defaults = Node22Settings::default();
+        assert_eq!(
+            n22::start_check_wait(&slow, &defaults, true),
+            Duration::from_secs(60),
+            "the default stays well below the default request timeout of 120 s"
+        );
+        let (w, driver, _) = node22_world_with(None, settings).await;
+        let app = w.app("Slow start").await;
+        let src = w
+            .folder(
+                "slow src",
+                &[
+                    (
+                        "app.yaml",
+                        b"runtime: node22\nstart: node server.js\nhealth:\n  path: /\n  timeout_seconds: 90\n",
+                    ),
+                    ("server.js", SERVER_JS),
+                ],
+            )
+            .await;
+        let p = w.preview(app, src, None).await;
+        driver
+            .stall
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let err = w.publish(&w.m(), app, p.id).await.unwrap_err();
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_secs(1) && took < Duration::from_secs(30),
+            "{took:?}"
+        );
+        let Error::Api(e) = err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(e.code, ErrorCode::Conflict);
+        assert_eq!(
+            e.details.as_deref().and_then(|d| d.get("reason")),
+            Some(&serde_json::json!("not_ready")),
+            "{e:?}"
+        );
+        assert_eq!(w.live(app).await, None, "nothing went live");
+        assert!(driver.left_running().is_empty());
     }
 
     #[tokio::test]

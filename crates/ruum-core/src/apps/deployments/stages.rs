@@ -579,7 +579,7 @@ impl AppService {
             .await
             .map_err(|e| Box::new((e, None)))?;
         let check = self
-            .node22_start_check(spec, &run.manifest)
+            .node22_start_check(spec, &run.manifest, false)
             .await
             .map_err(|e| Box::new((e, None)))?;
         set(&mut run.stages, "start", "done", None);
