@@ -24,7 +24,7 @@
 //! - **Readiness** is an exec probe inside the sandbox (decision 0006 G point 1: never from the
 //!   node's network); the gateway reaches a ready pod at its address ([`KubeDriver::upstream`]).
 
-mod api;
+pub(crate) mod api;
 pub mod ledger;
 pub mod pod;
 mod seal;

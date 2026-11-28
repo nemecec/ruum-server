@@ -334,6 +334,47 @@ impl Api {
         }
     }
 
+    /// The end of the log of one container of a pod, at most `limit_bytes` and `tail_lines`
+    /// (the builder's build log, card I6-13). `None` when the pod is gone or has no log yet.
+    pub(crate) async fn log_tail(
+        &self,
+        pod: &str,
+        container: &str,
+        limit_bytes: u64,
+        tail_lines: u64,
+    ) -> Result<Option<bytes::Bytes>, RuntimeError> {
+        let what = format!("log of {pod}");
+        let q = [
+            ("container", container.to_owned()),
+            ("limitBytes", limit_bytes.to_string()),
+            ("tailLines", tail_lines.to_string()),
+        ];
+        let url = format!("{}/log", self.url(Kind::Pod, Some(pod)));
+        let r = self.send(&what, self.client.get(url).query(&q)).await?;
+        match r.status().as_u16() {
+            200 => {
+                // Read under the cap: the API server should stop at `limitBytes`, the client
+                // does not trust it to.
+                let mut out = Vec::new();
+                let mut r = r;
+                while let Some(chunk) = r
+                    .chunk()
+                    .await
+                    .map_err(|e| unavailable(&what, e.without_url()))?
+                {
+                    let room = (limit_bytes as usize).saturating_sub(out.len());
+                    out.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                    if out.len() >= limit_bytes as usize {
+                        break;
+                    }
+                }
+                Ok(Some(bytes::Bytes::from(out)))
+            }
+            400 | 404 => Ok(None),
+            _ => Err(self.refused(&what, r).await),
+        }
+    }
+
     /// Follows the log of the container `app` of a pod: one stream (`Stdout` or `Stderr`, which
     /// needs the API server's split streams) or both together (`None`). `from_now` skips what was
     /// written before (a reconnect).

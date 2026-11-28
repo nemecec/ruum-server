@@ -248,6 +248,98 @@ pub struct KubeSettings {
     pub supervisor_tls: bool,
     pub node_arch: String,
     pub runtime_class_overhead: std::collections::BTreeMap<String, String>,
+    /// The node22 builder on Kubernetes (card I6-13); `None`: node22 deployments stay off.
+    pub builder: Option<BuildSettings>,
+}
+
+/// The settings of the node22 builder on Kubernetes (card I6-13), on with
+/// `RUUM_BUILDER=kubernetes` (only next to `RUUM_RUNTIME_DRIVER=kubernetes`):
+///
+/// - `RUUM_BUILD_REGISTRY_URL` (required): the cluster registry as this process pushes to it
+///   (`http://host:port` or `https://host:port`, no path); `RUUM_REGISTRY` (required too) is
+///   the same registry as the nodes pull from it;
+/// - `RUUM_BUILD_PUSH_USER` and `RUUM_BUILD_PUSH_PASSWORD_FILE` (required): the push
+///   credential (the registry has no anonymous access); it never reaches a build;
+/// - `RUUM_BUILD_CHANNEL_SERVICE` (`host:port`, required): the build channel as the build pods
+///   reach it (a Service), and `RUUM_BUILD_CHANNEL_LISTEN` (`addr:port`, required): the
+///   listener of this process. TLS 1.3 with the supervisor listener's certificate (derived from
+///   the record key), pinned by the build pods;
+/// - `RUUM_BUILD_NAMESPACE` (default `ruum-builds`), `RUUM_BUILD_OUTPUT_MAX` (bytes, default
+///   256 MiB), `RUUM_BUILD_MAX_PARALLEL` (default 4) and `RUUM_BUILD_TENANT_MAX` (default 2,
+///   at most the former).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildSettings {
+    pub registry_url: String,
+    pub push_user: String,
+    pub push_password_file: PathBuf,
+    pub channel_service: (String, u16),
+    pub channel_listen: std::net::SocketAddr,
+    pub namespace: String,
+    pub output_max: Option<u64>,
+    pub max_parallel: Option<usize>,
+    pub tenant_max: Option<usize>,
+}
+
+/// The builder settings of `get` (see [`BuildSettings`]); `None` without `RUUM_BUILDER`.
+fn build_settings(
+    get: &impl Fn(&str) -> Option<String>,
+    registry: Option<&str>,
+) -> anyhow::Result<Option<BuildSettings>> {
+    match get("RUUM_BUILDER").as_deref() {
+        None | Some("off") => return Ok(None),
+        Some("kubernetes") => {}
+        Some(other) => anyhow::bail!("RUUM_BUILDER must be kubernetes or off, not {other:?}"),
+    }
+    let need = |name: &str| {
+        get(name).with_context(|| format!("{name} is required with RUUM_BUILDER=kubernetes"))
+    };
+    anyhow::ensure!(
+        registry.is_some_and(|r| !r.is_empty() && !r.contains('/')),
+        "RUUM_BUILDER=kubernetes needs RUUM_REGISTRY (host:port: the registry the nodes pull from)"
+    );
+    let registry_url = need("RUUM_BUILD_REGISTRY_URL")?;
+    let rest = registry_url
+        .strip_prefix("http://")
+        .or_else(|| registry_url.strip_prefix("https://"))
+        .context("RUUM_BUILD_REGISTRY_URL must start with http:// or https://")?;
+    anyhow::ensure!(
+        !rest.is_empty() && !rest.trim_end_matches('/').contains('/'),
+        "RUUM_BUILD_REGISTRY_URL must have no path (a path prefix refuses every upload, backlog P-84)"
+    );
+    let num = |name: &str| -> anyhow::Result<Option<u64>> {
+        get(name)
+            .map(|v| {
+                v.parse::<u64>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .with_context(|| format!("{name} must be a number above zero"))
+            })
+            .transpose()
+    };
+    let max_parallel = num("RUUM_BUILD_MAX_PARALLEL")?.map(|n| n as usize);
+    let tenant_max = num("RUUM_BUILD_TENANT_MAX")?.map(|n| n as usize);
+    if let (Some(all), Some(one)) = (max_parallel, tenant_max) {
+        anyhow::ensure!(
+            one <= all,
+            "RUUM_BUILD_TENANT_MAX must be at most RUUM_BUILD_MAX_PARALLEL"
+        );
+    }
+    Ok(Some(BuildSettings {
+        registry_url: registry_url.trim_end_matches('/').to_owned(),
+        push_user: need("RUUM_BUILD_PUSH_USER")?,
+        push_password_file: PathBuf::from(need("RUUM_BUILD_PUSH_PASSWORD_FILE")?),
+        channel_service: host_port(
+            "RUUM_BUILD_CHANNEL_SERVICE",
+            &need("RUUM_BUILD_CHANNEL_SERVICE")?,
+        )?,
+        channel_listen: need("RUUM_BUILD_CHANNEL_LISTEN")?
+            .parse()
+            .context("RUUM_BUILD_CHANNEL_LISTEN must be addr:port")?,
+        namespace: get("RUUM_BUILD_NAMESPACE").unwrap_or_else(|| "ruum-builds".into()),
+        output_max: num("RUUM_BUILD_OUTPUT_MAX")?,
+        max_parallel,
+        tenant_max,
+    }))
 }
 
 /// `name=quantity,...` of `RUUM_KUBE_RUNTIME_CLASS_OVERHEAD` (the driver checks the names and
@@ -290,7 +382,13 @@ impl RuntimeSettings {
 
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
         match get("RUUM_RUNTIME_DRIVER").as_deref() {
-            None | Some("memory") => return Ok(Self::Memory),
+            None | Some("memory") => {
+                anyhow::ensure!(
+                    matches!(get("RUUM_BUILDER").as_deref(), None | Some("off")),
+                    "RUUM_BUILDER=kubernetes needs RUUM_RUNTIME_DRIVER=kubernetes (the images it builds run there)"
+                );
+                return Ok(Self::Memory);
+            }
             Some("kubernetes") => {}
             Some(other) => anyhow::bail!(
                 "RUUM_RUNTIME_DRIVER must be memory or kubernetes, not {other:?} (the Docker driver is wired by card I-4)"
@@ -367,6 +465,8 @@ impl RuntimeSettings {
             ),
         };
         // The service account token goes to the API server over TLS only.
+        let registry = get("RUUM_REGISTRY");
+        let builder = build_settings(&get, registry.as_deref())?;
         let api_url =
             get("RUUM_KUBE_API_URL").unwrap_or_else(|| "https://kubernetes.default.svc".into());
         anyhow::ensure!(
@@ -379,7 +479,7 @@ impl RuntimeSettings {
             ca_file: get("RUUM_KUBE_CA_FILE").map(PathBuf::from),
             namespace: get("RUUM_KUBE_NAMESPACE").unwrap_or_else(|| "ruum-apps".into()),
             runtime_class: get("RUUM_KUBE_RUNTIME_CLASS").unwrap_or_else(|| "gvisor".into()),
-            registry: get("RUUM_REGISTRY"),
+            registry,
             egress_proxy,
             egress_control,
             egress_control_token_file,
@@ -393,6 +493,7 @@ impl RuntimeSettings {
             runtime_class_overhead: overhead(
                 &get("RUUM_KUBE_RUNTIME_CLASS_OVERHEAD").unwrap_or_default(),
             )?,
+            builder,
         })))
     }
 }
@@ -449,6 +550,90 @@ mod tests {
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
         RuntimeSettings::from_lookup(|k| m.get(k).cloned())
+    }
+
+    #[test]
+    fn the_builder_needs_the_kubernetes_driver_a_registry_and_a_credential() {
+        // Without the Kubernetes driver the builder is refused.
+        assert!(runtime(&[("RUUM_BUILDER", "kubernetes")]).is_err());
+        assert_eq!(
+            runtime(&[("RUUM_BUILDER", "off")]).unwrap(),
+            RuntimeSettings::Memory
+        );
+        let digest = format!("r/ruum-supervisor@sha256:{}", "a".repeat(64));
+        let base = vec![
+            ("RUUM_RUNTIME_DRIVER", "kubernetes"),
+            ("RUUM_KUBE_RECORD_KEY_FILE", "/run/ruum-runtime/record-key"),
+            ("RUUM_KUBE_SUPERVISOR_IMAGE", digest.as_str()),
+            (
+                "RUUM_KUBE_SUPERVISOR_SERVICE",
+                "ruum-supervisor.ruum.svc:8091",
+            ),
+            ("RUUM_KUBE_SUPERVISOR_LISTEN", "0.0.0.0:8091"),
+            ("RUUM_KUBE_SUPERVISOR_NETWORK", "tls"),
+        ];
+        let RuntimeSettings::Kubernetes(k) = runtime(&base).unwrap() else {
+            panic!("not kubernetes");
+        };
+        assert_eq!(k.builder, None, "the builder is off by default");
+        let mut full = base.clone();
+        full.extend([
+            ("RUUM_BUILDER", "kubernetes"),
+            ("RUUM_REGISTRY", "registry.ruum.internal:5000"),
+            (
+                "RUUM_BUILD_REGISTRY_URL",
+                "http://ruum-registry.ruum-registry.svc:5000/",
+            ),
+            ("RUUM_BUILD_PUSH_USER", "ruum-push"),
+            (
+                "RUUM_BUILD_PUSH_PASSWORD_FILE",
+                "/run/ruum-registry/push-password",
+            ),
+            (
+                "RUUM_BUILD_CHANNEL_SERVICE",
+                "ruum-build-channel.ruum.svc:8092",
+            ),
+            ("RUUM_BUILD_CHANNEL_LISTEN", "0.0.0.0:8092"),
+        ]);
+        let RuntimeSettings::Kubernetes(k) = runtime(&full).unwrap() else {
+            panic!("not kubernetes");
+        };
+        let b = k.builder.expect("the builder");
+        assert_eq!(
+            b.registry_url,
+            "http://ruum-registry.ruum-registry.svc:5000"
+        );
+        assert_eq!(b.namespace, "ruum-builds");
+        assert_eq!(b.channel_listen.port(), 8092);
+        assert_eq!(b.output_max, None);
+        // Each required setting, and the bad shapes.
+        for drop in [
+            "RUUM_REGISTRY",
+            "RUUM_BUILD_REGISTRY_URL",
+            "RUUM_BUILD_PUSH_USER",
+            "RUUM_BUILD_PUSH_PASSWORD_FILE",
+            "RUUM_BUILD_CHANNEL_SERVICE",
+            "RUUM_BUILD_CHANNEL_LISTEN",
+        ] {
+            let without: Vec<_> = full.iter().copied().filter(|(k, _)| *k != drop).collect();
+            assert!(runtime(&without).is_err(), "without {drop}");
+        }
+        for (k, v) in [
+            ("RUUM_BUILD_REGISTRY_URL", "ftp://r:5000"),
+            ("RUUM_BUILD_REGISTRY_URL", "http://r:5000/prefix"),
+            ("RUUM_BUILDER", "docker"),
+            ("RUUM_BUILD_OUTPUT_MAX", "0"),
+        ] {
+            let mut bad: Vec<_> = full.iter().copied().filter(|(n, _)| *n != k).collect();
+            bad.push((k, v));
+            assert!(runtime(&bad).is_err(), "{k}={v}");
+        }
+        let mut slots = full.clone();
+        slots.extend([
+            ("RUUM_BUILD_MAX_PARALLEL", "2"),
+            ("RUUM_BUILD_TENANT_MAX", "3"),
+        ]);
+        assert!(runtime(&slots).is_err());
     }
 
     #[test]

@@ -13,6 +13,7 @@
 //! starts the same role next to the API only with `RUUM_TELEMETRY=on` (default `off`).
 
 mod app;
+mod build_channel;
 mod config;
 mod migrate;
 mod seal_ledger;
@@ -244,7 +245,32 @@ async fn main() -> anyhow::Result<()> {
             None => Ok(()),
         }
     };
-    let servers = async move { tokio::try_join!(platform, dav, internal, supervisor).map(|_| ()) };
+    // The build channel of the Kubernetes builder (card I6-13), TLS with the pinned key.
+    let builds = match wiring::BUILDER.get() {
+        Some(b) => {
+            let bind = b.listen;
+            let listener = tokio::net::TcpListener::bind(bind)
+                .await
+                .with_context(|| format!("bind {bind} (RUUM_BUILD_CHANNEL_LISTEN)"))?;
+            tracing::info!(addr = %bind, "build channel (build pods only) listening");
+            Some(supervisor::serve(
+                listener,
+                build_channel::router(b.builder.clone()),
+                build_channel::caps(),
+                Some(b.tls.clone()),
+                stop.clone().stopped(),
+            ))
+        }
+        None => None,
+    };
+    let builds = async move {
+        match builds {
+            Some(serve) => serve.await,
+            None => Ok(()),
+        }
+    };
+    let servers =
+        async move { tokio::try_join!(platform, dav, internal, supervisor, builds).map(|_| ()) };
     match shutdown::drain(servers, stop, grace).await? {
         shutdown::Drained::Ended | shutdown::Drained::Clean => {
             tracing::info!("every connection is closed; bye")
