@@ -507,6 +507,16 @@ impl Fake {
         });
     }
 
+    /// Moves a pod's `metadata.creationTimestamp` `secs` into the past (a pod made that long ago).
+    pub fn backdate_pod(&self, ns: &str, name: &str, secs: i64) {
+        let t = (time::OffsetDateTime::now_utc() - time::Duration::seconds(secs))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        self.set_pod(&(ns.to_owned(), name.to_owned()), |p| {
+            p["metadata"]["creationTimestamp"] = json!(t);
+        });
+    }
+
     /// Changes a stored pod's status as the kubelet would (a late or partial status write).
     pub fn edit_pod_status(&self, ns: &str, name: &str, f: impl FnOnce(&mut Value)) {
         self.set_pod(&(ns.to_owned(), name.to_owned()), |p| f(&mut p["status"]));
@@ -992,6 +1002,8 @@ async fn collection_post(
                 }
             }
             obj["status"] = json!({ "phase": "Pending" });
+            // The API server sets it; no client can.
+            obj["metadata"]["creationTimestamp"] = json!(now_rfc3339());
             let log = Arc::new(LogBuf::default());
             {
                 let mut o = f.objs.lock().unwrap();

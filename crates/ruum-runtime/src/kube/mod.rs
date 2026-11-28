@@ -1449,13 +1449,26 @@ impl Inner {
                     Some(PodView::Pending { broken: false }) | Some(PodView::Running { .. })
                 )
             {
-                // A start time in the future (beyond a minute of clock skew) is one a writer of
-                // ConfigMaps set: such a run counts as old (Kimi re-check of I620-R).
-                let age = if rec.run_started_ms > now.saturating_add(ms(START_GRACE)) {
+                // The age of the run: the older of the record's start time and the pod's
+                // `creationTimestamp`, which the API server sets and no writer of ConfigMaps or
+                // pods can choose (Kimi re-checks of I620-R). A record start time in the future
+                // (beyond a minute of clock skew) was set by such a writer: the run counts as old.
+                let rec_age = if rec.run_started_ms > now.saturating_add(ms(START_GRACE)) {
                     i64::MAX
                 } else {
                     now.saturating_sub(rec.run_started_ms)
                 };
+                let pod_age = p
+                    .pointer("/metadata/creationTimestamp")
+                    .and_then(Value::as_str)
+                    .and_then(|t| {
+                        OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339)
+                            .ok()
+                    })
+                    .map_or(i64::MIN, |t| {
+                        now.saturating_sub((t.unix_timestamp_nanos() / 1_000_000) as i64)
+                    });
+                let age = rec_age.max(pod_age);
                 let why = if age > ms(START_GRACE) && !self.run_sealed(&cm, &rec, p) {
                     Some(
                         "a sandbox pod that its run's seal does not name (a crash between its create and its seal, or a pod made again) is ended (backlog I620-8)",
@@ -3736,6 +3749,48 @@ fn static_status(id: InstanceId, s: &StaticInst) -> InstanceStatus {
 mod tests {
     use super::*;
     use ruum_core::runtime::redact::MAX_SECRET_VALUES;
+
+    /// Kimi re-check of I620-R: a record at the cap of the seal writes still takes every plain
+    /// write that follows (ended, a registration's pod name, touched) within the ConfigMap's
+    /// 1 MiB, and one byte more is refused.
+    #[test]
+    fn a_record_at_the_seal_cap_can_still_be_ended() {
+        let mut rec: Record = serde_json::from_value(serde_json::json!({
+            "v": 1, "instance": InstanceId::new(),
+            "identity": { "tenant": uuid::Uuid::now_v7(), "app": uuid::Uuid::now_v7(),
+                "deployment": uuid::Uuid::now_v7(), "environment": "live" },
+            "kind": { "kind": "service", "port": 8080, "health": null, "idle_timeout_ms": null },
+            "routes": [], "limits": { "cpu_millis": 250, "memory_bytes": 67108864, "disk_bytes": 1048576 },
+            "image": "r/ruum/t/a@sha256:00", "command": ["serve"], "env": [],
+            "started_at_ms": 1, "state": { "state": "starting" }, "run": 1,
+            "run_started_ms": 1, "last_touch_ms": 1,
+        }))
+        .unwrap();
+        rec.sealed = Some(String::new());
+        let base = serde_json::to_string(&rec).unwrap().len();
+        rec.sealed = Some("x".repeat(MAX_RECORD_BYTES - base));
+        assert_eq!(serde_json::to_string(&rec).unwrap().len(), MAX_RECORD_BYTES);
+        assert!(check_record_size(&rec).is_ok());
+        let mut over = rec.clone();
+        over.sealed.as_mut().unwrap().push('x');
+        assert!(check_record_size(&over).is_err());
+        for end in [
+            InstanceState::Exited(ExitStatus::of(ExitReason::Killed)),
+            InstanceState::Exited(ExitStatus::completed(i32::MIN)),
+            InstanceState::Stopped,
+            InstanceState::ScaledToZero,
+        ] {
+            let mut ended = rec.clone();
+            ended.state = end;
+            ended.run = u32::MAX;
+            ended.ended_ms = Some(i64::MIN);
+            ended.last_touch_ms = i64::MIN;
+            ended.run_started_ms = i64::MIN;
+            ended.registered = Some(pod_name(rec.instance, u32::MAX));
+            let data = "record".len() + serde_json::to_string(&ended).unwrap().len();
+            assert!(data <= 1024 * 1024, "{data}");
+        }
+    }
 
     /// The largest valid spec: no secret environment value, 255 previous values and the token.
     fn largest(token: &str, earlier: &[&str]) -> Sealed {

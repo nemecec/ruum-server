@@ -2841,11 +2841,12 @@ async fn a_pod_that_its_seal_does_not_name_is_ended() {
     w.fake.skip_launch_once.store(true, Ordering::SeqCst);
     assert_eq!(w.create_pod(&copy).await, 201);
     wait_pod_ip(&w, &again_pod).await;
-    // Its start time moved a day into the future by the same writer (Kimi re-check of I620-R):
-    // the run counts as old, not as just started.
+    // The same writer keeps the record's start time just ahead of the clock (Kimi re-checks of
+    // I620-R): the pod's own creationTimestamp (two minutes ago) still makes the run old.
+    w.fake.backdate_pod(NS, &again_pod, 120);
     w.change_record(again.id, |r| {
         let now = time::OffsetDateTime::now_utc().unix_timestamp() * 1000;
-        r["run_started_ms"] = serde_json::json!(now + 86_400_000);
+        r["run_started_ms"] = serde_json::json!(now + 30_000);
     })
     .await;
     // A record without its first seal (a crash between the pod and the seal).
