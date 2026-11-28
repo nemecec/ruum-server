@@ -77,6 +77,13 @@ pub const BUILD_UID: u32 = 10001;
 pub const LABEL_BUILD: &str = super::LABEL_BUILD;
 /// The default output cap of a Kubernetes build (64 MiB).
 pub const KUBE_OUTPUT_MAX: u64 = 64 * 1024 * 1024;
+
+/// The reason of a build that found no free build slot in time.
+pub const BUILD_SLOTS_BUSY: &str = "every build slot is busy; try again in a few minutes";
+
+/// How long a build waits for a build slot ([`KubeBuilderConfig::slot_wait`]), then fails as
+/// unavailable with "try again" (review I6-13, 1; backlog P-84).
+pub const KUBE_SLOT_WAIT: Duration = Duration::from_secs(120);
 /// The most bytes of a token or manifest answer of Docker Hub while mirroring the base.
 const MIRROR_SMALL_MAX: usize = 1024 * 1024;
 /// How often the builder reads the pod while the build runs.
@@ -213,6 +220,9 @@ pub struct KubeBuilderConfig {
     pub output_max: u64,
     pub max_parallel: usize,
     pub per_tenant: usize,
+    /// How long a build waits for a slot ([`KUBE_SLOT_WAIT`]); then it fails with
+    /// [`RuntimeError::Unavailable`] and its deployment frees its deploy slot.
+    pub slot_wait: Duration,
     pub npm_registry: String,
     /// The allow list of a build at the egress proxy: the npm registry hosts.
     pub npm_hosts: Vec<String>,
@@ -258,6 +268,7 @@ impl KubeBuilderConfig {
             output_max: KUBE_OUTPUT_MAX,
             max_parallel: 1,
             per_tenant: 1,
+            slot_wait: KUBE_SLOT_WAIT,
             npm_registry: super::NPM_REGISTRY.to_owned(),
             npm_hosts: vec!["registry.npmjs.org".to_owned()],
             egress_proxy: None,
@@ -279,6 +290,9 @@ impl KubeBuilderConfig {
         };
         if self.max_parallel == 0 || self.per_tenant == 0 || self.per_tenant > self.max_parallel {
             return bad("the build slots: 0 < per_tenant <= max_parallel");
+        }
+        if self.slot_wait.is_zero() {
+            return bad("the wait for a build slot must be above zero");
         }
         if self.output_max == 0 {
             return bad("the output cap must be above zero");
@@ -1200,7 +1214,16 @@ impl Builder for KubeBuilder {
                 runtime: input.runtime,
             });
         }
-        let slot = self.slots.acquire(input.identity.tenant).await;
+        // A bounded wait (review I6-13, 1): the deployment holds a deploy slot meanwhile.
+        let Some(slot) = self
+            .slots
+            .acquire_within(input.identity.tenant, self.cfg.slot_wait)
+            .await
+        else {
+            return Err(RuntimeError::Unavailable {
+                reason: BUILD_SLOTS_BUSY.to_owned(),
+            });
+        };
         let build = uuid::Uuid::now_v7();
         let registered = Arc::new(Mutex::new(false));
         let mut finish = Finish {

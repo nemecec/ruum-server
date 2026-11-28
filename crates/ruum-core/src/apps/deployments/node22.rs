@@ -23,7 +23,9 @@
 //! - `check`: the result of the start (one route, `health.path`); the browser check is O-4.
 //!
 //! A publish (or a rollback) of a node22 deployment copies its image digest to the new live
-//! deployment and starts the image once as the live environment before the switch, unless the
+//! deployment and starts the image once as the live environment before the switch (healthy
+//! within the same wait, but at most [`Node22Settings::publish_start_wait`], 60 s: it runs
+//! inside the request), unless the
 //! manifest has bindings: the live credentials of a binding exist only after the switch, and
 //! the preview already passed the start with the same image and manifest (backlog I613-3).
 //!
@@ -79,6 +81,10 @@ pub struct Node22Settings {
     pub build_limits: Limits,
     /// The longest the stage `start` waits for a healthy instance.
     pub start_wait: Duration,
+    /// The longest the start before a publish (or a rollback) waits for a healthy instance,
+    /// counted from the start request. It runs inside the request, so it stays well below the
+    /// request timeout (`RUUM_REQUEST_TIMEOUT_SECONDS`, default 120 s; review I6-13, 3).
+    pub publish_start_wait: Duration,
     /// An instance without a request for this long scales to zero.
     pub idle_timeout: Duration,
     /// The writable disk of an instance (`/tmp`).
@@ -97,6 +103,7 @@ impl Default for Node22Settings {
                 disk_bytes: 2 * 1024 * 1024 * 1024,
             },
             start_wait: Duration::from_secs(120),
+            publish_start_wait: Duration::from_secs(60),
             idle_timeout: Duration::from_secs(15 * 60),
             disk_bytes: 256 * 1024 * 1024,
             health_interval: Duration::from_secs(5),
@@ -110,6 +117,21 @@ pub struct Node22 {
     pub settings: Node22Settings,
     /// Signs the workload tokens (`Services::workload_tokens`); `None`: a random token.
     pub tokens: Option<Arc<crate::apps::workload_tokens::WorkloadTokenIssuer>>,
+}
+
+/// How long a start check waits for a healthy instance, counted from the start request: the
+/// manifest's health timeout and 30 s, at most [`Node22Settings::start_wait`] for the stage
+/// `start` of a preview, and at most [`Node22Settings::publish_start_wait`] too for the start
+/// before a publish, which runs inside the request (review I6-13, 3).
+pub fn start_check_wait(manifest: &Value, settings: &Node22Settings, publish: bool) -> Duration {
+    let wait = health_timeout(manifest)
+        .saturating_add(Duration::from_secs(30))
+        .min(settings.start_wait);
+    if publish {
+        wait.min(settings.publish_start_wait)
+    } else {
+        wait
+    }
 }
 
 /// Whether a manifest is a node22 server.
@@ -302,6 +324,17 @@ pub(crate) fn build_error(e: &RuntimeError) -> StageError {
             s.details = json!({ "runtime_error": e.code() });
             s
         }
+        RuntimeError::Unavailable { .. } => {
+            // Also a build that found no free build slot in time (review I6-13, 1).
+            let mut s = runtime_stage_error(
+                "build",
+                "build_unavailable",
+                "the builder is unavailable",
+                e,
+            );
+            s.hint = Some("try again in a few minutes".into());
+            s
+        }
         other => runtime_stage_error("build", "build_unavailable", "the builder failed", other),
     }
 }
@@ -417,12 +450,13 @@ impl AppService {
     }
 
     /// Starts a node22 instance once and stops it again (the stage `start`, and the start
-    /// before a publish): it must be running and healthy in time. The check result
-    /// (`AppCheckResult`) on success.
+    /// before a publish when `publish` is true): it must be running and healthy in time. The
+    /// check result (`AppCheckResult`) on success.
     pub(crate) async fn node22_start_check(
         &self,
         spec: WorkloadSpec,
         manifest: &Value,
+        publish: bool,
     ) -> std::result::Result<Value, StageError> {
         let Some(node22) = self.node22() else {
             return Err(StageError::new(
@@ -431,9 +465,7 @@ impl AppService {
                 "node22 deployments are off on this server",
             ));
         };
-        let wait = health_timeout(manifest)
-            .saturating_add(Duration::from_secs(30))
-            .min(node22.settings.start_wait);
+        let wait = start_check_wait(manifest, &node22.settings, publish);
         start_and_check(self.deps.runtime.clone(), spec, wait).await
     }
 
@@ -502,6 +534,8 @@ pub(crate) async fn start_and_check(
         _ => None,
     }
     .unwrap_or_else(|| "/".to_owned());
+    // The wait counts from the start request, so a slow start does not add to it.
+    let deadline = tokio::time::Instant::now() + wait;
     let status = driver.start(spec).await.map_err(|e| {
         runtime_stage_error(
             "start",
@@ -544,7 +578,6 @@ pub(crate) async fn start_and_check(
         id,
         armed: true,
     };
-    let deadline = tokio::time::Instant::now() + wait;
     let mut st = status;
     let outcome = loop {
         match st.state {

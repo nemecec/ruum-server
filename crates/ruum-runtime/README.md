@@ -634,7 +634,8 @@ T-53). It mirrors the base image of the engine's platform from Docker Hub into i
 - When the registry stores the manifest but its answer fails (or the caller drops the build
   during the manifest push), the build reports an error although the manifest is in the
   build's own repository: by digest only, never tagged, never referenced by a deployment.
-- The wait for a build slot is not part of `BuildInput::timeout`: the caller (I-4) bounds it.
+- The wait for a build slot is not part of `BuildInput::timeout`: the caller (I-4) bounds it
+  (the Kubernetes builder below bounds it itself).
 - Under runsc the pids limit bounds the sandbox's host threads: a fork bomb ends the whole job
   (the build fails without the job's own report).
 - A build without `build` in `app.yaml` runs no build script (no `npm run build` by default).
@@ -678,6 +679,9 @@ staging side.
   their digests; ruum-server runs it at start until it is there.
 - **Settings** (`KubeBuilderConfig`; ruum-server's `RUUM_BUILDER=kubernetes` and `RUUM_BUILD_*`,
   `crates/ruum-server/src/config.rs` `BuildSettings`).
+- **The wait for a build slot is bounded** (`slot_wait`, default `KUBE_SLOT_WAIT` 120 s; review
+  I6-13, 1): after it the build fails with `unavailable` ("try again") and makes no pod, so a
+  queued build never holds its deployment's deploy slot without end.
 - **Tests**: `src/builder/kube_tests.rs` (a fake API server: the pod's shape, the channel's rules,
   every end, the cleanup and the sweep) in every `cargo test`; `crates/ruum-server`
   `build_channel::e2e` with `RUUM_BUILD_SCRIPT_E2E=1` on a host with Docker and runsc: build pods

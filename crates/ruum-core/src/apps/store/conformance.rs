@@ -1310,6 +1310,94 @@ pub(crate) async fn app_hosts_are_known_only_for_real_apps(h: &dyn Harness) {
     );
 }
 
+/// The image of a server runtime (card I6-13): a running preview of its own tenant takes one
+/// digest, once; an ended one, another tenant and a bad digest are refused; a release keeps the
+/// digest it is given.
+pub(crate) async fn image_digests_are_set_once_by_their_tenant(h: &dyn Harness) {
+    let s = h.store();
+    let (a, ua) = h.tenant().await;
+    let (b, _) = h.tenant().await;
+    let n = h.app_node(a, ua).await;
+    let ca = ctx(a, ua);
+    s.insert_app(&ca, app(n, &unique("server")))
+        .await
+        .unwrap()
+        .unwrap();
+    let d1 = format!("sha256:{}", "1".repeat(64));
+    let d2 = format!("sha256:{}", "2".repeat(64));
+    let digest_of = |id: Uuid| async move {
+        s.get_deployment(a, n, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .image_digest
+    };
+    // Only a deployment that runs takes an image: pending and running, not ready or failed.
+    for state in [DeploymentState::Pending, DeploymentState::Running] {
+        let p = s
+            .insert_deployment(&ca, deployment(n, Environment::Preview, state))
+            .await
+            .unwrap();
+        assert!(p.image_digest.is_none());
+        // Another tenant's ID changes nothing.
+        assert!(!s.set_image_digest(b, p.id, &d1).await.unwrap());
+        assert_eq!(digest_of(p.id).await, None);
+        // A bad digest is refused before anything is written.
+        for bad in [
+            format!("sha256:{}", "A".repeat(64)),
+            format!("sha256:{}", "a".repeat(63)),
+            format!("sha256:{}", "a".repeat(65)),
+            "a".repeat(64),
+            format!("sha512:{}", "a".repeat(64)),
+            String::new(),
+        ] {
+            assert!(
+                s.set_image_digest(a, p.id, &bad).await.is_err(),
+                "{bad:?} was taken"
+            );
+        }
+        assert_eq!(digest_of(p.id).await, None);
+        // Once only.
+        assert!(s.set_image_digest(a, p.id, &d1).await.unwrap(), "{state:?}");
+        assert!(!s.set_image_digest(a, p.id, &d2).await.unwrap());
+        assert_eq!(digest_of(p.id).await.as_deref(), Some(d1.as_str()));
+    }
+    for state in [DeploymentState::Ready, DeploymentState::Failed] {
+        let p = s
+            .insert_deployment(&ca, deployment(n, Environment::Preview, state))
+            .await
+            .unwrap();
+        assert!(
+            !s.set_image_digest(a, p.id, &d1).await.unwrap(),
+            "{state:?}"
+        );
+        assert_eq!(digest_of(p.id).await, None);
+    }
+    // An unknown deployment.
+    assert!(!s.set_image_digest(a, Uuid::now_v7(), &d1).await.unwrap());
+    // A release with an image reads back the same image.
+    let mut r = deployment(n, Environment::Live, DeploymentState::Live);
+    r.image_digest = Some(d2.clone());
+    let rid = r.id;
+    s.release(
+        &ca,
+        r,
+        Release {
+            kind: ReleaseKind::Publish,
+            expected_live: None,
+            restored_from: None,
+            rollback_of: None,
+            approval_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(digest_of(rid).await.as_deref(), Some(d2.as_str()));
+    // A live release takes no second image.
+    assert!(!s.set_image_digest(a, rid, &d1).await.unwrap());
+    assert_eq!(digest_of(rid).await.as_deref(), Some(d2.as_str()));
+}
+
 /// Runs every case.
 /// An agent acting for `user` (the requester of publish requests).
 fn agent_of(user: UserId) -> Actor {
@@ -1707,6 +1795,7 @@ pub(crate) async fn run_all(h: &dyn Harness) {
     app_hosts_are_known_only_for_real_apps(h).await;
     approvals_follow_their_rules(h).await;
     approvals_stay_in_their_tenant(h).await;
+    image_digests_are_set_once_by_their_tenant(h).await;
 }
 
 #[cfg(test)]

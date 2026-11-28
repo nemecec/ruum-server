@@ -31,6 +31,9 @@
 //! [`TENANT_DEPLOYS`] per tenant and [`GLOBAL_DEPLOYS`] per process. A request waits up to
 //! [`DEPLOY_SLOT_WAIT`] for a slot, holding no archive, then gets `409 conflict` with
 //! `Retry-After`, before anything is read or stored. Unpacking runs on the blocking pool.
+//! A node22 preview holds its slot until its build has read the archive; at most
+//! [`SERVER_DEPLOYS`] of them hold a slot at the same time in a process, and one more gets
+//! `409 conflict` at once, so their builds never take every slot (review I6-13, 1).
 //!
 //! After the `202` the stages `image` (the files under `static.root` as content-addressed
 //! objects and the site index, [`super::static_site`]; R-1's `StaticImage`), `start` (the image
@@ -157,6 +160,13 @@ pub const TENANT_DEPLOYS: usize = 2;
 /// How many deployments of all tenants run at the same time in one process (the same reason).
 pub const GLOBAL_DEPLOYS: usize = 4;
 
+/// How many deployments of a server runtime (`node22`) hold a deployment slot at the same
+/// time in one process: one fewer than [`GLOBAL_DEPLOYS`] (review I6-13, 1). A node22 preview
+/// holds its slot until its build has read the archive, which can take minutes (the build and
+/// the wait for a build slot); the slot left over keeps the static deployments of every tenant
+/// going meanwhile.
+pub const SERVER_DEPLOYS: usize = GLOBAL_DEPLOYS - 1;
+
 /// How long a deployment request waits for a slot, then `409 conflict` with `Retry-After`.
 pub const DEPLOY_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -167,6 +177,8 @@ pub(crate) struct DeploySlots {
     per_tenant: usize,
     wait: std::time::Duration,
     global: Arc<tokio::sync::Semaphore>,
+    /// The share of `global` that server runtimes may hold ([`SERVER_DEPLOYS`]).
+    server: Arc<tokio::sync::Semaphore>,
     tenants: std::sync::Mutex<std::collections::HashMap<TenantId, Arc<tokio::sync::Semaphore>>>,
 }
 
@@ -174,6 +186,8 @@ pub(crate) struct DeploySlots {
 pub(crate) struct DeploySlot {
     _tenant: tokio::sync::OwnedSemaphorePermit,
     _global: tokio::sync::OwnedSemaphorePermit,
+    /// Set for a server runtime ([`DeploySlots::take_server`]).
+    server: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// How long a publish waits for the live switch of its app (another publish of the same app
@@ -245,8 +259,23 @@ impl DeploySlots {
             per_tenant,
             wait,
             global: Arc::new(tokio::sync::Semaphore::new(global)),
+            server: Arc::new(tokio::sync::Semaphore::new(global.saturating_sub(1).max(1))),
             tenants: std::sync::Mutex::default(),
         }
+    }
+
+    /// Marks `slot` as the slot of a server runtime, without a wait: `409 conflict` with
+    /// `Retry-After` when server runtimes already hold their share ([`SERVER_DEPLOYS`]). The
+    /// request then ends and frees its slot at once, so a waiting static deployment gets it.
+    pub(crate) fn take_server(&self, slot: &mut DeploySlot) -> Result<()> {
+        if slot.server.is_some() {
+            return Ok(());
+        }
+        let permit = self.server.clone().try_acquire_owned().map_err(|_| {
+            deploys_busy("the server has the most node22 deployments running at the same time")
+        })?;
+        slot.server = Some(permit);
+        Ok(())
     }
 
     /// The semaphore of `tenant` (only tenants with a slot taken or awaited keep an entry).
@@ -277,6 +306,7 @@ impl DeploySlots {
         Ok(DeploySlot {
             _tenant: mine,
             _global: global,
+            server: None,
         })
     }
 
@@ -700,6 +730,12 @@ impl AppService {
             })
             .await?;
         let server = node22::is_server(&manifest);
+        // A node22 preview holds its slot through its build: at most SERVER_DEPLOYS of them
+        // per process, so one slot stays free for the other deployments (review I6-13, 1).
+        let mut slot = slot;
+        if server {
+            self.deploy_slots.take_server(&mut slot)?;
+        }
         // The bindings (card B-1): resolution and the deployer check before the answer; a
         // refusal leaves nothing behind. The stage `bindings` runs the check again after it.
         let resolved = self
@@ -1165,7 +1201,7 @@ impl AppService {
                     .node22_check_spec(ctx.tenant, identity, &manifest, digest, false)
                     .await
                     .map_err(refused)?;
-                self.node22_start_check(spec, &manifest)
+                self.node22_start_check(spec, &manifest, true)
                     .await
                     .map_err(refused)?;
             }

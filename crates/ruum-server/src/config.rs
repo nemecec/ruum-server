@@ -276,8 +276,9 @@ pub struct KubeSettings {
 ///   listener of this process. TLS 1.3 with the supervisor listener's certificate (derived from
 ///   the record key), pinned by the build pods;
 /// - `RUUM_BUILD_NAMESPACE` (default `ruum-builds`), `RUUM_BUILD_OUTPUT_MAX` (bytes, default
-///   256 MiB), `RUUM_BUILD_MAX_PARALLEL` (default 4) and `RUUM_BUILD_TENANT_MAX` (default 2,
-///   at most the former).
+///   64 MiB), `RUUM_BUILD_MAX_PARALLEL` (default 1) and `RUUM_BUILD_TENANT_MAX` (default 1,
+///   at most the former). The defaults are those of `KubeBuilderConfig::new`: an output is in
+///   the server's memory until its push.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BuildSettings {
     pub registry_url: String,

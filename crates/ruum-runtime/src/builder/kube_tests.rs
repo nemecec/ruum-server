@@ -21,6 +21,8 @@ struct Fake {
     pods: Mutex<HashMap<String, Value>>,
     deleted: Mutex<Vec<String>>,
     log: Mutex<String>,
+    /// The pods created so far: the n-th pod gets the address `10.0.0.(9 + n)`.
+    created: std::sync::atomic::AtomicU8,
 }
 
 type S = Arc<Fake>;
@@ -30,7 +32,9 @@ async fn create(State(f): State<S>, axum::Json(mut pod): axum::Json<Value>) -> i
         .as_str()
         .unwrap_or_default()
         .to_owned();
-    pod["status"] = json!({ "phase": "Pending", "podIP": POD_IP });
+    let n = f.created.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let ip = format!("10.0.0.{}", 9 + n);
+    pod["status"] = json!({ "phase": "Pending", "podIP": ip });
     pod["metadata"]["creationTimestamp"] = json!("2026-01-01T00:00:00Z");
     f.pods.lock().unwrap().insert(name, pod.clone());
     (StatusCode::CREATED, axum::Json(pod))
@@ -147,6 +151,33 @@ async fn wait_pod(f: &Fake) -> (String, String, Value) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("no build pod");
+}
+
+/// Waits for a build pod other than `seen`; its build ID, token and address.
+async fn wait_other_pod(f: &Fake, seen: &[&str]) -> (String, String, IpAddr) {
+    for _ in 0..200 {
+        let found = f
+            .pods
+            .lock()
+            .unwrap()
+            .values()
+            .find(|p| {
+                let b = p["metadata"]["labels"][LABEL_BUILD].as_str().unwrap();
+                !seen.contains(&b)
+            })
+            .cloned();
+        if let Some(p) = found {
+            let build = p["metadata"]["labels"][LABEL_BUILD]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let token = env_of(&p, "RUUM_BUILD_TOKEN").unwrap();
+            let ip = p["status"]["podIP"].as_str().unwrap().parse().unwrap();
+            return (build, token, ip);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("no other build pod");
 }
 
 fn set_status(f: &Fake, status: Value) {
@@ -471,6 +502,150 @@ async fn a_dropped_build_deletes_its_pod_and_the_sweep_takes_old_leftovers() {
     assert!(f.pods.lock().unwrap().contains_key("ruum-b-new"));
 }
 
+/// Two builds of two tenants at the same time (review I6-13, 7): one build's token opens
+/// nothing of the other build, also not from the other pod's address, and a refused request
+/// uses up neither source nor output.
+#[tokio::test]
+async fn one_build_cannot_reach_the_channel_of_another_tenants_build() {
+    let (f, api) = fake().await;
+    let mut c = cfg(&api);
+    c.max_parallel = 2;
+    c.per_tenant = 1;
+    let b = builder(c);
+    let (in_a, in_b) = (input(archive(None)), input(archive(None)));
+    assert_ne!(in_a.identity.tenant, in_b.identity.tenant);
+    let task_a = {
+        let b = b.clone();
+        tokio::spawn(async move { b.build(in_a).await })
+    };
+    let (build_a, token_a, ip_a) = wait_other_pod(&f, &[]).await;
+    let task_b = {
+        let b = b.clone();
+        tokio::spawn(async move { b.build(in_b).await })
+    };
+    let (build_b, token_b, ip_b) = wait_other_pod(&f, &[&build_a]).await;
+    assert_ne!(ip_a, ip_b);
+    let refused = ChannelRefusal::Forbidden;
+    // A's token on B's source and output, from either pod's address.
+    for peer in [ip_a, ip_b] {
+        assert_eq!(
+            b.channel_source(&build_b, &token_a, peer)
+                .await
+                .unwrap_err(),
+            refused,
+            "A's token on B's source from {peer}"
+        );
+        assert_eq!(
+            b.channel_output(&build_b, &token_a, peer, chunks(vec![1u8; 100]))
+                .await
+                .unwrap_err(),
+            refused,
+            "A's token on B's output from {peer}"
+        );
+    }
+    // B's token from A's pod address: on B's build (the wrong address) and on A's build.
+    assert_eq!(
+        b.channel_source(&build_b, &token_b, ip_a)
+            .await
+            .unwrap_err(),
+        refused,
+        "B's own token from A's address"
+    );
+    assert_eq!(
+        b.channel_output(&build_b, &token_b, ip_a, chunks(vec![1u8; 100]))
+            .await
+            .unwrap_err(),
+        refused
+    );
+    for peer in [ip_a, ip_b] {
+        assert_eq!(
+            b.channel_source(&build_a, &token_b, peer)
+                .await
+                .unwrap_err(),
+            refused,
+            "B's token on A's source from {peer}"
+        );
+        assert_eq!(
+            b.channel_output(&build_a, &token_b, peer, chunks(vec![1u8; 100]))
+                .await
+                .unwrap_err(),
+            refused,
+            "B's token on A's output from {peer}"
+        );
+    }
+    // A's own token from B's address.
+    assert_eq!(
+        b.channel_source(&build_a, &token_a, ip_b)
+            .await
+            .unwrap_err(),
+        refused
+    );
+    // Nothing was used up: each pod still gets its own source, once.
+    b.channel_source(&build_a, &token_a, ip_a).await.unwrap();
+    b.channel_source(&build_b, &token_b, ip_b).await.unwrap();
+    assert_eq!(
+        b.channel_source(&build_a, &token_a, ip_a)
+            .await
+            .unwrap_err(),
+        ChannelRefusal::Conflict
+    );
+    // Both pods fail: both builds end and their pods are deleted.
+    set_status(
+        &f,
+        json!({ "phase": "Failed", "podIP": POD_IP, "containerStatuses": [
+            { "state": { "terminated": { "exitCode": 1 } } }
+        ] }),
+    );
+    for task in [task_a, task_b] {
+        let err = task.await.unwrap().unwrap_err();
+        assert!(matches!(err, RuntimeError::BuildFailed { .. }), "{err:?}");
+    }
+    assert!(f.pods.lock().unwrap().is_empty());
+}
+
+/// A build waits a bounded time for a build slot, then fails as unavailable without a pod
+/// (review I6-13, 1; backlog P-84).
+#[tokio::test]
+async fn a_build_without_a_free_slot_fails_after_the_slot_wait() {
+    let (f, api) = fake().await;
+    let mut c = cfg(&api);
+    c.slot_wait = Duration::from_millis(200);
+    let b = builder(c);
+    assert_eq!(b.config().max_parallel, 1);
+    let task_a = {
+        let b = b.clone();
+        tokio::spawn(async move { b.build(input(archive(None))).await })
+    };
+    wait_other_pod(&f, &[]).await;
+    let started = Instant::now();
+    let err = b.build(input(archive(None))).await.unwrap_err();
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    assert!(
+        matches!(&err, RuntimeError::Unavailable { reason } if reason == BUILD_SLOTS_BUSY),
+        "{err:?}"
+    );
+    assert_eq!(
+        f.created.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the refused build made no pod"
+    );
+    set_status(
+        &f,
+        json!({ "phase": "Failed", "podIP": POD_IP, "containerStatuses": [
+            { "state": { "terminated": { "exitCode": 1 } } }
+        ] }),
+    );
+    assert!(task_a.await.unwrap().is_err());
+    // The slot is free again: the next build gets a pod.
+    let task_c = {
+        let b = b.clone();
+        tokio::spawn(async move { b.build(input(archive(None))).await })
+    };
+    wait_other_pod(&f, &[]).await;
+    assert_eq!(f.created.load(std::sync::atomic::Ordering::SeqCst), 2);
+    task_c.abort();
+}
+
 #[test]
 fn the_settings_are_checked() {
     let ok = cfg("https://k");
@@ -490,6 +665,10 @@ fn the_settings_are_checked() {
         },
         KubeBuilderConfig {
             channel_port: 0,
+            ..cfg("https://k")
+        },
+        KubeBuilderConfig {
+            slot_wait: Duration::ZERO,
             ..cfg("https://k")
         },
         KubeBuilderConfig {

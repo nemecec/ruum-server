@@ -198,6 +198,12 @@ impl Slots {
             _global: global,
         }
     }
+
+    /// [`Slots::acquire`], waiting at most `wait` in all; `None` after that (review I6-13, 1;
+    /// backlog P-84: a queued build must not wait without a bound).
+    pub async fn acquire_within(&self, tenant: TenantId, wait: Duration) -> Option<Slot> {
+        tokio::time::timeout(wait, self.acquire(tenant)).await.ok()
+    }
 }
 
 /// The builder (see the module docs).
