@@ -513,8 +513,10 @@ impl World {
         let instances = Arc::new(Instances::default());
         let locate = instances.clone();
         let locator: Locator = Arc::new(move |st: &InstanceStatus| locate.locate(st));
-        let spec: SpecMaker =
-            Arc::new(|row: &DeploymentRow| Some(spec_of(identity_of(row), Vec::new())));
+        let spec: SpecMaker = Arc::new(|row: DeploymentRow| {
+            let spec = Some(spec_of(identity_of(&row), Vec::new()));
+            Box::pin(async move { spec })
+        });
         let directory = Arc::new(
             SandboxDirectory::new(state.services.apps.store().clone(), driver.clone(), locator)
                 .with_spec_maker(spec),
@@ -1411,6 +1413,7 @@ impl World {
             .insert_deployment(
                 &ctx,
                 NewDeployment {
+                    image_digest: None,
                     id,
                     app_node_id: s.app,
                     environment,

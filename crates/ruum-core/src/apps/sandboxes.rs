@@ -76,7 +76,10 @@ impl Upstream {
 pub type Locator = Arc<dyn Fn(&InstanceStatus) -> Option<Upstream> + Send + Sync>;
 
 /// Builds the workload spec of a sandbox deployment, for a start (`None`: it cannot start).
-pub type SpecMaker = Arc<dyn Fn(&DeploymentRow) -> Option<WorkloadSpec> + Send + Sync>;
+/// Async: the spec of a node22 deployment reads the plan and makes the binding environment of
+/// this start ([`crate::apps::AppService::spec_maker`], card I6-13).
+pub type SpecMaker =
+    Arc<dyn Fn(DeploymentRow) -> BoxFuture<'static, Option<WorkloadSpec>> + Send + Sync>;
 
 /// Whether a manifest runs in a sandbox: a `runtime` that is not `static`.
 pub fn is_sandbox(manifest: Option<&Value>) -> bool {
@@ -428,7 +431,11 @@ impl Inner {
                 Err(_) => (Flight::NotRunning, None),
             },
             Action::Start => {
-                let Some(spec) = self.spec.as_ref().and_then(|f| f(row)) else {
+                let spec = match self.spec.as_ref() {
+                    Some(f) => f(row.clone()).await,
+                    None => None,
+                };
+                let Some(spec) = spec else {
                     return (Flight::NotRunning, None);
                 };
                 let id = spec.identity;
@@ -678,6 +685,7 @@ mod tests {
                 .insert_deployment(
                     &ctx,
                     NewDeployment {
+                        image_digest: None,
                         id,
                         app_node_id: seeded.app,
                         environment,
@@ -736,9 +744,10 @@ mod tests {
     }
 
     fn counting_spec(calls: Arc<AtomicUsize>) -> SpecMaker {
-        Arc::new(move |row: &DeploymentRow| {
+        Arc::new(move |row: DeploymentRow| {
             calls.fetch_add(1, Ordering::SeqCst);
-            Some(spec_for(identity_of(row), Vec::new()))
+            let spec = Some(spec_for(identity_of(&row), Vec::new()));
+            Box::pin(async move { spec })
         })
     }
 
@@ -943,7 +952,10 @@ mod tests {
         // A spec maker that names another tenant's deployment is refused before the driver.
         let bad: SpecMaker = {
             let other = identity_of(&row_b);
-            Arc::new(move |_row: &DeploymentRow| Some(spec_for(other, Vec::new())))
+            Arc::new(move |_row: DeploymentRow| {
+                let spec = Some(spec_for(other, Vec::new()));
+                Box::pin(async move { spec })
+            })
         };
         let d = w.directory(Some(bad));
         assert_eq!(

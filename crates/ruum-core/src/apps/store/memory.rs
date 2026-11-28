@@ -166,6 +166,7 @@ fn insert_row(
         created_at: now,
         published_at: release.then_some(now),
         expires_at: d.expires_at,
+        image_digest: d.image_digest.clone(),
     })
 }
 
@@ -477,6 +478,17 @@ impl AppStore for MemoryAppStore {
             Some(d) if d.state.is_moving() => {
                 d.state = DeploymentState::Running;
                 d.stages = stages.clone();
+                true
+            }
+            _ => false,
+        })
+    }
+
+    async fn set_image_digest(&self, tenant: TenantId, id: Uuid, digest: &str) -> Result<bool> {
+        super::check_image_digest(digest)?;
+        Ok(match self.st().deployments.get_mut(&(tenant, id)) {
+            Some(d) if d.state.is_moving() && d.image_digest.is_none() => {
+                d.image_digest = Some(digest.to_owned());
                 true
             }
             _ => false,

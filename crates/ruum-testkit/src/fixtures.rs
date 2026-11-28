@@ -1333,6 +1333,7 @@ mod seed {
                 .insert_deployment(
                     &c,
                     NewDeployment {
+                        image_digest: None,
                         id: deployment,
                         app_node_id: app,
                         environment: Environment::Live,

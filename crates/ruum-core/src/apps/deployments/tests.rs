@@ -564,6 +564,7 @@ async fn drafts_supersede_and_the_sweeper_ends_expired_previews() {
             .unwrap();
     d.expires_at = Some(crate::now() - time::Duration::seconds(1));
     let expired = NewDeployment {
+        image_digest: None,
         id: Uuid::now_v7(),
         app_node_id: app,
         environment: Environment::Preview,
@@ -2085,4 +2086,425 @@ async fn the_static_quota_counts_files_members_and_static_objects() {
         },
     );
     apps.check_static_quota(t, &new).await.unwrap();
+}
+
+// ---------------------------------------------------------------------------- node22 (I6-13)
+
+mod node22_pipeline {
+    use super::*;
+    use crate::apps::deployments::node22::{self as n22, Node22, Node22Settings};
+    use crate::runtime::{
+        EnvValue, ImageRef, InstanceState, MemoryBuilder, MemoryDriver, MemoryRegistry,
+        MemoryUsage, Route, RuntimeDriver, WorkloadKind,
+    };
+
+    const SERVER: &[u8] = b"runtime: node22\nstart: node server.js\nenv:\n  GREETING: hello\n";
+    const SERVER_JS: &[u8] =
+        b"require('http').createServer((q, s) => s.end('hi')).listen(process.env.PORT)\n";
+
+    /// The memory driver, with the instances that were started and stopped.
+    struct Counting {
+        inner: MemoryDriver,
+        started: Mutex<Vec<crate::runtime::InstanceId>>,
+        stopped: Mutex<Vec<crate::runtime::InstanceId>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeDriver for Counting {
+        fn name(&self) -> &str {
+            "counting"
+        }
+        async fn start(
+            &self,
+            spec: crate::runtime::WorkloadSpec,
+        ) -> std::result::Result<crate::runtime::InstanceStatus, crate::runtime::RuntimeError>
+        {
+            let st = self.inner.start(spec).await?;
+            self.started.lock().unwrap().push(st.id);
+            Ok(st)
+        }
+        async fn status(
+            &self,
+            t: TenantId,
+            i: crate::runtime::InstanceId,
+        ) -> std::result::Result<crate::runtime::InstanceStatus, crate::runtime::RuntimeError>
+        {
+            self.inner.status(t, i).await
+        }
+        async fn stop(
+            &self,
+            t: TenantId,
+            i: crate::runtime::InstanceId,
+        ) -> std::result::Result<(), crate::runtime::RuntimeError> {
+            self.stopped.lock().unwrap().push(i);
+            self.inner.stop(t, i).await
+        }
+        async fn touch(
+            &self,
+            t: TenantId,
+            i: crate::runtime::InstanceId,
+        ) -> std::result::Result<(), crate::runtime::RuntimeError> {
+            self.inner.touch(t, i).await
+        }
+        async fn wake(
+            &self,
+            t: TenantId,
+            i: crate::runtime::InstanceId,
+        ) -> std::result::Result<crate::runtime::InstanceStatus, crate::runtime::RuntimeError>
+        {
+            self.inner.wake(t, i).await
+        }
+        async fn logs(
+            &self,
+            t: TenantId,
+            i: crate::runtime::InstanceId,
+            after: Option<u64>,
+            limit: usize,
+        ) -> std::result::Result<Vec<crate::runtime::LogLine>, crate::runtime::RuntimeError>
+        {
+            self.inner.logs(t, i, after, limit).await
+        }
+        async fn rotate_token(
+            &self,
+            t: TenantId,
+            i: crate::runtime::InstanceId,
+            token: crate::runtime::SecretValue,
+        ) -> std::result::Result<(), crate::runtime::RuntimeError> {
+            self.inner.rotate_token(t, i, token).await
+        }
+    }
+
+    impl Counting {
+        /// The started instances that were not stopped.
+        fn left_running(&self) -> Vec<crate::runtime::InstanceId> {
+            let stopped = self.stopped.lock().unwrap().clone();
+            self.started
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|i| !stopped.contains(i))
+                .copied()
+                .collect()
+        }
+    }
+
+    /// A world whose apps area runs node22 over one in-memory registry: the memory builder
+    /// pushes there and the memory driver starts only what is there.
+    async fn node22_world() -> (World, Arc<Counting>) {
+        let mut w = world().await;
+        let registry = MemoryRegistry::new();
+        let usage = Arc::new(MemoryUsage::new());
+        let driver = Arc::new(Counting {
+            inner: MemoryDriver::new(registry.clone(), usage.clone()),
+            started: Mutex::default(),
+            stopped: Mutex::default(),
+        });
+        let mut parts = crate::apps::AppParts::memory(None);
+        parts.runtime = driver.clone();
+        crate::apps::install(&mut w.s, parts).unwrap();
+        w.s.apps.set_node22(Node22 {
+            builder: Arc::new(MemoryBuilder::new(registry, usage)),
+            settings: Node22Settings {
+                start_wait: Duration::from_secs(5),
+                ..Node22Settings::default()
+            },
+            tokens: None,
+        });
+        (w, driver)
+    }
+
+    async fn row(w: &World, app: NodeId, id: Uuid) -> DeploymentRow {
+        w.s.apps
+            .store()
+            .get_deployment(w.team.id, app, id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_node22_preview_builds_records_its_image_and_starts() {
+        let (w, driver) = node22_world().await;
+        let app = w.app("Greeter").await;
+        let src = w
+            .folder(
+                "greeter src",
+                &[("app.yaml", SERVER), ("server.js", SERVER_JS)],
+            )
+            .await;
+        let d = w.deploy(&w.m(), app, src, None).await.unwrap();
+        assert_eq!(stage(&d, "build")["state"], "pending");
+        let d = w.settled(app, d.id).await;
+        assert_eq!(d.state, DeploymentState::Ready, "{:?}", d.stages);
+        for s in ["build", "image", "start", "check"] {
+            assert_eq!(stage(&d, s)["state"], "done", "{s}: {:?}", d.stages);
+        }
+        assert_eq!(stage(&d, "test")["state"], "skipped");
+        assert_eq!(d.check.as_ref().unwrap()["passed"], true);
+        // The image is the build's digest, stored once; no site index exists.
+        let r = row(&w, app, d.id).await;
+        let digest = r.image_digest.clone().expect("an image digest");
+        assert!(
+            digest.starts_with("sha256:") && digest.len() == 71,
+            "{digest}"
+        );
+        assert!(
+            w.s.apps
+                .deps()
+                .sites
+                .read_index(w.team.id, d.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !w.s.apps
+                .store()
+                .set_image_digest(w.team.id, d.id, &digest)
+                .await
+                .unwrap(),
+            "a ready deployment takes no second image"
+        );
+        // The start check left no running instance: the first request starts it.
+        assert_eq!(driver.started.lock().unwrap().len(), 1);
+        assert!(driver.left_running().is_empty());
+        // The spec maker of the sandbox directory: the image by digest, PORT and the plain
+        // env, the egress proxy only, a service with its health check and scale to zero.
+        let spec = w.s.apps.server_spec(&r).await.unwrap().expect("a spec");
+        assert_eq!(spec.identity.deployment, d.id);
+        assert_eq!(spec.identity.tenant, w.team.id);
+        assert!(matches!(&spec.image, ImageRef::Oci(x) if x.as_str() == digest));
+        assert!(spec.command.is_empty());
+        let env: Vec<(String, String)> = spec
+            .env
+            .iter()
+            .map(|e| match &e.value {
+                EnvValue::Plain(v) => (e.name.clone(), v.clone()),
+                EnvValue::Secret(_) => (e.name.clone(), "<secret>".into()),
+            })
+            .collect();
+        assert_eq!(
+            env,
+            vec![
+                ("PORT".to_owned(), "8080".to_owned()),
+                ("GREETING".to_owned(), "hello".to_owned())
+            ]
+        );
+        assert_eq!(spec.routes, vec![Route::EgressProxy]);
+        let WorkloadKind::Service(svc) = &spec.kind else {
+            panic!("not a service");
+        };
+        assert_eq!(svc.port, n22::PORT);
+        assert_eq!(svc.health.as_ref().unwrap().path, "/");
+        assert!(svc.idle_timeout.is_some());
+        assert_eq!(spec.limits.memory_bytes, 256 * 1024 * 1024);
+        spec.validate().unwrap();
+        // The directory's start of that spec runs (the memory driver finds the image).
+        let st = driver.start(spec).await.unwrap();
+        assert_ne!(st.state, InstanceState::Stopped);
+        driver.stop(w.team.id, st.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_build_fails_the_stage_build_with_its_reason() {
+        let (w, _) = node22_world().await;
+        let app = w.app("Broken").await;
+        let src = w
+            .folder(
+                "broken src",
+                &[
+                    ("app.yaml", SERVER),
+                    ("server.js", b"// ruum-memory-builder:fail\n"),
+                ],
+            )
+            .await;
+        let d = w.deploy(&w.m(), app, src, None).await.unwrap();
+        let d = w.settled(app, d.id).await;
+        assert_eq!(d.state, DeploymentState::Failed);
+        let b = stage(&d, "build");
+        assert_eq!(b["state"], "failed");
+        assert!(
+            b["message"]
+                .as_str()
+                .unwrap()
+                .contains("exited with code 1"),
+            "{b}"
+        );
+        for s in ["image", "start", "check"] {
+            assert_eq!(stage(&d, s)["state"], "skipped", "{s}");
+        }
+        assert!(row(&w, app, d.id).await.image_digest.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_publish_copies_the_image_and_a_rollback_keeps_it() {
+        let (w, _) = node22_world().await;
+        let app = w.app("Greeter live").await;
+        let v1 = w
+            .folder("v1", &[("app.yaml", SERVER), ("server.js", SERVER_JS)])
+            .await;
+        let p1 = w.preview(app, v1, None).await;
+        let Published::Live(l1) = w.publish(&w.m(), app, p1.id).await.unwrap() else {
+            panic!("not live");
+        };
+        assert_eq!(stage(&l1, "build")["state"], "done");
+        let d1 = row(&w, app, p1.id).await.image_digest;
+        assert!(d1.is_some());
+        assert_eq!(row(&w, app, l1.id).await.image_digest, d1);
+        let v2 = w
+            .folder(
+                "v2",
+                &[("app.yaml", SERVER), ("server.js", b"// version two\n")],
+            )
+            .await;
+        let p2 = w.preview(app, v2, None).await;
+        let Published::Live(l2) = w.publish(&w.m(), app, p2.id).await.unwrap() else {
+            panic!("not live");
+        };
+        let d2 = row(&w, app, l2.id).await.image_digest;
+        assert_ne!(d1, d2);
+        // A rollback to the first release runs its image again.
+        let Published::Live(back) = w.publish(&w.m(), app, l1.id).await.unwrap() else {
+            panic!("not live");
+        };
+        assert_eq!(row(&w, app, back.id).await.image_digest, d1);
+        assert_eq!(w.live(app).await, Some(back.id));
+        // The live spec names the live environment.
+        let spec =
+            w.s.apps
+                .server_spec(&row(&w, app, back.id).await)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(spec.identity.environment, crate::runtime::Environment::Live);
+    }
+
+    #[tokio::test]
+    async fn unbuilt_parts_of_a_node22_manifest_refuse_before_the_answer() {
+        let (w, _) = node22_world().await;
+        let app = w.app("Refused node").await;
+        for (manifest, pointer) in [
+            (
+                &b"runtime: node22\nstart: node s.js\nstatic:\n  root: public\n"[..],
+                "/static",
+            ),
+            (
+                b"runtime: node22\nstart: node s.js\njobs:\n  nightly:\n    schedule: \"0 3 * * *\"\n    path: /jobs/nightly\n",
+                "/jobs",
+            ),
+            (
+                b"runtime: node22\nstart: node s.js\negress:\n  allow: [api.example.com]\n",
+                "/egress/allow",
+            ),
+            (
+                b"runtime: node22\nstart: node s.js\nsecrets: [STRIPE_KEY]\n",
+                "/secrets",
+            ),
+        ] {
+            let src = w
+                .folder(
+                    &format!("src {}", Uuid::now_v7().simple()),
+                    &[("app.yaml", manifest), ("s.js", b"//\n")],
+                )
+                .await;
+            let err = w.deploy(&w.m(), app, src, None).await.unwrap_err();
+            let Error::Api(a) = err else {
+                panic!("{err:?}");
+            };
+            let pointer_of = a
+                .details
+                .as_deref()
+                .and_then(|d| d.get("pointer"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            assert!(
+                a.code == ErrorCode::Conflict || a.code == ErrorCode::ValidationFailed,
+                "{manifest:?}: {a:?}"
+            );
+            assert_eq!(pointer_of.as_deref(), Some(pointer), "{a:?}");
+        }
+        let page =
+            w.s.apps
+                .store()
+                .list_deployments(w.team.id, app, None, PageRequest::default())
+                .await
+                .unwrap();
+        assert!(page.items.is_empty());
+    }
+
+    #[test]
+    fn the_spec_follows_the_manifest_and_the_plan() {
+        let plan = AppPlanLimits::of(crate::tenants::Plan::Free);
+        let settings = Node22Settings::default();
+        let identity = crate::runtime::WorkloadIdentity {
+            tenant: TenantId::new(),
+            app: NodeId::new(),
+            deployment: Uuid::now_v7(),
+            environment: crate::runtime::Environment::Preview,
+        };
+        let m: Value = serde_json::json!({
+            "runtime": "node22", "start": "node s.js",
+            "health": { "path": "/healthz", "timeout_seconds": 12 },
+            "resources": { "memory_mb": 128, "min_instances": 1 },
+        });
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let token = crate::runtime::SecretValue::new("t");
+        let db = crate::runtime::EnvVar::secret(
+            "RUUM_BINDING_DB",
+            crate::runtime::SecretValue::new("postgres://x"),
+        );
+        let s = n22::workload_spec(
+            identity,
+            &m,
+            Some(&digest),
+            &plan,
+            &settings,
+            token.clone(),
+            vec![db],
+        )
+        .unwrap();
+        assert_eq!(s.limits.memory_bytes, 128 * 1024 * 1024);
+        assert_eq!(s.limits.cpu_millis, 125);
+        assert_eq!(s.routes, vec![Route::EgressProxy, Route::Pooler]);
+        let WorkloadKind::Service(svc) = &s.kind else {
+            panic!()
+        };
+        let h = svc.health.as_ref().unwrap();
+        assert_eq!(h.path, "/healthz");
+        assert_eq!(h.failure_threshold, 3);
+        assert_eq!(svc.idle_timeout, None, "min_instances keeps it running");
+        s.validate().unwrap();
+        // No image, a bad digest, or a static manifest: no spec.
+        assert!(
+            n22::workload_spec(identity, &m, None, &plan, &settings, token.clone(), vec![])
+                .is_err()
+        );
+        assert!(
+            n22::workload_spec(
+                identity,
+                &m,
+                Some("sha256:zz"),
+                &plan,
+                &settings,
+                token.clone(),
+                vec![]
+            )
+            .is_err()
+        );
+        assert!(
+            n22::workload_spec(
+                identity,
+                &serde_json::json!({"runtime": "static"}),
+                Some(&digest),
+                &plan,
+                &settings,
+                token,
+                vec![]
+            )
+            .is_err()
+        );
+        // A manifest above the plan never gets more than the plan's memory.
+        let big = serde_json::json!({"runtime": "node22", "resources": {"memory_mb": 2048}});
+        assert_eq!(n22::memory_mb(&big, &plan), plan.memory_mb);
+    }
 }

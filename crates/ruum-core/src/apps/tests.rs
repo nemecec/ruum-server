@@ -203,6 +203,7 @@ impl World {
             .insert_deployment(
                 &self.m(),
                 NewDeployment {
+                    image_digest: None,
                     id: Uuid::now_v7(),
                     app_node_id: app,
                     environment: env,

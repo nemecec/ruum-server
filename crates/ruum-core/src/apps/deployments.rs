@@ -17,11 +17,14 @@
 //! YAML reader of [`yaml`], then [`super::manifest::validate`] with the tenant's plan; a bad
 //! manifest is `422` with `error.details.pointer`), the fail-closed checks of the cards that
 //! are not built yet: `migrations` (`migrations_not_ready`: D-2), a runtime other than `static`
-//! (`runtime_not_ready`: R-2a, R-2b) and `secrets` (`secrets_not_ready`: W-4), and the
+//! (`runtime_not_ready`; `node22` is built by card I6-13 and runs only when the server set a
+//! builder, [`node22`], which also lists the parts of a node22 manifest that still refuse) and
+//! `secrets` (`secrets_not_ready`: W-4), and the
 //! bindings ([`super::bindings`], card B-1: the resolution and the deployer check, `403`
 //! `binding_not_allowed`, `422` for a role rule, `409 bindings_not_ready` for database and API
 //! bindings). With no binding the stage `bindings` is `skipped`; with node bindings it writes
-//! the preview's grants after the `202`. `build` and `test` are always `skipped` in step 3.
+//! the preview's grants after the `202`. `test` is always `skipped` in step 3; `build` runs for
+//! a node22 app ([`node22`]) and is `skipped` for a static one.
 //!
 //! A deployment holds a slot from before the source is read until its image stage has stored
 //! the files (or its run ends): at most
@@ -83,6 +86,7 @@
 //! The image stage records the bytes of new static file objects (`storage_bytes`, charged to
 //! the app; STEP3 "Costs and metering"). No meter ever names a visitor.
 
+pub mod node22;
 mod source;
 mod stages;
 #[cfg(test)]
@@ -382,6 +386,7 @@ pub fn canonical(v: &Value) -> Vec<u8> {
 pub(crate) fn checked_manifest(
     unpacked: &archive::Unpacked,
     plan: &AppPlanLimits,
+    node22_on: bool,
 ) -> Result<Value> {
     let Some(entry) = unpacked.get("app.yaml") else {
         return Err(Error::Api(
@@ -412,18 +417,24 @@ pub(crate) fn checked_manifest(
     if !result.valid {
         return Err(manifest_error(&result.problems));
     }
-    fail_closed(&manifest)?;
+    fail_closed(&manifest, node22_on)?;
     Ok(manifest)
 }
 
 /// The parts of a manifest whose cards are not built yet refuse the deployment (fail closed).
-pub(crate) fn fail_closed(m: &Value) -> Result<()> {
-    if m.get("runtime").and_then(Value::as_str) != Some("static") {
+/// `node22_on`: the server has a builder for node22 ([`AppService::set_node22`]).
+pub(crate) fn fail_closed(m: &Value, node22_on: bool) -> Result<()> {
+    let runtime = m.get("runtime").and_then(Value::as_str);
+    let server = node22_on && runtime == Some(node22::RUNTIME);
+    if runtime != Some("static") && !server {
         return Err(not_ready(
             "server runtimes (node22)",
             "runtime_not_ready",
             "/runtime",
         ));
+    }
+    if server {
+        node22::refuse_unbuilt(m)?;
     }
     let non_empty = |k: &str| match m.get(k) {
         Some(Value::Object(o)) => !o.is_empty(),
@@ -666,19 +677,27 @@ impl AppService {
         // the blocking pool and never stalls the async workers.
         // The slot goes into the blocking task and comes back with its result: a cancelled
         // request cannot free the slot while the unpacking still runs (Kimi W-2s run 11, 4).
+        let node22_on = self.node22().is_some();
         let ((packed, manifest, files, need, privacy), slot) =
             blocking_with_slot(slot, move || {
                 let unpacked =
                     archive::unpack(&packed.bytes, &limits).map_err(|r| r.into_error())?;
-                let manifest = checked_manifest(&unpacked, &plan)?;
+                let manifest = checked_manifest(&unpacked, &plan, node22_on)?;
                 // Card O-2: the privacy file's suggestions (a direct `422` when it is bad).
                 let privacy = privacy_file(&unpacked, &manifest)?;
-                let files = site_files(&unpacked, &manifest);
-                let need =
-                    super::static_site::SiteNeed::of(&files, stages::spa_fallback(&manifest))?;
+                // A node22 app has no site: the builder makes its image from the archive.
+                let (files, need) = if node22::is_server(&manifest) {
+                    (Vec::new(), None)
+                } else {
+                    let files = site_files(&unpacked, &manifest);
+                    let need =
+                        super::static_site::SiteNeed::of(&files, stages::spa_fallback(&manifest))?;
+                    (files, Some(need))
+                };
                 Ok::<_, Error>((packed, manifest, files, need, privacy))
             })
             .await?;
+        let server = node22::is_server(&manifest);
         // The bindings (card B-1): resolution and the deployer check before the answer; a
         // refusal leaves nothing behind. The stage `bindings` runs the check again after it.
         let resolved = self
@@ -695,7 +714,9 @@ impl AppService {
         // The storage quota (backlog W2S-1): a site whose new objects (files and index) do
         // not fit is a direct `403 quota_exceeded`; the image stage checks again under the
         // site lock.
-        self.check_static_quota(ctx.tenant, &need).await?;
+        if let Some(need) = &need {
+            self.check_static_quota(ctx.tenant, need).await?;
+        }
         // Card O-2: the privacy file's suggestions go to the app's fields (per app, also from a
         // preview) before the deployment exists, so its code never runs with classes less
         // strict than its file asks (review O-2, Kimi 2). A write that fails, or a file with
@@ -739,10 +760,11 @@ impl AppService {
             chunks: archive_manifest.encode(),
         };
         let now = crate::now();
-        let stages = stages::initial(now, has_bindings);
+        let stages = stages::initial(now, has_bindings, server);
         let mut row = None;
         for _ in 0..SHORT_ID_TRIES {
             let d = NewDeployment {
+                image_digest: None,
                 id: Uuid::now_v7(),
                 app_node_id: app,
                 environment: Environment::Preview,
@@ -786,6 +808,8 @@ impl AppService {
             stages,
             slot: Some(slot),
             bindings: has_bindings,
+            // The builder reads the archive as uploaded (card I6-13).
+            archive: server.then(|| archive_bytes.clone()),
         };
         // The stages read what the request wrote (the freshness floor of the request).
         tokio::spawn(crate::authz::in_current_request(async move {
@@ -1014,7 +1038,18 @@ impl AppService {
             .clone()
             .ok_or_else(|| Error::Internal(format!("deployment {} has no manifest", dep.id)))?;
         // The rules of today, also for an old deployment.
-        fail_closed(&manifest)?;
+        fail_closed(&manifest, self.node22().is_some())?;
+        let server = node22::is_server(&manifest);
+        let image_digest = if server {
+            Some(dep.image_digest.clone().ok_or_else(|| {
+                Error::Api(
+                    ApiError::new(ErrorCode::Conflict, "this deployment has no image")
+                        .with_hint("deploy a new preview"),
+                )
+            })?)
+        } else {
+            None
+        };
         // The bindings with the publisher's right for the live principal (card B-1), on the
         // targets the deployment recorded.
         let planned = self
@@ -1049,39 +1084,75 @@ impl AppService {
         // of the old index while the copy checks it (backlog W2S-1). The new index has no row
         // until the release; the collection keeps such an index for its grace period. The
         // copy counts against the storage quota (`403 quota_exceeded` when it does not fit).
-        let index = {
+        // A node22 deployment has no site: its image is copied by digest (card I6-13).
+        let index = if server {
+            None
+        } else {
             let _sites = self
                 .lock_sites(ctx.tenant, false, super::static_gc::SITE_LOCK_WAIT)
                 .await?;
             let free = self.static_free_bytes(ctx.tenant).await?;
-            self.deps
-                .sites
-                .copy_site_within(ctx.tenant, dep.id, id, Some(free))
-                .await?
+            Some(
+                self.deps
+                    .sites
+                    .copy_site_within(ctx.tenant, dep.id, id, Some(free))
+                    .await?,
+            )
         };
         let checked = async {
-            let image = index.image()?;
-            stages::start_static(
-                &*self.deps.runtime,
-                ctx.tenant,
-                app.node_id,
-                id,
-                crate::runtime::Environment::Live,
-                image,
-            )
-            .await
-            .map_err(|e| {
-                Error::Internal(format!("the runtime refused the image: {}", e.message))
-            })?;
-            let check = stages::check_site(&index, &manifest);
-            if !check.passed {
-                return Err(Error::Api(
-                    ApiError::new(
-                        ErrorCode::Conflict,
-                        "the site of this deployment does not pass its check",
+            if let Some(index) = &index {
+                let image = index.image()?;
+                stages::start_static(
+                    &*self.deps.runtime,
+                    ctx.tenant,
+                    app.node_id,
+                    id,
+                    crate::runtime::Environment::Live,
+                    image,
+                )
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("the runtime refused the image: {}", e.message))
+                })?;
+                let check = stages::check_site(index, &manifest);
+                if !check.passed {
+                    return Err(Error::Api(
+                        ApiError::new(
+                            ErrorCode::Conflict,
+                            "the site of this deployment does not pass its check",
+                        )
+                        .with_hint("deploy a new preview"),
+                    ));
+                }
+            } else if let Some(digest) = image_digest.as_deref()
+                && planned.is_empty()
+            {
+                // The image starts once as the live environment before the switch. With
+                // bindings it does not: the live credentials exist only after the switch, and
+                // the preview passed the start with this image (backlog I613-3).
+                let identity = crate::runtime::WorkloadIdentity {
+                    tenant: ctx.tenant,
+                    app: app.node_id,
+                    deployment: id,
+                    environment: crate::runtime::Environment::Live,
+                };
+                let refused = |e: StageError| {
+                    Error::Api(
+                        ApiError::new(
+                            ErrorCode::Conflict,
+                            format!("the live instance did not start: {}", e.message),
+                        )
+                        .with_hint("read the logs of the preview, fix it and deploy a new preview")
+                        .with_details(json!({ "stage": "start", "reason": e.reason })),
                     )
-                    .with_hint("deploy a new preview"),
-                ));
+                };
+                let spec = self
+                    .node22_check_spec(ctx.tenant, identity, &manifest, digest, false)
+                    .await
+                    .map_err(refused)?;
+                self.node22_start_check(spec, &manifest)
+                    .await
+                    .map_err(refused)?;
             }
             for hook in self.live_hooks() {
                 hook.live_changed(
@@ -1100,6 +1171,7 @@ impl AppService {
                 .await?;
             let now = crate::now();
             let d = NewDeployment {
+                image_digest: image_digest.clone(),
                 id,
                 app_node_id: app.node_id,
                 environment: Environment::Live,
@@ -1110,7 +1182,7 @@ impl AppService {
                 source: dep.source.clone(),
                 archive: dep.archive.clone(),
                 manifest: Some(manifest.clone()),
-                stages: stages::release(now, !planned.is_empty()),
+                stages: stages::release(now, !planned.is_empty(), server),
                 published_from: Some(dep.id),
                 new_chunks: Vec::new(),
                 expires_at: None,
@@ -1154,7 +1226,9 @@ impl AppService {
                 self.repair_after_failed_switch(ctx.tenant, app.node_id)
                     .await;
                 // Nothing went live: drop the copied index (the files stay, they are shared).
-                if let Err(d) = self.deps.sites.delete_index(ctx.tenant, id).await {
+                if index.is_some()
+                    && let Err(d) = self.deps.sites.delete_index(ctx.tenant, id).await
+                {
                     tracing::warn!(tenant = %ctx.tenant, error = %d, "could not delete an unused site index");
                 }
                 Err(e)
