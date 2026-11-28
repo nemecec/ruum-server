@@ -522,6 +522,42 @@ impl AppService {
     }
 }
 
+/// A start that runs in its own task. Dropped while the task still runs (a late start, or a
+/// dropped caller), it lets the start finish and stops the instance it made.
+struct PendingStart {
+    handle: Option<
+        tokio::task::JoinHandle<
+            std::result::Result<crate::runtime::InstanceStatus, crate::runtime::RuntimeError>,
+        >,
+    >,
+    driver: Arc<dyn RuntimeDriver>,
+    tenant: TenantId,
+}
+
+impl Drop for PendingStart {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let (driver, tenant) = (self.driver.clone(), self.tenant);
+        let cleanup = async move {
+            if let Ok(Ok(st)) = handle.await
+                && let Err(e) = driver.stop(tenant, st.id).await
+            {
+                tracing::warn!(target: "ruum::apps", %tenant, error = %e, "could not stop a late node22 start");
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(cleanup);
+            }
+            Err(_) => {
+                tracing::warn!(target: "ruum::apps", %tenant, "a node22 start was dropped outside a runtime; its instance scales to zero after its idle time");
+            }
+        }
+    }
+}
+
 /// Starts `spec`, waits until it is running and healthy (at most `wait`), and stops it.
 pub(crate) async fn start_and_check(
     driver: Arc<dyn RuntimeDriver>,
@@ -534,16 +570,51 @@ pub(crate) async fn start_and_check(
         _ => None,
     }
     .unwrap_or_else(|| "/".to_owned());
-    // The wait counts from the start request, so a slow start does not add to it.
+    // The wait counts from the start request and bounds the start too (Kimi re-check of the
+    // review of I6-13): the start runs in a task of its own, so a start that is late, or whose
+    // caller is dropped, never cuts the driver off half way; its instance is stopped once the
+    // start returns.
     let deadline = tokio::time::Instant::now() + wait;
-    let status = driver.start(spec).await.map_err(|e| {
-        runtime_stage_error(
-            "start",
-            "runtime_refused",
-            "the runtime refused the instance",
-            &e,
-        )
-    })?;
+    let mut pending = PendingStart {
+        handle: Some(tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.start(spec).await }
+        })),
+        driver: driver.clone(),
+        tenant,
+    };
+    let joined = match pending.handle.as_mut() {
+        Some(h) => tokio::time::timeout_at(deadline, h).await,
+        None => unreachable!("the start task is set above"),
+    };
+    let status = match joined {
+        Err(_) => {
+            // `pending` drops here: the start goes on and its instance is stopped.
+            return Err(StageError::new(
+                "start",
+                "not_ready",
+                format!(
+                    "the runtime did not start the server within {} s",
+                    wait.as_secs()
+                ),
+            ));
+        }
+        Ok(joined) => {
+            pending.handle = None;
+            joined
+                .map_err(|e| {
+                    StageError::new("start", "runtime_refused", format!("the start failed: {e}"))
+                })?
+                .map_err(|e| {
+                    runtime_stage_error(
+                        "start",
+                        "runtime_refused",
+                        "the runtime refused the instance",
+                        &e,
+                    )
+                })?
+        }
+    };
     let id = status.id;
     // Stops the instance also when this future is dropped (a cancelled publish; Kimi I6-13, 1).
     struct StopOnDrop {
@@ -580,6 +651,18 @@ pub(crate) async fn start_and_check(
     };
     let mut st = status;
     let outcome = loop {
+        // A healthy answer after the deadline does not count either.
+        if tokio::time::Instant::now() >= deadline {
+            break Err(StageError::new(
+                "start",
+                "not_ready",
+                format!(
+                    "the server was not healthy at {path} within {} s (state {})",
+                    wait.as_secs(),
+                    st.state.name()
+                ),
+            ));
+        }
         match st.state {
             InstanceState::Running if st.health == crate::runtime::Health::Healthy => break Ok(()),
             InstanceState::Running if st.health == crate::runtime::Health::Unhealthy => {
@@ -609,17 +692,6 @@ pub(crate) async fn start_and_check(
                 ));
             }
             _ => {}
-        }
-        if tokio::time::Instant::now() >= deadline {
-            break Err(StageError::new(
-                "start",
-                "not_ready",
-                format!(
-                    "the server was not healthy at {path} within {} s (state {})",
-                    wait.as_secs(),
-                    st.state.name()
-                ),
-            ));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
         st = match driver.status(tenant, id).await {
