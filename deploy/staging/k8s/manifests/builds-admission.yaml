@@ -41,8 +41,15 @@ spec:
     - expression: "object.spec.containers.all(c, c.image.matches('^registry\\\\.ruum\\\\.internal:5000/ruum-base/node22@sha256:[0-9a-f]{64}$'))"
       message: "pods in ruum-builds run the node22 base image by digest from the cluster registry only"
       reason: Forbidden
-    - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir))"
-      message: "pods in ruum-builds mount only emptyDir volumes; no Secret, no projected token"
+    - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir) && has(v.emptyDir.sizeLimit) && (!has(v.emptyDir.medium) || v.emptyDir.medium == ''))"
+      message: "pods in ruum-builds mount only size-limited, disk-backed emptyDir volumes; no Secret, no projected token"
+      reason: Forbidden
+    # The bounds of a build (Kimi I6-13, finding 12): limits, a deadline, no restart, a read-only root.
+    - expression: "has(object.spec.activeDeadlineSeconds) && object.spec.activeDeadlineSeconds <= 3600 && has(object.spec.restartPolicy) && object.spec.restartPolicy == 'Never'"
+      message: "pods in ruum-builds have a deadline of at most an hour and restartPolicy Never"
+      reason: Forbidden
+    - expression: "object.spec.containers.all(c, has(c.resources) && has(c.resources.limits) && 'cpu' in c.resources.limits && 'memory' in c.resources.limits && has(c.securityContext) && has(c.securityContext.readOnlyRootFilesystem) && c.securityContext.readOnlyRootFilesystem == true)"
+      message: "pods in ruum-builds have CPU and memory limits and a read-only root"
       reason: Forbidden
     - expression: "object.spec.containers.all(c, (!has(c.envFrom) || size(c.envFrom) == 0) && (!has(c.env) || c.env.all(e, !has(e.valueFrom))))"
       message: "pods in ruum-builds take no environment value from another object"

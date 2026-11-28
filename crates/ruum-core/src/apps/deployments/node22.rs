@@ -34,14 +34,14 @@
 //! has a workload key, else a random value that the runtime API refuses), the egress proxy as
 //! the only other route, the memory of `resources.memory_mb` (default the smaller of 256 MB and
 //! the plan's), CPU in proportion (a quarter core per 256 MB) and the disk of the settings,
-//! scale to zero after [`Node22Settings::idle_timeout`] unless `resources.min_instances` is
-//! above zero.
+//! scale to zero after [`Node22Settings::idle_timeout`] (always-on instances are refused).
 //!
 //! Fail closed: parts of a node22 manifest whose cards are not built refuse the deployment
 //! before the answer (`409 runtime_not_ready` with the pointer): `static` (the gateway does not
 //! serve static files next to a server yet), `jobs` (R-5), `events` (R-6), `apis` (B-3) and
 //! `egress.allow` (no runtime path narrows the egress proxy's allow list yet: the app would get
-//! more than it asked for).
+//! more than it asked for; also an empty list) and `resources.min_instances` above zero (an
+//! always-on instance would outlive a retired deployment until a stop reaches it).
 
 use super::super::AppService;
 use super::super::plan::AppPlanLimits;
@@ -135,14 +135,26 @@ pub(crate) fn refuse_unbuilt(m: &Value) -> Result<()> {
             return Err(not_ready(what, "runtime_not_ready", &format!("/{key}")));
         }
     }
-    if m.pointer("/egress/allow")
-        .and_then(Value::as_array)
-        .is_some_and(|a| !a.is_empty())
-    {
+    // Any allow list, also an empty one (which asks for no egress at all): no runtime path
+    // carries it to the proxy yet, so the app would get more than it asked for (Kimi I6-13, 2).
+    if m.pointer("/egress/allow").is_some() {
         return Err(not_ready(
             "egress allow lists",
             "runtime_not_ready",
             "/egress/allow",
+        ));
+    }
+    // Always on: an instance that never scales to zero would outlive its deployment until a
+    // stop reaches it (Kimi I6-13, 1); the sandbox directory's sweep and the idle timeout bound
+    // a retired instance only when it scales to zero.
+    if m.pointer("/resources/min_instances")
+        .and_then(Value::as_u64)
+        .is_some_and(|n| n > 0)
+    {
+        return Err(not_ready(
+            "always-on instances (resources.min_instances)",
+            "runtime_not_ready",
+            "/resources/min_instances",
         ));
     }
     Ok(())
@@ -237,16 +249,13 @@ pub fn workload_spec(
     }
     let mut env = plain_env(manifest);
     env.extend(extra);
-    let always_on = manifest
-        .pointer("/resources/min_instances")
-        .and_then(Value::as_u64)
-        .is_some_and(|n| n > 0);
     Ok(WorkloadSpec {
         identity,
         kind: WorkloadKind::Service(ServiceSpec {
             port: PORT,
             health: Some(health_check(manifest, settings)),
-            idle_timeout: (!always_on).then_some(settings.idle_timeout),
+            // Always scales to zero (always-on is refused before the answer).
+            idle_timeout: Some(settings.idle_timeout),
         }),
         image: ImageRef::Oci(digest),
         command: Vec::new(),
@@ -425,7 +434,7 @@ impl AppService {
         let wait = health_timeout(manifest)
             .saturating_add(Duration::from_secs(30))
             .min(node22.settings.start_wait);
-        start_and_check(&*self.deps.runtime, spec, wait).await
+        start_and_check(self.deps.runtime.clone(), spec, wait).await
     }
 
     /// The spec of a start check (the stage `start` of a preview, or the start before a
@@ -483,7 +492,7 @@ impl AppService {
 
 /// Starts `spec`, waits until it is running and healthy (at most `wait`), and stops it.
 pub(crate) async fn start_and_check(
-    driver: &dyn RuntimeDriver,
+    driver: Arc<dyn RuntimeDriver>,
     spec: WorkloadSpec,
     wait: Duration,
 ) -> std::result::Result<Value, StageError> {
@@ -502,6 +511,39 @@ pub(crate) async fn start_and_check(
         )
     })?;
     let id = status.id;
+    // Stops the instance also when this future is dropped (a cancelled publish; Kimi I6-13, 1).
+    struct StopOnDrop {
+        driver: Arc<dyn RuntimeDriver>,
+        tenant: TenantId,
+        id: crate::runtime::InstanceId,
+        armed: bool,
+    }
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            let (driver, tenant, id) = (self.driver.clone(), self.tenant, self.id);
+            match tokio::runtime::Handle::try_current() {
+                Ok(rt) => {
+                    rt.spawn(async move {
+                        if let Err(e) = driver.stop(tenant, id).await {
+                            tracing::warn!(target: "ruum::apps", %tenant, error = %e, "could not stop a cancelled node22 start check");
+                        }
+                    });
+                }
+                Err(_) => {
+                    tracing::warn!(target: "ruum::apps", %tenant, "a node22 start check was dropped outside a runtime; its instance scales to zero after its idle time");
+                }
+            }
+        }
+    }
+    let mut guard = StopOnDrop {
+        driver: driver.clone(),
+        tenant,
+        id,
+        armed: true,
+    };
     let deadline = tokio::time::Instant::now() + wait;
     let mut st = status;
     let outcome = loop {
@@ -559,9 +601,10 @@ pub(crate) async fn start_and_check(
             }
         };
     };
-    if let Err(e) = driver.stop(tenant, id).await {
+    if let Err(e) = guard.driver.stop(tenant, id).await {
         tracing::warn!(target: "ruum::apps", %tenant, error = %e, "could not stop a node22 start check");
     }
+    guard.armed = false;
     outcome.map(|()| {
         json!({
             "passed": true,

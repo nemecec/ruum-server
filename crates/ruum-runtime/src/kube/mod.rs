@@ -183,6 +183,9 @@ pub struct KubeConfig {
     pub registry: Option<String>,
     /// The URL the driver checks a digest at (`http://` + registry by default).
     pub registry_url: Option<String>,
+    /// The user and password the driver reads the registry with (HTTP basic auth; card I6-13:
+    /// the cluster registry has no anonymous access). `None`: no credential.
+    pub registry_credential: Option<(String, ruum_core::runtime::SecretValue)>,
     pub routes: BTreeMap<Route, SharedService>,
     /// The pod's termination grace (at most 30 s).
     pub stop_timeout: Duration,
@@ -311,6 +314,7 @@ impl KubeConfig {
             runtime_class_overhead: BTreeMap::new(),
             registry: None,
             registry_url: None,
+            registry_credential: None,
             routes: BTreeMap::new(),
             stop_timeout: Duration::from_secs(10),
             log_lines: 10_000,
@@ -902,8 +906,7 @@ impl Inner {
         );
         let accept = "application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json";
         let r = self
-            .registry_http
-            .head(&url)
+            .registry_auth(self.registry_http.head(&url))
             .header(reqwest::header::ACCEPT, accept)
             .send()
             .await
@@ -921,6 +924,14 @@ impl Inner {
         }
     }
 
+    /// A registry request with the driver's credential, when it has one (card I6-13).
+    fn registry_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.cfg.registry_credential {
+            Some((user, password)) => req.basic_auth(user, Some(password.expose())),
+            None => req,
+        }
+    }
+
     /// `GET` a registry object under a cap, checked against its digest (`sha256:<hex>`).
     async fn registry_get(
         &self,
@@ -930,8 +941,7 @@ impl Inner {
     ) -> Result<Vec<u8>, RuntimeError> {
         const MAX: usize = 4 * 1024 * 1024;
         let mut r = self
-            .registry_http
-            .get(url)
+            .registry_auth(self.registry_http.get(url))
             .header(reqwest::header::ACCEPT, accept)
             .send()
             .await

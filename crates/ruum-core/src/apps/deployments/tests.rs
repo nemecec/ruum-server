@@ -2400,6 +2400,11 @@ mod node22_pipeline {
                 b"runtime: node22\nstart: node s.js\nsecrets: [STRIPE_KEY]\n",
                 "/secrets",
             ),
+            // An empty allow list asks for no egress at all (Kimi I6-13, 2).
+            (
+                b"runtime: node22\nstart: node s.js\negress:\n  allow: []\n",
+                "/egress/allow",
+            ),
         ] {
             let src = w
                 .folder(
@@ -2430,6 +2435,37 @@ mod node22_pipeline {
                 .await
                 .unwrap();
         assert!(page.items.is_empty());
+    }
+
+    #[test]
+    fn always_on_and_any_allow_list_are_refused_for_node22() {
+        for (m, pointer) in [
+            (
+                serde_json::json!({"runtime": "node22", "start": "x", "resources": {"min_instances": 1}}),
+                "/resources/min_instances",
+            ),
+            (
+                serde_json::json!({"runtime": "node22", "start": "x", "egress": {"allow": []}}),
+                "/egress/allow",
+            ),
+        ] {
+            let Err(Error::Api(a)) = n22::refuse_unbuilt(&m) else {
+                panic!("{m} is not refused");
+            };
+            assert_eq!(
+                a.details
+                    .as_deref()
+                    .and_then(|d| d.get("pointer"))
+                    .and_then(Value::as_str),
+                Some(pointer)
+            );
+        }
+        assert!(
+            n22::refuse_unbuilt(
+                &serde_json::json!({"runtime": "node22", "start": "x", "resources": {"min_instances": 0}})
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -2472,7 +2508,11 @@ mod node22_pipeline {
         let h = svc.health.as_ref().unwrap();
         assert_eq!(h.path, "/healthz");
         assert_eq!(h.failure_threshold, 3);
-        assert_eq!(svc.idle_timeout, None, "min_instances keeps it running");
+        assert_eq!(
+            svc.idle_timeout,
+            Some(settings.idle_timeout),
+            "a node22 instance always scales to zero"
+        );
         s.validate().unwrap();
         // No image, a bad digest, or a static manifest: no spec.
         assert!(

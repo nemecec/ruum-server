@@ -271,7 +271,8 @@ pub struct KubeSettings {
 /// - `RUUM_BUILD_PUSH_USER` and `RUUM_BUILD_PUSH_PASSWORD_FILE` (required): the push
 ///   credential (the registry has no anonymous access); it never reaches a build;
 /// - `RUUM_BUILD_CHANNEL_SERVICE` (`host:port`, required): the build channel as the build pods
-///   reach it (a Service), and `RUUM_BUILD_CHANNEL_LISTEN` (`addr:port`, required): the
+///   reach it: this process's own pod address (a build's channel entry lives in the process that
+///   started it, so not a Service over every replica), and `RUUM_BUILD_CHANNEL_LISTEN` (`addr:port`, required): the
 ///   listener of this process. TLS 1.3 with the supervisor listener's certificate (derived from
 ///   the record key), pinned by the build pods;
 /// - `RUUM_BUILD_NAMESPACE` (default `ruum-builds`), `RUUM_BUILD_OUTPUT_MAX` (bytes, default
