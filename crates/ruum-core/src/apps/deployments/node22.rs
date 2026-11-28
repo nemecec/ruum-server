@@ -722,13 +722,21 @@ pub(crate) async fn start_and_check(
             }
         };
     };
-    // The stop is bounded as well: after STOP_WAIT the guard stays armed and its drop sends the
-    // stop again in a task of its own.
-    match tokio::time::timeout(STOP_WAIT, guard.driver.stop(tenant, id)).await {
-        Ok(Ok(())) => guard.armed = false,
-        Ok(Err(e)) => {
+    // The stop is bounded as well (Kimi re-check 3 of the review of I6-13): it runs once in a
+    // task of its own, which owns the cleanup from here on; after STOP_WAIT (or when the caller
+    // is dropped) that same stop goes on in the background, never cut off and sent again.
+    guard.armed = false;
+    let stop = tokio::spawn({
+        let driver = guard.driver.clone();
+        async move { driver.stop(tenant, id).await }
+    });
+    match tokio::time::timeout(STOP_WAIT, stop).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => {
             tracing::warn!(target: "ruum::apps", %tenant, error = %e, "could not stop a node22 start check");
-            guard.armed = false;
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(target: "ruum::apps", %tenant, error = %e, "the stop of a node22 start check failed");
         }
         Err(_) => {
             tracing::warn!(target: "ruum::apps", %tenant, "the stop of a node22 start check is slow; it goes on in the background");
