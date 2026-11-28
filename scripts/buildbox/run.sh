@@ -266,13 +266,16 @@ trap 'rm -f "$LIST"' EXIT
 git -C "$SRC" ls-files -z -co --exclude-standard | while IFS= read -r -d '' f; do
   case "$f" in
     target | target/* | target[.-]* | node_modules/* | */node_modules/*) continue ;;
+    # A nested git repository (or a worktree inside the tree) is listed as `dir/`: not ours.
+    */) continue ;;
   esac
   [[ -e "$SRC/$f" || -L "$SRC/$f" ]] && printf '%s\0' "$f"
 done >"$LIST"
 
 remote prune "$NAME" <"$LIST"
-# -a without -t (times), with --checksum: see the header (B-62).
-rsync -rlpgoD --checksum -0 --files-from="$LIST" -e "${SSH[*]}" "$SRC/" "$DEST:w/$NAME/" ||
+# -a without -t (times) and without recursion (only the listed paths; a listed directory, such
+# as an untracked nested repository, is not copied), with --checksum: see the header (B-62).
+rsync -lpgoD --checksum -0 --files-from="$LIST" -e "${SSH[*]}" "$SRC/" "$DEST:w/$NAME/" ||
   die "rsync failed"
 say "$NAME: synced $(tr -cd '\0' <"$LIST" | wc -c | tr -d ' ') files from $SRC in $((SECONDS - start))s"
 
